@@ -1,0 +1,23 @@
+// Regression test: a single-line `if cond then <lhs> := <rhs>` used to bind the
+// assignment to the whole if-expression (`(if cond then x) := rhs`), which then
+// ICE'd in MIR lowering with "unhandled assignment LHS". The assignment must bind
+// to the then/else branch instead: `if cond then (x := rhs)`.
+main () =
+    var x = 0
+    if true then x := 5
+    println x
+
+    // else branch and field assignment
+    if false then x := 100 else x := 42
+    println x
+
+    // compound assignment inline
+    var y = 10
+    if true then y += 1 else y += 100
+    println y
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 5
+// 42
+// 11

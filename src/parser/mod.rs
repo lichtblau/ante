@@ -2087,7 +2087,17 @@ impl<'tokens> Parser<'tokens> {
         }
 
         let expression = self.parse_expression()?;
+        self.parse_assignment_tail(expression)
+    }
 
+    /// Given an already-parsed lvalue expression, parse a trailing assignment
+    /// (`:=` or a compound `+=`/`-=`/...) if one follows. Returns `expression`
+    /// unchanged when there is no assignment operator.
+    ///
+    /// Shared by `parse_statement` and by single-line if/else branches so that
+    /// `if c then x := y` binds the assignment to the branch (`if c then (x := y)`)
+    /// rather than to the whole if-expression.
+    fn parse_assignment_tail(&mut self, expression: ExprId) -> Result<ExprId> {
         // Try to parse a compound assignment (+=, -=, *=, /=, %=)
         if let Some((op, op_str)) = self.try_accept_compound_assign_op() {
             let rhs = self.parse_expression()?;
@@ -2284,7 +2294,21 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_if_expr(&mut self) -> Result<ExprId> {
-        self.parse_if(Self::parse_block_or_expression)
+        self.parse_if(Self::parse_if_branch)
+    }
+
+    /// Parse a then/else branch of an if expression. Like `parse_block_or_expression`,
+    /// but a single-line (non-block) branch may also be an assignment statement, so
+    /// `if c then x := y` parses as `if c then (x := y)` instead of `(if c then x) := y`.
+    fn parse_if_branch(&mut self) -> Result<ExprId> {
+        match self.current_token() {
+            Token::Indent => self.parse_block(),
+            Token::Return => self.parse_return(0, false),
+            _ => {
+                let expr = self.parse_expression_trailing(0, false)?;
+                self.parse_assignment_tail(expr)
+            },
+        }
     }
 
     /// A comptime if, unlike a regular if, requires a block so that we can quote
