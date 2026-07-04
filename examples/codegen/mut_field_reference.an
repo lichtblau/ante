@@ -1,0 +1,32 @@
+// Regression test: passing a struct field by mutable reference (`mut s.field`)
+// across a call must alias the field in place. Previously `reference()` only
+// reborrowed a mutable-local `Variable`; any other lvalue (a `MemberAccess`)
+// fell through to `StackAlloc`, copying the field's *value* into a fresh slot.
+// The callee then mutated the copy and the write was silently lost.
+type Inner = v: I32, w: I32
+type Outer = inner: Inner, tag: I32
+
+set_value (n: mut I32) (val: I32) =
+    n.* := val
+
+increment (n: mut I32) =
+    n.* := n.* + 1
+
+main () =
+    var o = Outer (Inner 0 0) 0
+
+    // Direct field: the write must reach `o`, not a throwaway copy.
+    set_value (mut o.tag) 42
+    println o.tag
+
+    // Nested field: only the addressed field changes.
+    increment (mut o.inner.v)
+    increment (mut o.inner.v)
+    println o.inner.v
+    println o.inner.w
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 42
+// 2
+// 0

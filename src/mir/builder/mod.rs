@@ -1290,10 +1290,53 @@ where
             return self.expression(rhs);
         }
 
+        // Addressable lvalue: taking `mut` of a struct field (`mut s.field`) must alias the
+        // field in place, not copy its value. When the field bottoms out at an addressable root
+        // (a mutable local or a reference/pointer-typed value) `lhs_as_pointer` computes the
+        // field's address so the callee's writes are visible to the caller. Without this the
+        // field would fall through to the `StackAlloc` below and the callee would mutate a
+        // throwaway copy. A field of a by-value binding is *not* addressable, so it still falls
+        // through to the copy (there is no slot to alias).
+        if let cst::Expr::MemberAccess(_) = &context[rhs]
+            && self.reference_is_addressable(rhs)
+        {
+            return self.lhs_as_pointer(rhs);
+        }
+
         // For all other cases (non-mutable local, temporary): evaluate the expression and
         // allocate a new stack slot for it.
         let value = self.expression(rhs);
         self.push_instruction(Instruction::StackAlloc(value), Type::POINTER)
+    }
+
+    /// Whether `lhs_as_pointer` can compute a real in-memory address for this lvalue, i.e.
+    /// whether it bottoms out at an addressable root rather than a by-value binding. A
+    /// mutable local (`var`) is stored as a pointer slot, and a reference/pointer-typed value
+    /// is already a pointer; a field of either is addressable. A plain by-value binding (e.g.
+    /// a normal parameter) holds an SSA value with no slot to point at.
+    fn reference_is_addressable(&self, expr: ExprId) -> bool {
+        match &self.context()[expr] {
+            cst::Expr::MemberAccess(ma) => {
+                // A field of a reference/pointer-typed object is addressable: the object is
+                // already a pointer we can `GetFieldPtr` through. Otherwise the field is only
+                // addressable if the object itself is.
+                let object_type = self.types.result.maps.expr_types[&ma.object].follow(&self.types.bindings);
+                object_type.reference_or_pointer_element(&self.types.bindings).is_some()
+                    || self.reference_is_addressable(ma.object)
+            },
+            cst::Expr::TypeAnnotation(ta) => self.reference_is_addressable(ta.lhs),
+            cst::Expr::Variable(path_id) => {
+                let path_id = *path_id;
+                if let Some(Origin::Local(name)) = self.context().path_origin(path_id)
+                    && self.mutable_locals.contains(&name)
+                {
+                    return true;
+                }
+                let ty = self.types.result.maps.expr_types[&expr].follow(&self.types.bindings);
+                ty.reference_element(&self.types.bindings).is_some()
+            },
+            _ => false,
+        }
     }
 
     fn lhs_as_pointer(&mut self, lhs: ExprId) -> Value {
