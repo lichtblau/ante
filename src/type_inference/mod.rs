@@ -213,6 +213,15 @@ struct TypeChecker<'local, 'inner> {
     /// plain `x := v` LHS (reassignment reads nothing from `x`).
     suppress_move_record: bool,
 
+    /// Set only while inferring a call's **direct variable callee** (`m ()`). Calling a closure
+    /// borrows it, it does not consume it -- the same rule the escape scan already uses ("a direct
+    /// variable callee does not escape `m`"). Without this, an *owning* closure (now non-`Copy`)
+    /// would be moved by its own call, so its scope-exit env-teardown drop would never fire and the
+    /// capture would leak. Unlike `suppress_move_record` this must not disable drop elaboration,
+    /// and it leaves the use-after-move *check* in place, so calling an already-moved closure is
+    /// still an error.
+    borrow_callee: bool,
+
     /// The place each local binding denotes. Absent ⇒ the binding denotes its own variable.
     /// Present only for bindings that name a sub-place of another value — currently those
     /// introduced under an alias pattern (`whole @ Box p` maps `p` to `whole.<inner-field>`),
@@ -397,6 +406,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             move_tracker: Default::default(),
             suppress_move_check: false,
             suppress_move_record: false,
+            borrow_callee: false,
             binding_places: Default::default(),
             copy_type_name: None,
             auto_drop: crate::incremental::AutoDrop.get(compiler),

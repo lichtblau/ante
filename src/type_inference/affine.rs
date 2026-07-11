@@ -192,10 +192,17 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             return true;
         }
 
-        // TODO: This isn't always true, but we also can't define the proper Copy impls
-        // for functions in the stdlib because we can't manually access a closure's environment
-        // and we can't define every copy impl for every possible parameter count.
-        if matches!(&typ, Type::Function(_)) {
+        // A closure is Copy iff its environment is Copy. A free function (`NoClosureEnv`) and a
+        // closure whose env holds only refs/`Copy` captures stay Copy; a closure whose env *owns* a
+        // non-`Copy` capture (a `move fn` holding a `String`) is affine, so the single owner
+        // travels with the closure value and its env-teardown drop fires at the closure's real
+        // death instead of being retracted. We cannot write these Copy impls in the stdlib (no way
+        // to name a closure's environment, nor every parameter count), so the rule lives here.
+        if let Type::Function(f) = &typ {
+            if self.auto_drop {
+                let env = f.environment.clone();
+                return self.env_type_is_copy(&env);
+            }
             return true;
         }
 
@@ -284,6 +291,40 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         false
+    }
+
+    /// Is a closure **environment** Copy? Decides whether the closure value is Copy (see
+    /// `type_is_copy`).
+    ///
+    /// - `NoClosureEnv` (a free function) and any other Primitive → Copy.
+    /// - `MUT`/`IMM` ref captures -- `var` borrows and Part-B's borrowed captures -- are
+    ///   pointer-shaped borrows the env does not own → Copy.
+    /// - An **unknown** env (`Variable`/`Generic`) → Copy. A generic function parameter (`f: a ->
+    ///   b`) has an unresolved environment, and `type_is_copy` treats a rigid variable as non-Copy,
+    ///   which would make every higher-order stdlib function reject its own `f` on second use
+    ///   ("cannot move `f` … executed multiple times"). A generic `f` is caller-owned; the callee
+    ///   borrows it.
+    /// - An env tuple is Copy iff every capture is; an owned capture (a `String`) defers to
+    ///   `type_is_copy` and makes the closure affine.
+    fn env_type_is_copy(&mut self, env: &Type) -> bool {
+        let env = self.follow_type(env).clone();
+        match &env {
+            Type::Primitive(_) => true,
+            Type::Variable(_) | Type::Generic(_) => true,
+            Type::Application(constructor, _)
+                if matches!(
+                    self.follow_type(constructor),
+                    Type::Primitive(super::types::PrimitiveType::Reference(_))
+                ) =>
+            {
+                true
+            },
+            Type::Tuple(elements) => {
+                let elements = elements.clone();
+                elements.iter().all(|element| self.env_type_is_copy(element))
+            },
+            _ => self.type_is_copy(&env),
+        }
     }
 
     /// True if the variable will default to an int/float primitive (both Copy): either it

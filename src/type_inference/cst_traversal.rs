@@ -492,7 +492,10 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 if !self.suppress_move_check {
                     self.check_use_of_move_path(&move_path, path);
                 }
-                if !self.suppress_move_record {
+                // Calling a closure borrows it. Fenced to function-typed callees so a non-function
+                // variable in callee position (an error path) still records normally.
+                let borrowed_as_callee = self.borrow_callee && matches!(self.follow_type(&typ), Type::Function(_));
+                if !self.suppress_move_record && !borrowed_as_callee {
                     let non_copy = !self.type_is_copy(&typ);
                     // Auto-drop: also record *tentative* moves for bare generic variables
                     // the lenient Copy search let through. Their Copy-ness may only be
@@ -662,7 +665,14 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             environment: self.next_type_variable(),
             return_type: expected.clone(),
         });
+        // Calling a closure borrows it. A direct variable callee (`m ()`) must not record a move of
+        // `m`, or an *owning* (now affine) closure would be consumed by its own call and its
+        // scope-exit env-teardown drop would never fire. Scoped to the callee expression only;
+        // arguments below still move normally.
+        let callee_is_variable = matches!(self.expr_of(call.function).as_ref(), Expr::Variable(_));
+        let old_borrow_callee = std::mem::replace(&mut self.borrow_callee, callee_is_variable);
         let actual_function_type = self.infer_expr(call.function, &Type::Function(expected_function_type.clone()));
+        self.borrow_callee = old_borrow_callee;
 
         let actual_return_type = self.next_type_variable();
         Arc::make_mut(&mut expected_function_type).return_type = actual_return_type.clone();
