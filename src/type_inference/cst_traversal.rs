@@ -127,6 +127,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Expr::Lambda(lambda) => {
                 let lambda = lambda.clone();
                 self.expr_types.insert(rhs, expected_type.clone());
+                // Name the top-level function/method whose body follows so its return-origin
+                // summary can be keyed (covers `MethodName`, unlike `self_name`).  Taken at
+                // `infer_lambda_impl` entry, so nested body lambdas do not inherit it.
+                if is_top_level {
+                    self.summary_binding_name = self.definition_binding_name(definition.pattern);
+                }
                 self.infer_lambda(&lambda, &expected_type, rhs, self_name);
             },
             _ => {
@@ -874,6 +880,9 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         &mut self, lambda: &cst::Lambda, expected: &Type, expr: ExprId, self_name: Option<NameId>,
         options: LambdaOptions,
     ) -> Type {
+        // Claim the return-origin summary name for *this* lambda before its body is checked, so
+        // nested body lambdas (which re-enter here) take `None` rather than this name.
+        let summary_name = self.summary_binding_name.take();
         let function_type = match self.follow_type(expected) {
             Type::Function(function_type) => function_type.clone(),
             _ => {
@@ -950,6 +959,15 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // derived from an owned local must not escape through it.
         if self.drop_elaboration_active() {
             self.check_reference_escape(lambda.body);
+        }
+
+        // Record the return-origin summary for a named top-level function -- which explicit
+        // parameters' origins flow into the return value's references. Computed here, while this
+        // function's scope is still live (parameters resolve to `Param`, body locals to `Local`),
+        // before `pop_drop_scope` below tears it down. `summary_name` was claimed at entry above so
+        // nested body lambdas did not consume it.
+        if let Some(fn_name) = summary_name {
+            self.compute_return_origin_summary(fn_name, lambda, &function_type.return_type);
         }
 
         // Function-exit drops for the parameters (run after the body's own block drops when

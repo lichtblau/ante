@@ -38,6 +38,7 @@ pub mod fresh_expr;
 pub mod generics;
 pub mod get_type;
 mod implicits;
+mod origins;
 pub mod kinds;
 pub mod patterns;
 mod type_body;
@@ -116,6 +117,18 @@ pub struct IndividualTypeCheckResult {
     /// these; call sites with statically-known callees consult this mask to elide the argument
     /// retain (or to balance it with a post-call release).
     pub borrowed_params: FxHashMap<NameId, Vec<bool>>,
+
+    /// For each *reference-returning* top-level function name, which of its *explicit* parameters'
+    /// origins can flow into the return value's reference elements -- the return-origin
+    /// summary. Positional mask aligned with explicit call arguments.  Consumed by task 10's escape
+    /// check **post-inference** (where all `TypeCheck` results are complete -- the
+    /// `borrowed_param_mask_of_callee` seam; consuming it *during* inference is unsound, see
+    /// `compute_return_origin_summary` and `call_origin`), as an additive refinement over the
+    /// fallback union: substitute the origins of exactly the arguments whose parameters
+    /// flow. Present only for reference-returning functions; an all-`false` entry means "returns a
+    /// reference, but not one derived from a parameter" (a local/immortal, or lost through a
+    /// nominal wrapper the may-alias test can't see -- 10 keeps the fallback floor for the latter).
+    pub return_origins: FxHashMap<NameId, Vec<bool>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -241,9 +254,21 @@ struct TypeChecker<'local, 'inner> {
     /// it reflects only the innermost lambda directly containing the assignment.
     in_handler_scoped_lambda: bool,
 
+    /// The top-level definition name whose lambda body is about to be inferred, so
+    /// [`Self::compute_return_origin_summary`] can key its summary -- set only for a top-level
+    /// function/method definition immediately before its `infer_lambda`, and `take`n at the start of
+    /// each `infer_lambda_impl` (so nested lambdas in the body see `None`). Unlike `self_name` this
+    /// covers `MethodName` patterns (`Vec.get`, `HashMap.get`) without perturbing recursion-capture.
+    summary_binding_name: Option<NameId>,
+
     /// Masks computed by [`Self::compute_borrowed_param_mask`], keyed by
     /// item then function name, moved into each [`IndividualTypeCheckResult`] at `finish`.
     borrowed_param_masks: FxHashMap<TopLevelId, FxHashMap<NameId, Vec<bool>>>,
+
+    /// Return-origin summaries computed by [`Self::compute_return_origin_summary`], keyed by item
+    /// then function name, moved into each [`IndividualTypeCheckResult`] at `finish` (same
+    /// lifecycle as `borrowed_param_masks`).
+    return_origin_summaries: FxHashMap<TopLevelId, FxHashMap<NameId, Vec<bool>>>,
 
     /// The current item's borrowing parameter names -- their scope-exit
     /// release is skipped (the caller owns the handle for the call's duration).
@@ -381,7 +406,9 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_type_name: None,
             captured_names: Default::default(),
             in_handler_scoped_lambda: false,
+            summary_binding_name: None,
             borrowed_param_masks: Default::default(),
+            return_origin_summaries: Default::default(),
             borrowed_local_params: Default::default(),
             borrowed_bindings: Default::default(),
             call_argument_depth: 0,
@@ -507,10 +534,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             .map(|(id, maps)| {
                 let generalized = generalized.remove(&id).unwrap_or_default();
                 let borrowed_params = self.borrowed_param_masks.remove(&id).unwrap_or_default();
+                let return_origins = self.return_origin_summaries.remove(&id).unwrap_or_default();
                 let mut context = self.id_contexts.remove(&id).unwrap();
                 let item_context = self.item_contexts.get(&id).unwrap();
                 context.extend_from_resolution_result(item_context.2.as_ref());
-                (id, IndividualTypeCheckResult { maps, generalized, context, borrowed_params })
+                (id, IndividualTypeCheckResult { maps, generalized, context, borrowed_params, return_origins })
             })
             .collect();
 
@@ -539,6 +567,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.synthesizing_drops = false;
         self.captured_names.clear();
         self.in_handler_scoped_lambda = false;
+        self.summary_binding_name = None;
         self.borrowed_local_params.clear();
         self.borrowed_bindings.clear();
         self.call_argument_depth = 0;

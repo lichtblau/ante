@@ -186,6 +186,7 @@ pub fn type_check_impl(context: &TypeCheck, db: &DbHandle) -> Arc<TypeCheckResul
             generalized: FxHashMap::default(),
             context: ExtendedTopLevelContext::new(item_context),
             borrowed_params: FxHashMap::default(),
+            return_origins: FxHashMap::default(),
         }
     });
 
