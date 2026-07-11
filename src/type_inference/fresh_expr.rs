@@ -93,9 +93,16 @@ pub struct ExtendedTopLevelContext {
     post_expr_drops: BTreeMap<ExprId, Vec<ExprId>>,
 
     /// Drop calls synthesized by drop elaboration (`--auto-drop`), lowered between the keyed
-    /// expression's value computation and the control-flow effect that follows it. Keys
-    /// today: the returned expression of a `return` (drops run before the Return terminator).
+    /// expression's value computation and the control-flow effect that follows it. Keys:
+    /// the returned expression of a `return` (drops run before the Return terminator) and
+    /// an Assignment expression (overwrite drops run after the RHS, before the Store).
     pre_exit_drops: BTreeMap<ExprId, Vec<ExprId>>,
+
+    /// Drop calls for the implicit else edge of an else-less `if` (`--auto-drop`), keyed by
+    /// the If expression. A then-branch that moves a value leaves it owned on the false
+    /// edge, which otherwise has no block: the MIR builder materializes a real else block
+    /// running these drops.
+    implicit_else_drops: BTreeMap<ExprId, Vec<ExprId>>,
 }
 
 impl<'local, 'innter> TypeChecker<'local, 'innter> {
@@ -142,6 +149,7 @@ impl ExtendedTopLevelContext {
             move_closures: Default::default(),
             post_expr_drops: Default::default(),
             pre_exit_drops: Default::default(),
+            implicit_else_drops: Default::default(),
         }
     }
 
@@ -353,6 +361,9 @@ impl ExtendedTopLevelContext {
         if let Some(drops) = self.pre_exit_drops.get(&from).cloned() {
             self.pre_exit_drops.insert(to, drops);
         }
+        if let Some(drops) = self.implicit_else_drops.get(&from).cloned() {
+            self.implicit_else_drops.insert(to, drops);
+        }
     }
 
     pub fn is_move_closure(&self, expr: ExprId) -> bool {
@@ -376,6 +387,15 @@ impl ExtendedTopLevelContext {
 
     pub fn pre_exit_drops(&self, expr: ExprId) -> Option<&Vec<ExprId>> {
         self.pre_exit_drops.get(&expr)
+    }
+
+    /// Record the drops for the implicit else edge of the else-less `if` at `expr`.
+    pub(crate) fn push_implicit_else_drops(&mut self, expr: ExprId, drops: Vec<ExprId>) {
+        self.implicit_else_drops.entry(expr).or_default().extend(drops);
+    }
+
+    pub fn implicit_else_drops(&self, expr: ExprId) -> Option<&Vec<ExprId>> {
+        self.implicit_else_drops.get(&expr)
     }
 }
 

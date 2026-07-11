@@ -168,7 +168,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 self.check_return(return_.expression, id);
                 Type::NEVER
             },
-            Expr::Assignment(assignment) => self.infer_assignment(assignment),
+            Expr::Assignment(assignment) => self.infer_assignment(assignment, id),
             // Error expressions assume the expected type to suppress cascading errors.
             // This also preserves the recorded types of implicit-argument placeholder
             // slots (which are Expr::Error) when their wrapper is re-inferred.
@@ -1017,12 +1017,36 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 branches.push(else_moves);
             }
             self.move_tracker = super::affine::MoveTracker::merge_branches(&pre_branch_moves, &branches);
+
+            // Auto-drop: a value moved in one branch only is still owned at the end of the
+            // other branch -- the only edge that can drop it (the merged state above reads
+            // it moved). `branches` holds the non-diverging end states in then/else order.
+            if self.drop_elaboration_active() {
+                let mut edges = Vec::new();
+                let mut branch_states = branches.iter();
+                if !then_diverges {
+                    edges.push((if_.then, branch_states.next().unwrap().clone()));
+                }
+                if !else_diverges {
+                    edges.push((else_, branch_states.next().unwrap().clone()));
+                }
+                self.equalize_branch_drops(&pre_branch_moves, &edges);
+            }
             result
         } else {
             // If-without-else: if the then-branch always returns, moves don't carry forward
             if then_diverges {
                 self.move_tracker = pre_branch_moves;
             } else {
+                // Auto-drop: values the then-branch moved are still owned on the implicit
+                // else edge; the builder materializes an else block running these drops.
+                if self.drop_elaboration_active() {
+                    let location = self.current_extended_context().expr_location(expr);
+                    let drops = self.implicit_else_edge_drops(&pre_branch_moves, &then_moves, &location);
+                    if !drops.is_empty() {
+                        self.current_extended_context_mut().push_implicit_else_drops(expr, drops);
+                    }
+                }
                 self.move_tracker = super::affine::MoveTracker::merge_branches(&pre_branch_moves, &[then_moves]);
             }
 
@@ -1074,6 +1098,8 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // Save move state before branches
         let pre_branch_moves = self.move_tracker.clone();
         let mut branch_trackers = Vec::new();
+        // Auto-drop: (arm body, arm end-state) for each non-diverging arm, for edge equalization.
+        let mut arm_edges = Vec::new();
         let mut result_type = Type::NEVER;
 
         for (pattern, branch) in match_.cases.iter() {
@@ -1083,15 +1109,24 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 self.assign_binding_places(*pattern, place.clone());
             }
             self.push_implicits_scope();
-            if self.diverges(&result_type) {
+            let arm_type = if self.diverges(&result_type) {
                 result_type = self.infer_expr(*branch, expected);
+                result_type.clone()
             } else {
-                self.check_expr(*branch, &result_type, TypeErrorKind::MatchBranch);
-            }
+                self.check_expr(*branch, &result_type, TypeErrorKind::MatchBranch)
+            };
             self.pop_implicits_scope();
+            if self.drop_elaboration_active() && !self.diverges(&arm_type) {
+                arm_edges.push((*branch, self.move_tracker.clone()));
+            }
             branch_trackers.push(self.move_tracker.clone());
         }
         self.move_tracker = super::affine::MoveTracker::merge_branches(&pre_branch_moves, &branch_trackers);
+
+        // Auto-drop: a value moved in some arms only must be dropped at the end of each arm
+        // that still owns it. Keyed by the original arm body -- the decision tree re-lowers
+        // that body as the last expression of any wrapper it creates.
+        self.equalize_branch_drops(&pre_branch_moves, &arm_edges);
         self.pop_implicits_scope();
 
         // Now compile the match into a decision tree. The `match expr | ...` expression will be
@@ -1297,7 +1332,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
     }
 
-    fn infer_assignment(&mut self, assignment: &cst::Assignment) -> Type {
+    fn infer_assignment(&mut self, assignment: &cst::Assignment, id: ExprId) -> Type {
         let lhs_hint = self.next_type_variable();
 
         // Allow `x := v` to use `x` even if moved but `x += v` cannot since it reads `x`
@@ -1358,6 +1393,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         self.check_expr(assignment.rhs, &value_type, TypeErrorKind::Assignment);
+
+        // Auto-drop: `x := new` over a live owned place drops the old value (after the RHS,
+        // before the store). Must run before `clear_moves` re-marks the place owned.
+        if is_plain {
+            self.assignment_overwrite_drop(assignment, id);
+        }
 
         // The LHS always holds a value after an assignment
         if let Some(path) = self.try_build_move_path(assignment.lhs) {

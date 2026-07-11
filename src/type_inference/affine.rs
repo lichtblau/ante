@@ -121,6 +121,16 @@ impl MoveTracker {
         self.moved.iter().find(|(moved_path, _)| moved_path.is_descendant_of(path))
     }
 
+    /// The root names of whole-local moves (`MovePath::Variable` entries) recorded here.
+    /// Used by drop elaboration's branch-edge equalization; field-path (partial) moves are
+    /// handled separately by residual drops.
+    pub(super) fn whole_moved_locals(&self) -> impl Iterator<Item = NameId> + '_ {
+        self.moved.keys().filter_map(|path| match path {
+            MovePath::Variable(name) => Some(*name),
+            MovePath::Field(..) => None,
+        })
+    }
+
     /// Merge into `self` the moves from `other` whose root variable is in `roots`.
     /// Used (under `--auto-drop`) to surface a lambda body's moves of *captured outer*
     /// variables to the enclosing scope: closures capture by reference, so a moved capture

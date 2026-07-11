@@ -1,0 +1,62 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+consume (_r: R): Unit = ()
+
+cond_move (flag: Bool): Unit =
+    x = R 1
+    if flag then consume x
+    else println "else edge"
+    println "after if"
+
+implicit_else (flag: Bool): Unit =
+    x = R 2
+    if flag then consume x
+    println "after implicit"
+
+arm_move (m: Maybe I32): Unit =
+    x = R 3
+    match m
+    | Some _ -> consume x
+    | None -> println "none arm"
+    println "after match"
+
+overwrite (): Unit =
+    var x = R 4
+    x := R 5
+    println "after overwrite"
+
+main () =
+    cond_move true
+    cond_move false
+    implicit_else true
+    implicit_else false
+    arm_move (Some 1)
+    arm_move None
+    overwrite ()
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// drop 1
+// after if
+// else edge
+// drop 1
+// after if
+// drop 2
+// after implicit
+// drop 2
+// after implicit
+// drop 3
+// after match
+// none arm
+// drop 3
+// after match
+// drop 4
+// after overwrite
+// drop 5
+// end

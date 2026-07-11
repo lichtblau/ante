@@ -222,7 +222,7 @@ struct TypeChecker<'local, 'inner> {
 
     /// Names captured (by reference) by any lambda in the current item (`--auto-drop` only).
     /// Captured names are never auto-dropped: the closure may outlive the owning scope, so
-    /// dropping the referent would dangle it. Skipping only leaks. Narrowed by 1f later.
+    /// dropping the referent would dangle it. Skipping only leaks for now.
     captured_names: FxHashSet<NameId>,
 
     /// Names defined with `var` or as mutable parameters. Used by closure capture analysis

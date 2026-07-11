@@ -322,7 +322,7 @@ where
             cst::Expr::Break => self.break_(),
             cst::Expr::Continue => self.continue_(),
             cst::Expr::Return(return_) => self.return_(return_.expression),
-            cst::Expr::Assignment(assignment) => self.assignment(assignment),
+            cst::Expr::Assignment(assignment) => self.assignment(assignment, expr),
             cst::Expr::Extern(extern_) => self.extern_(extern_, expr),
             cst::Expr::InterpolatedString(_) => {
                 unreachable!("InterpolatedString should be desugared before MIR generation")
@@ -1054,9 +1054,17 @@ where
     fn if_(&mut self, if_: &cst::If, expr: ExprId) -> Value {
         let condition = self.expression(if_.condition);
 
+        // Auto-drop: an else-less `if` whose then-branch moves values needs a real else
+        // block so the false edge can drop what it still owns.
+        let implicit_else_drops = self.context().implicit_else_drops(expr).cloned();
+
         let then = self.push_block_no_params();
         let else_ = self.push_block_no_params();
-        let end = if if_.else_.is_some() { self.push_block_no_params() } else { else_ };
+        let end = if if_.else_.is_some() || implicit_else_drops.is_some() {
+            self.push_block_no_params()
+        } else {
+            else_
+        };
         self.terminate_block(TerminatorInstruction::if_(condition, then, else_, end));
 
         self.switch_to_block(then);
@@ -1074,6 +1082,13 @@ where
             Value::Parameter(end, 0)
         } else {
             self.terminate_block(TerminatorInstruction::jmp_no_args(end));
+            if let Some(drops) = implicit_else_drops {
+                self.switch_to_block(else_);
+                for drop_call in drops {
+                    self.expression(drop_call);
+                }
+                self.terminate_block(TerminatorInstruction::jmp_no_args(end));
+            }
             self.switch_to_block(end);
             Value::Unit
         }
@@ -1377,7 +1392,7 @@ where
         }
     }
 
-    fn assignment(&mut self, assignment: &cst::Assignment) -> Value {
+    fn assignment(&mut self, assignment: &cst::Assignment, expr: ExprId) -> Value {
         let pointer = self.lhs_as_pointer(assignment.lhs);
 
         let value = if let Some((_, op_expr)) = assignment.op {
@@ -1404,6 +1419,14 @@ where
                 None => rhs,
             }
         };
+
+        // Auto-drop: the overwrite drop of the old value runs after the RHS is evaluated
+        // and before the store (Rust ordering; self-assignment never records one).
+        if let Some(drops) = self.context().pre_exit_drops(expr) {
+            for drop_call in drops.clone() {
+                self.expression(drop_call);
+            }
+        }
 
         self.push_instruction(Instruction::Store { pointer, value }, Type::UNIT);
         Value::Unit

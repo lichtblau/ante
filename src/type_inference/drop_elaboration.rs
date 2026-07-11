@@ -26,7 +26,12 @@ use crate::{
         cst::{self, Expr, ReferenceKind},
         ids::{ExprId, NameId, PatternId, TopLevelName},
     },
-    type_inference::{TypeChecker, affine::MovePath, errors::TypeErrorKind, types::Type},
+    type_inference::{
+        TypeChecker,
+        affine::{MovePath, MoveTracker},
+        errors::TypeErrorKind,
+        types::Type,
+    },
 };
 
 /// The kind of scope a [`DropScope`] tracks.
@@ -159,38 +164,157 @@ impl TypeChecker<'_, '_> {
                 continue;
             }
             let Some(typ) = self.name_types.get(&name).cloned() else { continue };
-            let typ = self.follow_type(&typ).clone();
-            // Not fully concrete (generics included): dropping needs `{Drop t}` propagation.
-            // We leak this for now.
-            if typ == Type::ERROR || !typ.free_vars(&self.bindings).is_empty() {
-                continue;
+            if let Some(drop) = self.try_synthesize_drop_for_place(&place, &typ, location) {
+                drops.push(drop);
             }
-            if self.type_is_copy(&typ) {
-                continue;
-            }
-            // No visible Drop impl: skip (leak).
-            if !self.type_has_drop_impl(&typ) {
-                continue;
-            }
-            drops.push(self.synthesize_drop_call(name, &typ, location));
         }
         drops
     }
 
-    /// Build and type-check `drop (mut <name>)` in the extended context, returning the call's
+    /// Apply the per-place filters (captured root, concrete type, Copy, visible Drop impl)
+    /// and synthesize the drop call if the place should be dropped. The caller has already
+    /// decided the place is *owned* on the edge in question. `None` means skip (each skip
+    /// can only leak, never double-free).
+    pub(super) fn try_synthesize_drop_for_place(
+        &mut self, place: &MovePath, typ: &Type, location: &Location,
+    ) -> Option<ExprId> {
+        // Captured by some closure: the closure may outlive this scope; dropping the
+        // referent would dangle it. Skip (leak) for now.
+        if self.captured_names.contains(&place.root_variable()) {
+            return None;
+        }
+        let typ = self.follow_type(typ).clone();
+        // Not fully concrete (generics included): dropping needs `{Drop t}` propagation,
+        // which lands with the derived-impls increment. Skip (leak).
+        if typ == Type::ERROR || !typ.free_vars(&self.bindings).is_empty() {
+            return None;
+        }
+        if self.type_is_copy(&typ) {
+            return None;
+        }
+        // No visible Drop impl: skip (leak).
+        if !self.type_has_drop_impl(&typ) {
+            return None;
+        }
+        Some(self.synthesize_drop_call(place, &typ, location))
+    }
+
+    /// For each `if`/`match` merge edge, drop the whole locals that a *sibling* branch moved
+    /// but this edge still owns. The merged tracker reads such places as moved (union), so
+    /// the end of the still-owning branch is the only point that can release them.
+    /// `edges` holds each non-diverging branch's body expression and end-state tracker.
+    /// Field paths (partial moves) are deferred to the residual increment.
+    pub(super) fn equalize_branch_drops(&mut self, pre_branch: &MoveTracker, edges: &[(ExprId, MoveTracker)]) {
+        if !self.drop_elaboration_active() || edges.is_empty() {
+            return;
+        }
+        let candidates = self.branch_move_candidates(pre_branch, edges.iter().map(|(_, tracker)| tracker));
+        if candidates.is_empty() {
+            return;
+        }
+        for (edge_expr, tracker) in edges {
+            let location = self.current_extended_context().expr_location(*edge_expr);
+            let mut drops = Vec::new();
+            for name in &candidates {
+                let place = MovePath::Variable(*name);
+                if tracker.is_moved(&place).is_none() && tracker.has_child_moved(&place).is_none() {
+                    let Some(typ) = self.name_types.get(name).cloned() else { continue };
+                    if let Some(drop) = self.try_synthesize_drop_for_place(&place, &typ, &location) {
+                        drops.push(drop);
+                    }
+                }
+            }
+            if !drops.is_empty() {
+                self.current_extended_context_mut().push_post_expr_drops(*edge_expr, drops);
+            }
+        }
+    }
+
+    /// Drops for the implicit else edge of an else-less `if` whose then-branch moved values:
+    /// on the false edge those values are still owned, and there is no expression to key them
+    /// on -- the builder materializes a real else block from `implicit_else_drops`.
+    pub(super) fn implicit_else_edge_drops(
+        &mut self, pre_branch: &MoveTracker, then_moves: &MoveTracker, location: &Location,
+    ) -> Vec<ExprId> {
+        if !self.drop_elaboration_active() {
+            return Vec::new();
+        }
+        let candidates = self.branch_move_candidates(pre_branch, std::iter::once(then_moves));
+        let mut drops = Vec::new();
+        for name in candidates {
+            // The implicit edge's state is `pre_branch`, which owns every candidate.
+            let Some(typ) = self.name_types.get(&name).cloned() else { continue };
+            let place = MovePath::Variable(name);
+            if let Some(drop) = self.try_synthesize_drop_for_place(&place, &typ, location) {
+                drops.push(drop);
+            }
+        }
+        drops
+    }
+
+    /// Whole locals declared in an enclosing drop scope that some branch moved while the
+    /// pre-branch state still owned them -- the candidate set for edge equalization. Ordered
+    /// innermost-scope-first, reverse declaration order (the drop order used on each edge).
+    fn branch_move_candidates<'a>(
+        &self, pre_branch: &MoveTracker, trackers: impl Iterator<Item = &'a MoveTracker>,
+    ) -> Vec<NameId> {
+        let mut moved_somewhere = rustc_hash::FxHashSet::default();
+        for tracker in trackers {
+            for name in tracker.whole_moved_locals() {
+                if pre_branch.is_moved(&MovePath::Variable(name)).is_none() {
+                    moved_somewhere.insert(name);
+                }
+            }
+        }
+        if moved_somewhere.is_empty() {
+            return Vec::new();
+        }
+        let mut ordered = Vec::new();
+        for scope in self.drop_scopes.iter().rev() {
+            for name in scope.names.iter().rev() {
+                if moved_somewhere.contains(name) {
+                    ordered.push(*name);
+                }
+            }
+        }
+        ordered
+    }
+
+    /// `x := new` over a live owned place drops the old value after the
+    /// RHS is evaluated, before the store. Restricted to places rooted
+    /// at owned locals -- deref-stores through references or pointers
+    /// (`ptr_store`) never drop the old pointee (documented v1 parity
+    /// gap). Must run before `clear_moves` re-marks the place owned.
+    pub(super) fn assignment_overwrite_drop(&mut self, assignment: &cst::Assignment, id: ExprId) {
+        if !self.drop_elaboration_active() {
+            return;
+        }
+        let Some(place) = self.try_build_move_path(assignment.lhs) else { return };
+        let root = place.root_variable();
+        let Some(root_type) = self.name_types.get(&root).cloned() else { return };
+        if root_type.reference_element(&self.bindings).is_some()
+            || root_type.pointer_element(&self.bindings).is_some()
+        {
+            return;
+        }
+        // Overwriting a moved-out hole (or a partially-moved value: residuals are a later
+        // increment): nothing to drop.
+        if self.move_tracker.is_moved(&place).is_some() || self.move_tracker.has_child_moved(&place).is_some() {
+            return;
+        }
+        let Some(lhs_type) = self.expr_types.get(&assignment.lhs).cloned() else { return };
+        let location = self.current_extended_context().expr_location(assignment.lhs);
+        if let Some(drop) = self.try_synthesize_drop_for_place(&place, &lhs_type, &location) {
+            self.current_extended_context_mut().push_pre_exit_drops(id, vec![drop]);
+        }
+    }
+
+    /// Build and type-check `drop (mut <place>)` in the extended context, returning the call's
     /// `ExprId`. Checking it runs the full pipeline, so the `Drop` impl is resolved and
     /// materialized by implicit search (possibly delayed to the enclosing scope's pop) and the
     /// MIR builder can lower the expression like any user-written call.
-    fn synthesize_drop_call(&mut self, name: NameId, typ: &Type, location: &Location) -> ExprId {
-        let name_string = self.current_extended_context()[name].as_ref().clone();
-
-        let place_path = self.push_path(
-            cst::Path { components: vec![(name_string, location.clone())] },
-            typ.clone(),
-            location.clone(),
-        );
-        self.current_extended_context_mut().insert_path_origin(place_path, Origin::Local(name));
-        let place_expr = self.push_expr(Expr::Variable(place_path), typ.clone(), location.clone());
+    fn synthesize_drop_call(&mut self, place: &MovePath, typ: &Type, location: &Location) -> ExprId {
+        let place_expr = self.synthesize_place_expr(place, typ, location);
 
         let ref_type = self.next_type_variable();
         let reference = cst::Reference { kind: ReferenceKind::Mut, rhs: place_expr };
@@ -220,6 +344,36 @@ impl TypeChecker<'_, '_> {
         self.synthesizing_drops = old_synthesizing;
 
         call_expr
+    }
+
+    /// Build the expression denoting `place`: a variable reference for a root, member-access
+    /// chains for field paths (`x.field`). Only real struct fields appear here -- enum payload
+    /// places (`Ok#0`) have no expression form and never reach this (residual drops of sums
+    /// synthesize a match instead).
+    fn synthesize_place_expr(&mut self, place: &MovePath, typ: &Type, location: &Location) -> ExprId {
+        match place {
+            MovePath::Variable(name) => {
+                let name_string = self.current_extended_context()[*name].as_ref().clone();
+                let place_path = self.push_path(
+                    cst::Path { components: vec![(name_string, location.clone())] },
+                    typ.clone(),
+                    location.clone(),
+                );
+                self.current_extended_context_mut().insert_path_origin(place_path, Origin::Local(*name));
+                self.push_expr(Expr::Variable(place_path), typ.clone(), location.clone())
+            },
+            MovePath::Field(parent, field) => {
+                let parent_type = match parent.as_ref() {
+                    MovePath::Variable(name) => {
+                        self.name_types.get(name).cloned().unwrap_or_else(|| self.next_type_variable())
+                    },
+                    MovePath::Field(..) => self.next_type_variable(),
+                };
+                let object = self.synthesize_place_expr(parent, &parent_type, location);
+                let access = cst::MemberAccess { object, member: field.clone() };
+                self.push_expr(Expr::MemberAccess(access), typ.clone(), location.clone())
+            },
+        }
     }
 
     /// Returns the TopLevelName for the Prelude's `Drop.drop` method, caching it.
