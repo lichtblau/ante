@@ -115,6 +115,15 @@ pub struct ExtendedTopLevelContext {
     /// directly rather than as a synthesized call.
     closure_env_releases: FxHashSet<ExprId>,
 
+    /// Closure *place* expressions rewritten by the MIR builder into "extract environment slot `n`
+    /// of this closure". An affine closure owns the non-`Copy` values in its env tuple, and whoever
+    /// holds the closure when it dies must drop them -- including a caller that received the closure
+    /// from an escape, which knows only the closure's *type*. Env slots have no surface syntax
+    /// (`get_field_types` on a `Type::Function` is empty, and there is no tuple pattern), so drop
+    /// elaboration binds each owned slot to a fresh local through one of these markers and drops
+    /// that local by name.
+    closure_env_slots: FxHashMap<ExprId, u32>,
+
     /// Drop calls synthesized by drop elaboration (`--auto-drop`), keyed by the expression
     /// whose value immediately precedes the scope-exit edge. The MIR builder lowers them
     /// right after that expression's value is computed. Keys today: a `Sequence` (block
@@ -181,6 +190,7 @@ impl ExtendedTopLevelContext {
             retain_bindings: Default::default(),
             escape_retains: Default::default(),
             closure_env_releases: Default::default(),
+            closure_env_slots: Default::default(),
             post_expr_drops: Default::default(),
             pre_exit_drops: Default::default(),
             implicit_else_drops: Default::default(),
@@ -423,6 +433,9 @@ impl ExtendedTopLevelContext {
         if self.closure_env_releases.contains(&from) {
             self.closure_env_releases.insert(to);
         }
+        if let Some(&slot) = self.closure_env_slots.get(&from) {
+            self.closure_env_slots.insert(to, slot);
+        }
         if let Some(drops) = self.post_expr_drops.get(&from).cloned() {
             self.post_expr_drops.insert(to, drops);
         }
@@ -464,6 +477,17 @@ impl ExtendedTopLevelContext {
 
     pub fn is_closure_env_release(&self, expr: ExprId) -> bool {
         self.closure_env_releases.contains(&expr)
+    }
+
+    /// Rewrite `expr` (a closure place) into an extract of its env slot `index`; see
+    /// [Self::closure_env_slots].
+    pub(crate) fn mark_closure_env_slot(&mut self, expr: ExprId, index: u32) {
+        self.closure_env_slots.insert(expr, index);
+    }
+
+    #[allow(dead_code, reason = "read by the MIR builder, which the lib target does not compile")]
+    pub(crate) fn closure_env_slot(&self, expr: ExprId) -> Option<u32> {
+        self.closure_env_slots.get(&expr).copied()
     }
 
     /// Append synthesized drop calls to run after `expr`'s value is computed.

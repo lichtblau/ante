@@ -204,7 +204,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 // block (returned/stored/passed), so the drop below never frees an aliased escapee.
                 let diverges = self.diverges(&result);
                 let location = self.current_extended_context().expr_location(id);
-                self.retract_escaping_move_closures(id);
+                self.retract_escaping_closure_env_releases(id);
                 let drops = self.pop_drop_scope(diverges, &location);
                 if !drops.is_empty() {
                     self.current_extended_context_mut().push_post_expr_drops(id, drops);

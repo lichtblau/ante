@@ -306,7 +306,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     ///   borrows it.
     /// - An env tuple is Copy iff every capture is; an owned capture (a `String`) defers to
     ///   `type_is_copy` and makes the closure affine.
-    fn env_type_is_copy(&mut self, env: &Type) -> bool {
+    pub(super) fn env_type_is_copy(&mut self, env: &Type) -> bool {
         let env = self.follow_type(env).clone();
         match &env {
             Type::Primitive(_) => true,

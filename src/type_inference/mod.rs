@@ -307,13 +307,6 @@ struct TypeChecker<'local, 'inner> {
     /// header off the stack. Excluded from closure-env RC for now.
     effect_continuation_names: FxHashSet<NameId>,
 
-    /// Each `move`-closure binding → the non-Copy, non-`var` variables it captured by value. The
-    /// env is those captures' sole owner (the moves are recorded, the outer scope neither uses nor
-    /// drops them), so when the closure value itself dies un-moved its captures are dropped
-    /// here. Keyed by the binding name (`m = move fn …`); an escaping closure is recorded moved, so
-    /// its scope-exit drop -- and this env drop with it -- never fires.
-    move_closure_captures: FxHashMap<NameId, Vec<NameId>>,
-
     /// Each closure binding (`move` *or* not) → the concretely `shared`-typed, non-`var` variables
     /// it captured by value. A shared handle is `Copy`, so the capture is a bit-copy the owner
     /// keeps too; the pack-time `RcRetain` (`pack_closure_environment`) gives the env its own
@@ -321,13 +314,9 @@ struct TypeChecker<'local, 'inner> {
     /// un-escaped. The owner's own release is restored in tandem (the capture is removed from
     /// `captured_names`), so the pair is: +1 capture retain, −1 env death, −1 owner exit against
     /// the original +1 ownership. Keyed by the binding name; an escaping closure is retracted from
-    /// this table (`retract_escaping_move_closures`) so only the leak-not-UAF fallback remains.
+    /// this table (`retract_escaping_closure_env_releases`) so only the leak-not-UAF fallback
+    /// remains.
     shared_closure_captures: FxHashMap<NameId, Vec<NameId>>,
-
-    /// Names whose `captured_names` skip is temporarily lifted because their owning `move` closure
-    /// is dying on this edge and we are synthesizing its env drop. Covers the whole subtree rooted
-    /// at the capture (a structural drop recurses through `captured_names.contains`).
-    force_drop_captured: FxHashSet<NameId>,
 
     /// Recursion guard for structural drop expansion (`--auto-drop`): recursive types
     /// cannot be expanded inline, so expansion stops at a fixed depth (skips leak).
@@ -424,9 +413,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             call_argument_depth: 0,
             pending_autoref_temp_drops: Vec::new(),
             effect_continuation_names: Default::default(),
-            move_closure_captures: Default::default(),
             shared_closure_captures: Default::default(),
-            force_drop_captured: Default::default(),
             drop_expansion_depth: 0,
             copy_check_depth: 0,
             function_local_names: Vec::new(),
@@ -583,9 +570,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.call_argument_depth = 0;
         self.pending_autoref_temp_drops.clear();
         self.effect_continuation_names.clear();
-        self.move_closure_captures.clear();
         self.shared_closure_captures.clear();
-        self.force_drop_captured.clear();
         self.drop_expansion_depth = 0;
         self.function_local_names.clear();
         self.diagnosed_missing_drops.clear();

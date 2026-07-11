@@ -315,6 +315,21 @@ where
             self.push_instruction(Instruction::ReleaseClosureEnv(env), Type::UNIT);
         }
 
+        // The frontend marked this closure place as an env-slot extract, so its value is the slot,
+        // not the closure. A closure is a `(function, environment)` pair, so the env is field 1 and
+        // the slot is field `index` of the env tuple. Only stack (tuple) envs are marked -- a heap
+        // env is an opaque pointer at the type layer, and its captures are released wholesale by
+        // `ReleaseClosureEnv` above.
+        if let Some(index) = self.context().closure_env_slot(expr)
+            && let Type::Function(function) = self.type_of_value(&value)
+            && let Type::Tuple(slots) = function.environment.clone()
+        {
+            let slot_type = slots[index as usize].clone();
+            let env_type = function.environment.clone();
+            let env = self.push_instruction(Instruction::IndexTuple { tuple: value, index: 1 }, env_type);
+            return self.push_instruction(Instruction::IndexTuple { tuple: env, index }, slot_type);
+        }
+
         value
     }
 

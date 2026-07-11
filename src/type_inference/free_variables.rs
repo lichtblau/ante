@@ -162,13 +162,6 @@ impl TypeChecker<'_, '_> {
         for capture in &owned_captures {
             self.captured_names.remove(capture);
         }
-        // Only a *bound* move closure gets an env-drop obligation (`m = move fn …`); an anonymous
-        // move closure passed straight into a call escapes by move and is never scope-dropped.
-        if let Some(binding) = self_name
-            && !owned_captures.is_empty()
-        {
-            self.move_closure_captures.insert(binding, owned_captures);
-        }
     }
 
     /// A `shared` handle captured **by value** into a closure env is a bit-copy the owner still
