@@ -398,6 +398,20 @@ impl<'ctx> ModuleContext<'ctx> {
         }
     }
 
+    /// Emit an `alloca` in the current function's ENTRY block regardless of where the builder
+    /// currently is. An alloca emitted inside a loop body grows the stack every iteration at
+    /// -O0 (a long `while` loop overflows); entry-block allocas are the one slot per frame the
+    /// C backend's function-scoped locals already give.
+    fn build_entry_alloca(&self, typ: BasicTypeEnum<'ctx>) -> inkwell::values::PointerValue<'ctx> {
+        let entry = self.blocks[mir::BlockId::ENTRY_BLOCK];
+        let b = self.llvm.create_builder();
+        match entry.get_first_instruction() {
+            Some(first) => b.position_before(&first),
+            None => b.position_at_end(entry),
+        }
+        b.build_alloca(typ, "").unwrap()
+    }
+
     fn codegen_block(&mut self, block_id: BlockId, function: &mir::Definition) {
         let llvm_block = self.blocks[block_id];
         self.builder.position_at_end(llvm_block);
@@ -588,13 +602,13 @@ impl<'ctx> ModuleContext<'ctx> {
             },
             mir::Instruction::StackAlloc(value) => {
                 let value = self.lookup_value(value);
-                let alloca = self.builder.build_alloca(value.get_type(), "").unwrap();
+                let alloca = self.build_entry_alloca(value.get_type());
                 self.builder.build_store(alloca, value).unwrap();
                 alloca.into()
             },
             mir::Instruction::StackAllocUninit(typ) => {
                 let typ = self.convert_type(typ);
-                self.builder.build_alloca(typ, "").unwrap().into()
+                self.build_entry_alloca(typ).into()
             },
             mir::Instruction::AllocShared(value) => {
                 // Allocate `{count, pad, value}` -- a fixed 16-byte header before the value (two i64
@@ -674,7 +688,7 @@ impl<'ctx> ModuleContext<'ctx> {
                 let i64_ty = self.llvm.i64_type();
                 let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
                 let block = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
-                let scratch = self.builder.build_alloca(i64_ty, "").unwrap();
+                let scratch = self.build_entry_alloca(i64_ty.into());
                 let null = ptr.get_type().const_null();
                 let is_null = self.builder.build_int_compare(IntPredicate::EQ, ptr, null, "").unwrap();
                 let addr = self.builder.build_select(is_null, scratch, block, "").unwrap().into_pointer_value();
@@ -696,7 +710,7 @@ impl<'ctx> ModuleContext<'ctx> {
                 let i64_ty = self.llvm.i64_type();
                 let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
                 let block = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
-                let scratch = self.builder.build_alloca(i64_ty, "").unwrap();
+                let scratch = self.build_entry_alloca(i64_ty.into());
                 let null = ptr.get_type().const_null();
                 let is_null = self.builder.build_int_compare(IntPredicate::EQ, ptr, null, "").unwrap();
                 let addr = self.builder.build_select(is_null, scratch, block, "").unwrap().into_pointer_value();
@@ -914,7 +928,9 @@ impl<'ctx> ModuleContext<'ctx> {
     fn transmute(&mut self, value: &mir::Value, function: &mir::Definition, id: InstructionId) -> BasicValueEnum<'ctx> {
         let result_type = self.convert_type(function.instruction_result_type(id));
         let value = self.lookup_value(value);
-        let alloca = self.builder.build_alloca(value.get_type(), "").unwrap();
+        // Entry-block scratch slot: a transmute inside a loop body must not grow the stack
+        // every iteration (see build_entry_alloca).
+        let alloca = self.build_entry_alloca(value.get_type());
         self.builder.build_store(alloca, value).unwrap();
         self.builder.build_load(result_type, alloca, "").unwrap()
     }

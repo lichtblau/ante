@@ -1905,23 +1905,71 @@ where
         let old_scope = std::mem::take(&mut self.local_variables);
         let old_mutables = std::mem::take(&mut self.mutable_locals);
 
+        // A self-recursive shared type (`Cons I32 L`) must not tear down with one native frame per
+        // node -- a long list overflows the stack. When any field releases through *this same* type
+        // instantiation, lower the release as a pointer-chasing loop over the LAST such field per
+        // variant (non-last self fields keep their recursive calls, so trees consume depth, not
+        // size).
+        let has_self_tail = self.type_has_self_release_field(&generic_args);
+
         let id = self.new_definition(name, Some(NameId::RELEASE_FUNCTION), generic_count, fn_type, |this| {
             this.push_parameter(Type::POINTER);
             let handle = Value::Parameter(this.current_block, 0);
 
-            let reached_zero = this.push_instruction(Instruction::RcDecrement(handle), Type::BOOL);
-            let glue_block = this.push_block_no_params();
-            let cont = this.push_block_no_params();
-            this.terminate_block(TerminatorInstruction::if_(reached_zero, glue_block, cont, cont));
+            if has_self_tail {
+                // cur/next live in stack slots (the same shape `while_` lowers to):
+                //   header:  cur = *cur_slot; if !RcDecrement(cur) -> exit
+                //   glue:    *next_slot = null; <release fields, the tail deferred into
+                //            next_slot>; FreeShared(cur); if *next_slot == null -> exit
+                //   advance: *cur_slot = next; jmp header
+                // Immortal statics (`Nil`) end the chase at RcDecrement (a count-0 sentinel
+                // is left alone); the null check covers variants with no self field.
+                let null =
+                    this.push_instruction(Instruction::Transmute(Value::Integer(IntConstant::Usz(0))), Type::POINTER);
+                let next_slot = this.push_instruction(Instruction::StackAlloc(null), Type::POINTER);
+                let cur_slot = this.push_instruction(Instruction::StackAlloc(handle), Type::POINTER);
+                let header = this.push_block_no_params();
+                let glue_block = this.push_block_no_params();
+                let advance = this.push_block_no_params();
+                let exit = this.push_block_no_params();
+                this.terminate_block(TerminatorInstruction::jmp_no_args(header));
 
-            // Last reference: release the pointee's shared fields, then free the whole block.
-            this.switch_to_block(glue_block);
-            this.build_release_glue(handle, &self_tc, &generic_args);
-            this.push_instruction(Instruction::FreeShared(handle), Type::UNIT);
-            this.terminate_block(TerminatorInstruction::jmp_no_args(cont));
+                this.switch_to_block(header);
+                let cur = this.push_instruction(Instruction::Deref(cur_slot), Type::POINTER);
+                let reached_zero = this.push_instruction(Instruction::RcDecrement(cur), Type::BOOL);
+                this.terminate_block(TerminatorInstruction::if_(reached_zero, glue_block, exit, exit));
 
-            this.switch_to_block(cont);
-            this.terminate_block(TerminatorInstruction::Return(Value::Unit));
+                this.switch_to_block(glue_block);
+                this.push_instruction(Instruction::Store { pointer: next_slot, value: null }, Type::UNIT);
+                this.build_release_glue(cur, &self_tc, &generic_args, Some(next_slot));
+                this.push_instruction(Instruction::FreeShared(cur), Type::UNIT);
+                let next = this.push_instruction(Instruction::Deref(next_slot), Type::POINTER);
+                let next_int = this.push_instruction(Instruction::Transmute(next), Type::int(IntegerKind::Usz));
+                let is_null = this
+                    .push_instruction(Instruction::EqInt(next_int, Value::Integer(IntConstant::Usz(0))), Type::BOOL);
+                this.terminate_block(TerminatorInstruction::if_(is_null, exit, advance, exit));
+
+                this.switch_to_block(advance);
+                this.push_instruction(Instruction::Store { pointer: cur_slot, value: next }, Type::UNIT);
+                this.terminate_block(TerminatorInstruction::jmp_no_args(header));
+
+                this.switch_to_block(exit);
+                this.terminate_block(TerminatorInstruction::Return(Value::Unit));
+            } else {
+                let reached_zero = this.push_instruction(Instruction::RcDecrement(handle), Type::BOOL);
+                let glue_block = this.push_block_no_params();
+                let cont = this.push_block_no_params();
+                this.terminate_block(TerminatorInstruction::if_(reached_zero, glue_block, cont, cont));
+
+                // Last reference: release the pointee's shared fields, then free the whole block.
+                this.switch_to_block(glue_block);
+                this.build_release_glue(handle, &self_tc, &generic_args, None);
+                this.push_instruction(Instruction::FreeShared(handle), Type::UNIT);
+                this.terminate_block(TerminatorInstruction::jmp_no_args(cont));
+
+                this.switch_to_block(cont);
+                this.terminate_block(TerminatorInstruction::Return(Value::Unit));
+            }
         });
 
         self.local_variables = old_scope;
@@ -1929,14 +1977,33 @@ where
         self.name_to_id.insert(TopLevelName::new(self.top_level_id, NameId::RELEASE_FUNCTION), id);
     }
 
+    /// True when a directly-releasable field of this type's body is this same type applied to
+    /// the same generics -- the self-recursive shape whose release must be a loop.
+    fn type_has_self_release_field(&self, generic_args: &[TCType]) -> bool {
+        let args = (!generic_args.is_empty()).then_some(generic_args);
+        let is_self = |this: &Self, tc: &TCType| {
+            this.shared_release_target(tc)
+                .is_some_and(|(id, args)| id == this.top_level_id && args.as_slice() == generic_args)
+        };
+        match self.top_level_id.type_body(args, self.compiler) {
+            crate::type_inference::TypeBody::Product { fields, .. } => {
+                fields.iter().any(|(_, tc)| is_self(self, tc))
+            },
+            crate::type_inference::TypeBody::Sum(variants) => {
+                variants.iter().any(|(_, payloads)| payloads.iter().any(|tc| is_self(self, tc)))
+            },
+        }
+    }
+
     /// Emit the pointee-field releases for a shared type's `release_T`. Derefs the handle to the
     /// pointee layout, then walks it via [Self::release_inline_body]. Leaves the builder positioned
-    /// at a single continuation block.
-    fn build_release_glue(&mut self, handle: Value, self_tc: &TCType, generic_args: &[TCType]) {
+    /// at a single continuation block. `tail_slot`, when set, receives the active variant's last
+    /// self-recursive handle via a Store instead of a recursive release call.
+    fn build_release_glue(&mut self, handle: Value, self_tc: &TCType, generic_args: &[TCType], tail_slot: Option<Value>) {
         let inner = self.deref_if_shared(handle, self_tc);
         // The pointee is processed as an inline aggregate of *this* type -- but not through
         // [Self::release_inline_value], which would re-enter `release_T` recursively (a self-call).
-        self.release_inline_body(inner, self.top_level_id, generic_args);
+        self.release_inline_body(inner, self.top_level_id, generic_args, tail_slot);
     }
 
     /// Release every shared handle reachable from `value`, an inline aggregate value laid out as the
@@ -1945,15 +2012,29 @@ where
     /// the builder at a single merge block. Directly-shared fields become recursive `release_T`
     /// calls; nested non-shared aggregates (`Maybe (shared T)`, tuples, …) are traversed inline so
     /// the shared values they wrap are still released. Bare generics are skipped (v1 leak).
-    fn release_inline_body(&mut self, value: Value, type_id: TopLevelId, args: &[TCType]) {
+    fn release_inline_body(&mut self, value: Value, type_id: TopLevelId, args: &[TCType], tail_slot: Option<Value>) {
+        // With a tail slot active, the LAST field of each variant that releases through this same
+        // type instantiation is stored into the slot instead of released (the release loop
+        // pointer-chases it). Earlier self fields keep recursive calls.
+        let is_self_field = |this: &Self, tc: &TCType| {
+            tail_slot.is_some()
+                && this
+                    .shared_release_target(tc)
+                    .is_some_and(|(id, targs)| id == this.top_level_id && targs.as_slice() == args)
+        };
         // Substitute the type's parameters with these args; `None` would instantiate them as fresh
         // unbound type variables (→ `Type::Error` at codegen).
-        let args = (!args.is_empty()).then_some(args);
-        match type_id.type_body(args, self.compiler) {
+        let args_opt = (!args.is_empty()).then_some(args);
+        match type_id.type_body(args_opt, self.compiler) {
             crate::type_inference::TypeBody::Product { fields, .. } => {
+                let tail_index = fields.iter().rposition(|(_, tc)| is_self_field(self, tc));
                 let variant = self.extract_variant(value, 0);
                 for (i, (_, field_tc)) in fields.iter().enumerate() {
-                    self.release_inline_field(variant, i as u32, &field_tc);
+                    if Some(i) == tail_index {
+                        self.defer_release_into_slot(variant, i as u32, field_tc, tail_slot.unwrap());
+                    } else {
+                        self.release_inline_field(variant, i as u32, field_tc);
+                    }
                 }
             },
             crate::type_inference::TypeBody::Sum(variants) => {
@@ -1976,9 +2057,14 @@ where
                 for (idx, (_, payloads)) in variants.iter().enumerate() {
                     self.switch_to_block(case_blocks[idx].1.0);
                     if !payloads.is_empty() {
+                        let tail_index = payloads.iter().rposition(|tc| is_self_field(self, tc));
                         let variant = self.extract_variant(value, idx);
                         for (j, payload_tc) in payloads.iter().enumerate() {
-                            self.release_inline_field(variant, j as u32, payload_tc);
+                            if Some(j) == tail_index {
+                                self.defer_release_into_slot(variant, j as u32, payload_tc, tail_slot.unwrap());
+                            } else {
+                                self.release_inline_field(variant, j as u32, payload_tc);
+                            }
                         }
                     }
                     self.terminate_block(TerminatorInstruction::jmp_no_args(end));
@@ -1986,6 +2072,14 @@ where
                 self.switch_to_block(end);
             },
         }
+    }
+
+    /// Project field `index` out of `tuple` and store its handle into the release
+    /// loop's tail slot (deferring it to the pointer chase) instead of releasing it.
+    fn defer_release_into_slot(&mut self, tuple: Value, index: u32, field_tc: &TCType, slot: Value) {
+        let field_type = self.convert_type(field_tc, None);
+        let field = self.push_instruction(Instruction::IndexTuple { tuple, index }, field_type);
+        self.push_instruction(Instruction::Store { pointer: slot, value: field }, Type::UNIT);
     }
 
     /// Project field `index` out of `tuple` and release the shared handles reachable from it.
@@ -2005,7 +2099,9 @@ where
         if let Some((type_id, type_args)) = self.shared_release_target(tc) {
             self.emit_release_call(value, type_id, &type_args);
         } else if let Some((type_id, type_args)) = self.aggregate_type_target(tc) {
-            self.release_inline_body(value, type_id, &type_args);
+            // Nested aggregates never defer: only the release loop's own top-level pointee
+            // walk pointer-chases.
+            self.release_inline_body(value, type_id, &type_args, None);
         }
     }
 

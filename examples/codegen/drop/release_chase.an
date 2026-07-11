@@ -1,0 +1,30 @@
+// Releasing a self-recursive shared type must not consume one native stack
+// frame per node. `release_L` is lowered as a pointer-chasing loop over the
+// variant's last self-recursive field, so this million-node list tears down
+// with flat stack usage at `build_and_drop`'s scope exit (the recursive
+// lowering overflowed the stack here and crashed before printing
+// anything). Trees (see shared_rc.an's RbTree) keep recursive calls for
+// non-last self fields and consume depth, not size.
+
+shared type L =
+    | Nil
+    | Cons I32 L
+
+build_and_drop (n: I32): I32 =
+    var list: L = Nil
+    var i = 0
+    while i < n do
+        list := Cons 1 list
+        i := i + 1
+    match list
+    | Nil -> 0
+    | Cons x _ -> x
+
+main () =
+    println (build_and_drop 1000000)
+    println "done"
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 1
+// done
