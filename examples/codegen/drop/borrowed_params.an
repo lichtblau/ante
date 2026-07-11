@@ -1,0 +1,35 @@
+// `sum_list`'s parameter is by-value, concretely shared, never tail-returned
+// and never captured -- so it is inferred *borrowing*: the callee never
+// releases it, and statically-known call sites with pure (unconstrained
+// static impl) implicits elide the argument retain outright. `use_weigh`
+// passes its own borrowing parameter to an ability method (the callee-owns
+// ability path retains/releases that hop independently).
+
+shared type L =
+    | Nil
+    | Cons I32 L
+
+sum_list (l: L): I32 =
+    match l
+    | Nil -> 0
+    | Cons x rest -> x + sum_list rest
+
+ability Weigh t =
+    weigh: fn t -> I32
+
+impl weigh_l: Weigh L with
+    weigh (l: L): I32 = sum_list l
+
+use_weigh (l: L) {w: Weigh L}: I32 = weigh l {w}
+
+main () =
+    list: L = Cons 1 (Cons 2 (Cons 3 Nil))
+    println (sum_list list)
+    println (use_weigh list)
+    println (sum_list list)
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 6
+// 6
+// 6

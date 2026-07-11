@@ -663,19 +663,49 @@ where
         // callee's parameter release, or the constructed value's later release, balances it).
         let is_release_call = matches!(&self.context()[call.function], cst::Expr::Variable(path)
             if matches!(self.context().path_origin(*path), Some(Origin::TopLevelDefinition(name)) if name.local_name_id == NameId::RELEASE_FUNCTION));
+        // A statically-known callee may have borrowing parameters (it never releases them). For a
+        // shared *place* argument in such a position, the callee-owns retain is elided outright
+        // when every implicit argument of this call is an unconstrained static impl (the callee
+        // then provably cannot suspend); otherwise the retain stays and is balanced by a post-call
+        // release -- the caller's frame holds the handle across any suspension. A shared *rvalue*
+        // argument (fresh, count 1) is caller-owned either way and released after the call.
+        let callee_mask = if is_release_call { None } else { self.borrowed_param_mask_of_callee(call.function) };
+        let implicits_pure = callee_mask.is_some()
+            && call.arguments.iter().filter(|arg| arg.is_implicit).all(|arg| self.implicit_is_pure_static(arg.expr));
+
         // Implicit capability arguments to plain calls (a generic wrapper like `println x
         // {Print t}`) get the same treatment as ability-method calls above: an
         // application-shaped cap is freshly allocated for this call, so the caller releases
         // its method-closure environments once the call completes.
         let mut cap_env_releases = Vec::new();
+        let mut post_call_releases: Vec<(Value, ExprId)> = Vec::new();
+        let mut explicit_index = 0usize;
         let arguments = mapvec(&call.arguments, |arg| {
             if arg.is_implicit && !is_release_call {
                 self.lower_drop_capability(arg.expr, &mut cap_env_releases)
             } else {
                 let value = self.expression(arg.expr);
                 if !is_release_call {
-                    self.retain_if_shared_place(arg.expr, value);
+                    let borrowed = callee_mask
+                        .as_ref()
+                        .is_some_and(|mask| mask.get(explicit_index).copied().unwrap_or(false))
+                        && self.expr_tc_is_shared(arg.expr);
+                    if borrowed {
+                        let is_place =
+                            matches!(&self.context()[arg.expr], cst::Expr::Variable(_) | cst::Expr::MemberAccess(_));
+                        if is_place && implicits_pure {
+                            // Pair elided: no retain here, no release in the callee.
+                        } else {
+                            if is_place {
+                                self.retain_if_shared_place(arg.expr, value);
+                            }
+                            post_call_releases.push((value, arg.expr));
+                        }
+                    } else {
+                        self.retain_if_shared_place(arg.expr, value);
+                    }
                 }
+                explicit_index += 1;
                 value
             }
         });
@@ -693,8 +723,44 @@ where
             for environment in cap_env_releases {
                 self.push_instruction(Instruction::ReleaseClosureEnv(environment), Type::UNIT);
             }
+            for (arg_value, arg_expr) in post_call_releases {
+                self.emit_shared_release_for_expr(arg_value, arg_expr);
+            }
         }
         value
+    }
+
+    /// The borrowing-parameter mask of a call's statically-known top-level callee, from its item's
+    /// inference result. `None` for indirect calls, effect ops, and callees without borrowing
+    /// parameters.
+    fn borrowed_param_mask_of_callee(&mut self, function: ExprId) -> Option<Vec<bool>> {
+        let cst::Expr::Variable(path) = &self.context()[function] else { return None };
+        let Some(Origin::TopLevelDefinition(name)) = self.context().path_origin(*path) else { return None };
+        let check = crate::incremental::TypeCheck(name.top_level_item).get(self.compiler);
+        let mask = check.result.borrowed_params.get(&name.local_name_id)?;
+        (!mask.is_empty()).then(|| mask.clone())
+    }
+
+    /// True when an implicit argument is an unconstrained static impl -- a plain reference to a
+    /// top-level definition whose value is not function-typed. Such a capability carries no hidden
+    /// effect constraints, so the callee cannot suspend through it. Locals (handler capabilities!),
+    /// applications, and constrained impls all fail this.
+    fn implicit_is_pure_static(&mut self, expr: ExprId) -> bool {
+        let cst::Expr::Variable(path) = &self.context()[expr] else { return false };
+        if !matches!(self.context().path_origin(*path), Some(Origin::TopLevelDefinition(_))) {
+            return false;
+        }
+        let typ = self.types.result.maps.expr_types[&expr].follow(&self.types.bindings);
+        !matches!(typ, TCType::Function(_))
+    }
+
+    /// Release a shared handle the caller owns past the call (`release_T` derived from the argument
+    /// expression's TC type). No-op for non-shared types.
+    fn emit_shared_release_for_expr(&mut self, value: Value, expr: ExprId) {
+        let tc_type = self.types.result.maps.expr_types[&expr].follow(&self.types.bindings);
+        if let Some((type_id, type_args)) = self.shared_release_target(&tc_type) {
+            self.emit_release_call(value, type_id, &type_args);
+        }
     }
 
     /// Emit the `IndexTuple cap op_index + CallClosure` sequence for an ability-method call.

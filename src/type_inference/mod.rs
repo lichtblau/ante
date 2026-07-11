@@ -108,6 +108,14 @@ pub struct IndividualTypeCheckResult {
     /// Ex2: in `type Foo = | A | B`, `A` and `B` will both be generalized, and
     /// there is no need to generalize `Foo` itself.
     pub generalized: FxHashMap<NameId, Type>,
+
+    /// For each top-level function name, which of its *explicit* parameters are borrowing --
+    /// by-value, concretely `shared`-typed, never referenced in tail/return position, and never
+    /// captured by a nested lambda (and the function has no function- or ability-typed explicit
+    /// parameters, its only suspension avenues besides implicits).  The callee never releases
+    /// these; call sites with statically-known callees consult this mask to elide the argument
+    /// retain (or to balance it with a post-call release).
+    pub borrowed_params: FxHashMap<NameId, Vec<bool>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -225,6 +233,14 @@ struct TypeChecker<'local, 'inner> {
     /// dropping the referent would dangle it. Skipping only leaks for now.
     captured_names: FxHashSet<NameId>,
 
+    /// Masks computed by [`Self::compute_borrowed_param_mask`], keyed by
+    /// item then function name, moved into each [`IndividualTypeCheckResult`] at `finish`.
+    borrowed_param_masks: FxHashMap<TopLevelId, FxHashMap<NameId, Vec<bool>>>,
+
+    /// The current item's borrowing parameter names -- their scope-exit
+    /// release is skipped (the caller owns the handle for the call's duration).
+    borrowed_local_params: FxHashSet<NameId>,
+
     /// Bindings that are whole-place aliases of an immutable local (`a = t`), keyed by the bound
     /// name, valued by the definition's rhs expr. Their retain+release pair is elided: the rhs is
     /// not marked in `retain_bindings` and the scope-exit release is skipped. An explicit `drop
@@ -334,6 +350,8 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_method_name: None,
             drop_type_name: None,
             captured_names: Default::default(),
+            borrowed_param_masks: Default::default(),
+            borrowed_local_params: Default::default(),
             borrowed_bindings: Default::default(),
             call_argument_depth: 0,
             pending_autoref_temp_drops: Vec::new(),
@@ -454,10 +472,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             .into_iter()
             .map(|(id, maps)| {
                 let generalized = generalized.remove(&id).unwrap_or_default();
+                let borrowed_params = self.borrowed_param_masks.remove(&id).unwrap_or_default();
                 let mut context = self.id_contexts.remove(&id).unwrap();
                 let item_context = self.item_contexts.get(&id).unwrap();
                 context.extend_from_resolution_result(item_context.2.as_ref());
-                (id, IndividualTypeCheckResult { maps, generalized, context })
+                (id, IndividualTypeCheckResult { maps, generalized, context, borrowed_params })
             })
             .collect();
 
@@ -485,6 +504,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.drop_scopes.clear();
         self.synthesizing_drops = false;
         self.captured_names.clear();
+        self.borrowed_local_params.clear();
         self.borrowed_bindings.clear();
         self.call_argument_depth = 0;
         self.pending_autoref_temp_drops.clear();

@@ -65,6 +65,13 @@ impl TypeChecker<'_, '_> {
         self.captured_names.extend(context.free_vars.iter().copied());
     }
 
+    /// True when the lambda at `id` captures `name` as a free variable.
+    pub(super) fn lambda_captures_name(&self, id: ExprId, name: NameId) -> bool {
+        let mut context = FreeVars::default();
+        context.find_free_variables(id, self);
+        context.free_vars.contains(&name)
+    }
+
     pub(super) fn record_move_captures(&mut self, id: ExprId, self_name: Option<NameId>) {
         let mut context = FreeVars::default();
         if let Some(name) = self_name {

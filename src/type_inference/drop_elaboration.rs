@@ -209,6 +209,11 @@ impl TypeChecker<'_, '_> {
         if self.borrowed_bindings.contains_key(&place.root_variable()) {
             return None;
         }
+        // A borrowing parameter is caller-owned -- the call site either elided the retain or
+        // balances it with a post-call release; never release here.
+        if self.borrowed_local_params.contains(&place.root_variable()) {
+            return None;
+        }
         let typ = self.follow_type(typ).clone();
         if typ == Type::ERROR {
             return None;
@@ -522,6 +527,128 @@ impl TypeChecker<'_, '_> {
         let block = Expr::Sequence(vec![seq_item(definition), seq_item(drop_call)]);
         self.current_extended_context_mut().insert_expr(item, block);
         self.expr_types.insert(item, Type::UNIT);
+    }
+
+    /// Decide which explicit parameters of a top-level function are *borrowing* -- the callee never
+    /// releases them; statically-known call sites either elide the argument retain (pure implicits:
+    /// the callee provably cannot suspend) or balance it with a post-call release (the caller's
+    /// frame then holds the handle across any suspension). Runs BEFORE the body is inferred -- the
+    /// analysis is purely syntactic over resolved names -- so the release skip is in place when the
+    /// function scope pops.
+    ///
+    /// A parameter is borrowing iff it is by-value (immutable), its annotated type is concretely
+    /// `shared`, and the body never references it in tail/return position nor captures it in a
+    /// nested lambda. The whole function is disqualified when any explicit parameter is function-
+    /// or ability-typed: calling those is a suspension avenue the call site cannot vet (implicit
+    /// capabilities are vetted per call site instead).
+    pub(super) fn compute_borrowed_param_mask(&mut self, fn_name: NameId, lambda: &cst::Lambda, expected: &Type) {
+        if !self.drop_elaboration_active() {
+            return;
+        }
+        let expected = self.follow_type(expected).clone();
+        let Type::Function(function_type) = &expected else { return };
+        if function_type.parameters.len() != lambda.parameters.len() {
+            return;
+        }
+        for (param, param_type) in lambda.parameters.iter().zip(&function_type.parameters) {
+            if param.is_implicit {
+                continue;
+            }
+            let typ = self.follow_type(&param_type.typ).clone();
+            if matches!(typ, Type::Function(_)) || self.is_ability(&typ) {
+                return;
+            }
+        }
+
+        let mut mask = Vec::new();
+        for (param, param_type) in lambda.parameters.iter().zip(&function_type.parameters) {
+            if param.is_implicit {
+                continue;
+            }
+            let typ = self.follow_type(&param_type.typ).clone();
+            let mut borrowing = false;
+            if !param.is_mutable && self.is_shared_user_defined(&typ) {
+                if let Some(name) = self.single_variable_pattern(param.pattern) {
+                    if !self.param_escapes_in_body(lambda.body, name) {
+                        borrowing = true;
+                        self.borrowed_local_params.insert(name);
+                    }
+                }
+            }
+            mask.push(borrowing);
+        }
+        if mask.iter().any(|b| *b)
+            && let Some(item) = self.current_item
+        {
+            self.borrowed_param_masks.entry(item).or_default().insert(fn_name, mask);
+        }
+    }
+
+    /// The single variable a pattern binds (through type annotations), if it is that simple.
+    pub(super) fn single_variable_pattern(&self, pattern: PatternId) -> Option<NameId> {
+        match self.pattern_of(pattern).as_ref() {
+            cst::Pattern::Variable(name) => Some(*name),
+            cst::Pattern::TypeAnnotation(inner, _) => self.single_variable_pattern(*inner),
+            _ => None,
+        }
+    }
+
+    /// True when `name` (a parameter) escapes the function through `expr`: referenced in
+    /// tail/return position (its handle would outlive the call) or captured by a nested
+    /// lambda. Call arguments, field reads, and stores are NOT escapes -- each of those
+    /// sites carries its own balanced retain.
+    fn param_escapes_in_body(&self, body: ExprId, name: NameId) -> bool {
+        self.param_escape_walk(body, name, true)
+    }
+
+    fn param_escape_walk(&self, expr: ExprId, name: NameId, tail: bool) -> bool {
+        let walk = |this: &Self, e: ExprId, tail: bool| this.param_escape_walk(e, name, tail);
+        match self.expr_of(expr).as_ref() {
+            Expr::Variable(path) => {
+                tail && matches!(self.path_origin(*path), Some(Origin::Local(n)) if n == name)
+            },
+            Expr::Error | Expr::Literal(_) | Expr::Extern(_) | Expr::Break | Expr::Continue | Expr::Quoted(_) => false,
+            Expr::Sequence(items) => {
+                let last = items.len().saturating_sub(1);
+                items.iter().enumerate().any(|(i, item)| walk(self, item.expr, tail && i == last))
+            },
+            Expr::Definition(definition) => walk(self, definition.rhs, false),
+            Expr::MemberAccess(access) => walk(self, access.object, false),
+            Expr::Call(call) => {
+                walk(self, call.function, false)
+                    || call.arguments.iter().any(|arg| walk(self, arg.expr, false))
+            },
+            Expr::Lambda(_) => self.lambda_captures_name(expr, name),
+            Expr::If(if_) => {
+                walk(self, if_.condition, false)
+                    || walk(self, if_.then, tail)
+                    || if_.else_.is_some_and(|e| walk(self, e, tail))
+            },
+            Expr::Match(match_) => {
+                walk(self, match_.expression, false)
+                    || match_.cases.iter().any(|(_, branch)| walk(self, *branch, tail))
+            },
+            // Conservative: a handle's body/branches feed its result value; treat every part
+            // as tail so a param flowing out through the handle disqualifies.
+            Expr::Handle(handle) => {
+                walk(self, handle.expression, true)
+                    || handle.cases.iter().any(|(_, branch)| walk(self, *branch, true))
+            },
+            Expr::Reference(reference) => walk(self, reference.rhs, false),
+            Expr::TypeAnnotation(annotation) => walk(self, annotation.lhs, tail),
+            Expr::Constructor(constructor) => constructor.fields.iter().any(|(_, e)| walk(self, *e, false)),
+            Expr::While(w) => walk(self, w.condition, false) || walk(self, w.body, false),
+            Expr::For(f) => walk(self, f.start, false) || walk(self, f.end, false) || walk(self, f.body, false),
+            Expr::Return(return_) => walk(self, return_.expression, true),
+            Expr::Assignment(assignment) => {
+                walk(self, assignment.lhs, false)
+                    || walk(self, assignment.rhs, false)
+                    || assignment.op.as_ref().is_some_and(|(_, op)| walk(self, *op, false))
+            },
+            Expr::ArrayLiteral(elements) => elements.iter().any(|e| walk(self, *e, false)),
+            // Not yet desugared here (or unexpected): be conservative.
+            Expr::Is(_) | Expr::Do(_) | Expr::Loop(_) | Expr::InterpolatedString(_) => true,
+        }
     }
 
     /// `definition` is a borrowed alias binding -- a single un-annotated, immutable variable bound

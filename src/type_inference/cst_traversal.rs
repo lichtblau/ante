@@ -96,6 +96,18 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             self.record_mutable_pattern(definition.pattern);
         }
 
+        // Decide the borrowing-parameter mask for a top-level function _before_ its body is
+        // inferred (the escape walk is purely syntactic), so parameter releases are already skipped
+        // when the function scope pops.
+        if is_top_level
+            && let Expr::Lambda(lambda) = self.expr_of(definition.rhs).as_ref()
+        {
+            let lambda = lambda.clone();
+            if let Some(fn_name) = self.single_variable_pattern(definition.pattern) {
+                self.compute_borrowed_param_mask(fn_name, &lambda, &expected_type);
+            }
+        }
+
         // If the RHS is a lambda, call check_lambda directly so we can pass the definition's
         // own name as `self_name`. This prevents self-recursive local functions (such as the
         // `recur` helper produced by loop desugaring) from treating themselves as a captured
