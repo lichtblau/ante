@@ -78,7 +78,16 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             let binds_droppable =
                 names.iter().any(|name| self.current_extended_context()[*name].as_ref() != "_");
             if binds_droppable {
-                self.current_extended_context_mut().mark_retain_binding(definition.rhs);
+                // A whole-place alias of an immutable local (`a = t`) elides its retain+release
+                // pair -- the alias's scope is lexically inside the source's, and an immutable
+                // source is only released at its own scope exit, so the handle outlives every use
+                // of the alias. Field reads and `var` sources keep the pair (`:=` through them
+                // releases the old value while the alias still points at it).
+                if let Some(borrowed) = self.try_borrowed_alias_binding(definition) {
+                    self.borrowed_bindings.insert(borrowed, definition.rhs);
+                } else {
+                    self.current_extended_context_mut().mark_retain_binding(definition.rhs);
+                }
             }
         }
 
@@ -742,6 +751,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             _ => return,
         };
         if let Some(place) = self.try_build_move_path(rhs) {
+            // An explicit drop of a borrowed alias binding releases a count its elided bind-retain
+            // never added -- restore the retain so the pair balances (the scope-exit release stays
+            // skipped: the drop marks the place moved below).
+            if let Some(bind_rhs) = self.borrowed_bindings.remove(&place.root_variable()) {
+                self.current_extended_context_mut().mark_retain_binding(bind_rhs);
+            }
             let location = arg.expr.locate(self);
             self.move_tracker.record_move(place, location);
         }

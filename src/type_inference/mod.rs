@@ -225,6 +225,12 @@ struct TypeChecker<'local, 'inner> {
     /// dropping the referent would dangle it. Skipping only leaks for now.
     captured_names: FxHashSet<NameId>,
 
+    /// Bindings that are whole-place aliases of an immutable local (`a = t`), keyed by the bound
+    /// name, valued by the definition's rhs expr. Their retain+release pair is elided: the rhs is
+    /// not marked in `retain_bindings` and the scope-exit release is skipped. An explicit `drop
+    /// (mut a)` on such a binding restores the retain (the pair must rebalance).
+    borrowed_bindings: FxHashMap<NameId, ExprId>,
+
     /// Nonzero while inferring a call's argument list (`--auto-drop` only). Auto-ref of an
     /// *rvalue* argument (`println ("a" ++ "b")`) creates a caller-owned temporary that no
     /// scope would otherwise drop; the coercion binds it to a fresh local and queues its
@@ -328,6 +334,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_method_name: None,
             drop_type_name: None,
             captured_names: Default::default(),
+            borrowed_bindings: Default::default(),
             call_argument_depth: 0,
             pending_autoref_temp_drops: Vec::new(),
             effect_continuation_names: Default::default(),
@@ -478,6 +485,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.drop_scopes.clear();
         self.synthesizing_drops = false;
         self.captured_names.clear();
+        self.borrowed_bindings.clear();
         self.call_argument_depth = 0;
         self.pending_autoref_temp_drops.clear();
         self.effect_continuation_names.clear();

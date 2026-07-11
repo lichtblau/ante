@@ -204,6 +204,11 @@ impl TypeChecker<'_, '_> {
         if self.captured_names.contains(&place.root_variable()) {
             return None;
         }
+        // A borrowed alias binding elided its bind-retain; its scope-exit release is elided with it
+        // (the pair must stay balanced).
+        if self.borrowed_bindings.contains_key(&place.root_variable()) {
+            return None;
+        }
         let typ = self.follow_type(typ).clone();
         if typ == Type::ERROR {
             return None;
@@ -517,6 +522,29 @@ impl TypeChecker<'_, '_> {
         let block = Expr::Sequence(vec![seq_item(definition), seq_item(drop_call)]);
         self.current_extended_context_mut().insert_expr(item, block);
         self.expr_types.insert(item, Type::UNIT);
+    }
+
+    /// `definition` is a borrowed alias binding -- a single un-annotated, immutable variable bound
+    /// to a *whole-place read of another immutable local* -- when its retain+release pair can be
+    /// elided. The alias's scope is lexically inside the source's and an immutable source is only
+    /// released at its own scope exit, so the handle outlives every use. `var` sources or field
+    /// reads keep the pair: `:=` through them releases the old value while the alias still points
+    /// at it.
+    pub(super) fn try_borrowed_alias_binding(&mut self, definition: &cst::Definition) -> Option<NameId> {
+        if definition.mutable || !self.drop_elaboration_active() {
+            return None;
+        }
+        let bound = match self.pattern_of(definition.pattern).as_ref() {
+            cst::Pattern::Variable(name) => *name,
+            _ => return None,
+        };
+        let rhs = self.current_extended_context()[definition.rhs].clone();
+        let Expr::Variable(path) = rhs else { return None };
+        let Some(Origin::Local(source)) = self.path_origin(path) else { return None };
+        if self.mutable_definitions.contains(&source) {
+            return None;
+        }
+        Some(bound)
     }
 
     /// Auto-ref of an *rvalue* in call-argument position (`println ("a" ++ "b")`): the callee
