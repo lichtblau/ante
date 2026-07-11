@@ -339,16 +339,17 @@ impl Type {
     /// Map `f` over `items`, cloning any element for which `f` returns `None`. Returns
     /// `Some(new_vec)` if at least one element changed, or `None` if none did — mirroring
     /// [Self::follow_all_opt]'s "reuse the original when unchanged" contract.
+    ///
+    /// Copy-on-write: nothing is allocated until the first changed element is found, so the
+    /// common all-unchanged case is a pure scan. (The eager collect-then-discard version of
+    /// this dominated `follow_all` profiles on drop-heavy programs.)
     fn follow_all_each<T: Clone>(items: &[T], mut f: impl FnMut(&T) -> Option<T>) -> Option<Vec<T>> {
-        let mut changed = false;
-        let new_items = mapvec(items, |item| match f(item) {
-            Some(new) => {
-                changed = true;
-                new
-            },
-            None => item.clone(),
-        });
-        changed.then_some(new_items)
+        let (first_changed, new_item) = items.iter().enumerate().find_map(|(i, item)| Some((i, f(item)?)))?;
+        let mut new_items = Vec::with_capacity(items.len());
+        new_items.extend(items[..first_changed].iter().cloned());
+        new_items.push(new_item);
+        new_items.extend(items[first_changed + 1..].iter().map(|item| f(item).unwrap_or_else(|| item.clone())));
+        Some(new_items)
     }
 
     /// Similar to substitute, but substitutes `Type::Generic` instead of `Type::TypeVariable`

@@ -474,7 +474,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         let Some(typ) = self.pattern_types.get(&id).cloned() else {
             return BTreeMap::default();
         };
-        self.get_field_types(&typ, None).into_iter().map(|(name, (_, index))| (index, name.to_string())).collect()
+        self.get_field_types(&typ, None).iter().map(|(name, (_, index))| (*index, name.to_string())).collect()
     }
 
     fn infer_path(&mut self, path: PathId, expected: &Type) -> Type {

@@ -1,4 +1,9 @@
-use std::{cell::Cell, collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    rc::Rc,
+    sync::Arc,
+};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -231,6 +236,33 @@ struct TypeChecker<'local, 'inner> {
     /// Cached TopLevelName for the Prelude's `Copy` type, lazily resolved on first use.
     copy_type_name: Option<TopLevelName>,
 
+    /// Memoized [`Self::get_field_types`] results, keyed by the `follow_all`-canonicalized
+    /// type. Only fully-concrete types (no unbound variables, no rigid generics) are cached:
+    /// a variable's binding can still change, and `Generic`s embed item-local NameIds that
+    /// could collide between items of one SCC.
+    field_types_cache: FxHashMap<Type, Arc<BTreeMap<Name, (Type, u32)>>>,
+
+    /// Memoized outcome of `type_is_copy`'s *global* implicit search, keyed like
+    /// [`Self::field_types_cache`] plus the current item's source file (visible implicits
+    /// are per-file). Local implicits are always re-checked before this cache is consulted,
+    /// so a scoped `Copy` impl still wins.
+    copy_search_cache: FxHashMap<(SourceFileId, Type), bool>,
+
+    /// Memoized outcome of `type_has_drop_impl`'s global implicit search, keyed like
+    /// [`Self::copy_search_cache`].
+    drop_search_cache: FxHashMap<(SourceFileId, Type), bool>,
+
+    /// Memoized `type_needs_no_drop` verdicts for concrete types: `true` = dropping a value
+    /// of this type is provably a no-op, so drop synthesis is skipped entirely.
+    no_drop_cache: FxHashMap<Type, bool>,
+
+    /// Caches the `(shared, mutable)` flags of user-defined types so `shared_type_flags`
+    /// does not re-run the `GetItemRaw` query (and its dependency registration) per call.
+    shared_flags_cache: RefCell<FxHashMap<TopLevelId, Option<(bool, bool)>>>,
+
+    /// Caches whether a top-level item is an ability definition, for the same reason.
+    ability_cache: RefCell<FxHashMap<TopLevelId, bool>>,
+
     /// Whether `--auto-drop` is enabled (the `AutoDrop` DB input). Gates the parts of move
     /// checking that only matter once drops are inserted automatically, e.g. linking match
     /// payload bindings to the scrutinee's place.
@@ -397,6 +429,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             borrow_callee: false,
             binding_places: Default::default(),
             copy_type_name: None,
+            field_types_cache: Default::default(),
+            copy_search_cache: Default::default(),
+            drop_search_cache: Default::default(),
+            no_drop_cache: Default::default(),
+            shared_flags_cache: Default::default(),
+            ability_cache: Default::default(),
             auto_drop: crate::incremental::AutoDrop.get(compiler),
             drop_scopes: Vec::new(),
             synthesizing_drops: false,
@@ -1207,6 +1245,26 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         typ.follow(&self.bindings)
     }
 
+    /// True when `typ`, following bindings, contains no unbound type variables and no rigid
+    /// generics -- so no later unification can change what it denotes. This is the cache
+    /// admission test for the per-type memo tables ([`Self::field_types_cache`] and friends):
+    /// a read-only walk with no allocation, unlike `follow_all` + `free_vars`.
+    pub(super) fn type_is_concrete(&self, typ: &Type) -> bool {
+        match self.follow_type(typ) {
+            Type::Primitive(_) | Type::UserDefined(_) | Type::U32(_) => true,
+            Type::Variable(_) | Type::Generic(_) | Type::Forall(..) => false,
+            Type::Function(function) => {
+                function.parameters.iter().all(|parameter| self.type_is_concrete(&parameter.typ))
+                    && self.type_is_concrete(&function.environment)
+                    && self.type_is_concrete(&function.return_type)
+            },
+            Type::Application(constructor, args) => {
+                self.type_is_concrete(constructor) && args.iter().all(|arg| self.type_is_concrete(arg))
+            },
+            Type::Tuple(elements) => elements.iter().all(|element| self.type_is_concrete(element)),
+        }
+    }
+
     /// Convert a [cst::Type] into a [Type]. If `allow_implicit_type_vars` is true, we'll
     /// insert type variables to make functions automatically polymorphic over effects or
     /// their closure environment. If false, we'll assume these to be pure or empty.
@@ -1269,7 +1327,27 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     /// Returns an empty map if unsuccessful.
     ///
     /// The map maps from the field name to a pair of (field type, field index).
-    fn get_field_types(&mut self, typ: &Type, generic_args: Option<&[Type]>) -> BTreeMap<Name, (Type, u32)> {
+    ///
+    /// Results for fully-concrete types are memoized in [`Self::field_types_cache`]: this is
+    /// called per member access and per field of every structural drop expansion, and
+    /// rebuilding the map (a `type_body` substitution plus a `BTreeMap`) dominated compile
+    /// time on drop-heavy projects.
+    fn get_field_types(&mut self, typ: &Type, generic_args: Option<&[Type]>) -> Arc<BTreeMap<Name, (Type, u32)>> {
+        // The raw type is the cache key: bindings are only ever added, so a concrete-following
+        // type always denotes the same fields. (Canonicalizing the key with `follow_all` costs
+        // an allocating deep walk per query and was itself a profile hotspot.)
+        if generic_args.is_none() && self.type_is_concrete(typ) {
+            if let Some(cached) = self.field_types_cache.get(typ) {
+                return cached.clone();
+            }
+            let fields = Arc::new(self.compute_field_types(typ, None));
+            self.field_types_cache.insert(typ.clone(), fields.clone());
+            return fields;
+        }
+        Arc::new(self.compute_field_types(typ, generic_args))
+    }
+
+    fn compute_field_types(&mut self, typ: &Type, generic_args: Option<&[Type]>) -> BTreeMap<Name, (Type, u32)> {
         match self.follow_type(typ) {
             Type::Application(constructor, arguments) => {
                 // TODO: Error if `generic_args` is non-empty
@@ -1289,18 +1367,18 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                     };
                     let inner_fields = self.get_field_types(&inner, None);
                     return inner_fields
-                        .into_iter()
+                        .iter()
                         .map(|(name, (field_type, index))| {
                             let wrapped_args = match &lifetime {
-                                Some(lifetime) => vec![lifetime.clone(), field_type],
-                                None => vec![field_type],
+                                Some(lifetime) => vec![lifetime.clone(), field_type.clone()],
+                                None => vec![field_type.clone()],
                             };
                             let wrapped = Type::Application(constructor.clone(), Arc::new(wrapped_args));
-                            (name, (wrapped, index))
+                            (name.clone(), (wrapped, *index))
                         })
                         .collect();
                 }
-                self.get_field_types(&constructor, Some(&arguments))
+                self.compute_field_types(&constructor, Some(&arguments))
             },
             Type::UserDefined(origin) => {
                 if let Origin::TopLevelDefinition(id) = origin {

@@ -253,44 +253,58 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // Check local implicits in scope
         let local_implicits = self.collect_implicits_in_scope();
         for name in &local_implicits {
+            // Head pre-filter: most in-scope implicits are other abilities (`{Drop t}`,
+            // `{Cmp t}`); their unification against `Copy _` can only fail, so skip the
+            // `follow_all` and the attempt.
+            if !self.implicit_could_be_ability(&self.name_types[name], copy_name) {
+                continue;
+            }
             let name_type = self.name_types[name].follow_all(&self.bindings);
             if self.try_unify(&name_type, &copy_of_t).is_ok() {
                 return true;
             }
         }
 
-        // Check global implicits
-        if let Some(item) = self.current_item {
-            let visible_implicits = VisibleImplicits(item.source_file).get(self.compiler);
-            let mut found = false;
-            visible_implicits.iter_possibly_matching_impls(&copy_of_t, |_name, name_id| {
-                let (name_type, _) = self.type_and_bindings_of_top_level_name(name_id);
-                if self.try_unify(&name_type, &copy_of_t).is_ok() {
+        // Check global implicits. The search unifies against every candidate impl; for a
+        // fully-concrete type its outcome cannot change with later unification and the local
+        // implicits were already consulted above, so memoize it per (source file, type). The
+        // raw type keys the cache -- see `get_field_types`.
+        let Some(item) = self.current_item else { return false };
+        // Probe before the concreteness walk: non-concrete keys are never inserted, so
+        // their lookups just miss (see `type_needs_no_drop`).
+        let probe_key = (item.source_file, typ.clone());
+        if let Some(hit) = self.copy_search_cache.get(&probe_key) {
+            return *hit;
+        }
+
+        let visible_implicits = VisibleImplicits(item.source_file).get(self.compiler);
+        let mut found = false;
+        visible_implicits.iter_possibly_matching_impls(&copy_of_t, |_name, name_id| {
+            let (name_type, _) = self.type_and_bindings_of_top_level_name(name_id);
+            if self.try_unify(&name_type, &copy_of_t).is_ok() {
+                found = true;
+                return true;
+            }
+            // Also check if it's a function whose return type matches. Under --auto-drop
+            // the candidate's own implicit constraints must hold too: `copy_maybe
+            // {Copy a}: Copy (Maybe a)` must not make `Maybe NonCopy` Copy, or its
+            // payload would never be tracked or dropped. (Without the flag the historic
+            // constraint-blind behavior is kept so default checking is unchanged.)
+            if let Type::Function(f) = &name_type
+                && let Ok(bindings) = self.try_unify(&f.return_type, &copy_of_t)
+            {
+                let f = f.clone();
+                if !self.auto_drop || self.copy_impl_constraints_hold(&f, bindings) {
                     found = true;
                     return true;
                 }
-                // Also check if it's a function whose return type matches. Under --auto-drop
-                // the candidate's own implicit constraints must hold too: `copy_maybe
-                // {Copy a}: Copy (Maybe a)` must not make `Maybe NonCopy` Copy, or its
-                // payload would never be tracked or dropped. (Without the flag the historic
-                // constraint-blind behavior is kept so default checking is unchanged.)
-                if let Type::Function(f) = &name_type
-                    && let Ok(bindings) = self.try_unify(&f.return_type, &copy_of_t)
-                {
-                    let f = f.clone();
-                    if !self.auto_drop || self.copy_impl_constraints_hold(&f, bindings) {
-                        found = true;
-                        return true;
-                    }
-                }
-                false
-            });
-            if found {
-                return true;
             }
+            false
+        });
+        if self.type_is_concrete(&probe_key.1) {
+            self.copy_search_cache.insert(probe_key, found);
         }
-
-        false
+        found
     }
 
     /// Is a closure **environment** Copy? Decides whether the closure value is Copy (see
@@ -353,6 +367,25 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             .any(|var| matches!(Type::Variable(*var).follow(&self.bindings), Type::Variable(v) if *v == id))
     }
 
+    /// Cheap pre-filter for the local-implicit scans: could this implicit's type possibly be
+    /// (or unify with) `<ability> _`? Only an application headed by the ability itself, or
+    /// something unification could still bind (an unbound head or a wholly-unbound type),
+    /// can. Head-only follows, no allocation -- the scans previously paid a deep
+    /// `follow_all` + unification attempt per implicit per query, which dominated profiles.
+    /// `true` is the conservative answer (the caller just attempts the match as before).
+    pub(super) fn implicit_could_be_ability(&self, typ: &Type, ability: TopLevelName) -> bool {
+        match typ.follow(&self.bindings) {
+            Type::Application(constructor, _) => match constructor.follow(&self.bindings) {
+                Type::UserDefined(Origin::TopLevelDefinition(name)) => *name == ability,
+                Type::Variable(_) | Type::Generic(_) => true,
+                _ => false,
+            },
+            Type::Variable(_) | Type::Generic(_) => true,
+            Type::Forall(_, inner) => self.implicit_could_be_ability(inner, ability),
+            _ => false,
+        }
+    }
+
     /// True if a local implicit of shape `<ability> x` -- where `x` follows to exactly the
     /// given rigid/unbound generic type (a named generic or a bare type variable) -- is in
     /// scope. Used where unifying against candidates is too loose: unification would bind
@@ -362,6 +395,9 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         let local_implicits = self.collect_implicits_in_scope();
         for name in &local_implicits {
             let Some(name_type) = self.name_types.get(name) else { continue };
+            if !self.implicit_could_be_ability(name_type, ability) {
+                continue;
+            }
             let name_type = name_type.follow_all(&self.bindings);
             let Type::Application(constructor, args) = &name_type else { continue };
             let matches_ability = matches!(
@@ -429,8 +465,13 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Type::Application(constructor, _) => self.is_ability(constructor),
             Type::UserDefined(origin) => match origin {
                 Origin::TopLevelDefinition(name) => {
+                    if let Some(hit) = self.ability_cache.borrow().get(&name.top_level_item) {
+                        return *hit;
+                    }
                     let (item, _) = GetItemRaw(name.top_level_item).get(self.compiler);
-                    matches!(&item.kind, TopLevelItemKind::AbilityDefinition(_))
+                    let is_ability = matches!(&item.kind, TopLevelItemKind::AbilityDefinition(_));
+                    self.ability_cache.borrow_mut().insert(name.top_level_item, is_ability);
+                    is_ability
                 },
                 _ => false,
             },
@@ -443,11 +484,16 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         match typ.follow(&self.bindings) {
             Type::Application(constructor, _) => self.shared_type_flags(constructor),
             Type::UserDefined(Origin::TopLevelDefinition(name)) => {
+                if let Some(hit) = self.shared_flags_cache.borrow().get(&name.top_level_item) {
+                    return *hit;
+                }
                 let (item, _) = GetItemRaw(name.top_level_item).get(self.compiler);
-                match &item.kind {
+                let flags = match &item.kind {
                     TopLevelItemKind::TypeDefinition(td) => Some((td.shared, td.mutable)),
                     _ => None,
-                }
+                };
+                self.shared_flags_cache.borrow_mut().insert(name.top_level_item, flags);
+                flags
             },
             _ => None,
         }

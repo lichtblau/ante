@@ -176,6 +176,9 @@ impl TypeChecker<'_, '_> {
     /// and synthesize one drop call per survivor.
     fn synthesize_drops(&mut self, names: Vec<NameId>, location: &Location) -> Vec<ExprId> {
         let mut drops = Vec::new();
+        // One snapshot for the whole edge: synthesized drops are checked with move
+        // recording suppressed, so the tracker cannot change between names.
+        let tracker = self.move_tracker.clone();
         for name in names {
             // Captured by some closure: the closure may outlive this scope; dropping the
             // referent would dangle it. Skip (leak) for now.
@@ -184,7 +187,6 @@ impl TypeChecker<'_, '_> {
             }
             let place = MovePath::Variable(name);
             let Some(typ) = self.name_types.get(&name).cloned() else { continue };
-            let tracker = self.move_tracker.clone();
             if let Some(drop) = self.synthesize_partial_drop(&place, &typ, &tracker, location) {
                 drops.push(drop);
             }
@@ -225,6 +227,13 @@ impl TypeChecker<'_, '_> {
         }
         let typ = self.follow_type(typ).clone();
         if typ == Type::ERROR {
+            return None;
+        }
+        // Fast bail-out: a memoized, type-driven proof that dropping this value is a no-op
+        // (no shared handles, closures, or Drop impls anywhere inside). Every check below
+        // and the whole structural expansion would re-derive `None` from scratch per site,
+        // which dominated compile profiles on drop-heavy programs.
+        if self.type_needs_no_drop(&typ) {
             return None;
         }
         // Honest for bare variables under the flag: literal vars and `{Copy t}`-bounded
@@ -363,7 +372,7 @@ impl TypeChecker<'_, '_> {
             return self.synthesize_sum_drop(place, typ, None, location);
         }
         let mut ordered: Vec<(String, Type, u32)> =
-            fields.into_iter().map(|(name, (typ, index))| (name.to_string(), typ, index)).collect();
+            fields.iter().map(|(name, (typ, index))| (name.to_string(), typ.clone(), *index)).collect();
         ordered.sort_unstable_by_key(|(_, _, index)| *index);
 
         let mut drops = Vec::new();
@@ -1273,7 +1282,7 @@ impl TypeChecker<'_, '_> {
             self.synthesize_sum_drop(place, &typ, Some(tracker), location)
         } else {
             let mut ordered: Vec<(String, Type, u32)> =
-                fields.into_iter().map(|(name, (typ, index))| (name.to_string(), typ, index)).collect();
+                fields.iter().map(|(name, (typ, index))| (name.to_string(), typ.clone(), *index)).collect();
             ordered.sort_unstable_by_key(|(_, _, index)| *index);
             let mut drops = Vec::new();
             for (field_name, field_type, _) in ordered {
@@ -1473,9 +1482,13 @@ impl TypeChecker<'_, '_> {
         let constructor = Type::UserDefined(Origin::TopLevelDefinition(drop_type_name));
         let drop_of_t = Type::Application(Arc::new(constructor), Arc::new(vec![typ.clone()]));
 
-        // Local implicits in scope (e.g. `{Drop t}` parameters).
+        // Local implicits in scope (e.g. `{Drop t}` parameters). Head pre-filter as in
+        // `type_is_copy`: non-`Drop`-headed implicits cannot unify, skip them cheaply.
         let local_implicits = self.collect_implicits_in_scope();
         for name in &local_implicits {
+            if !self.implicit_could_be_ability(&self.name_types[name], drop_type_name) {
+                continue;
+            }
             let name_type = self.name_types[name].follow_all(&self.bindings);
             if self.try_unify(&name_type, &drop_of_t).is_ok() {
                 return true;
@@ -1486,32 +1499,118 @@ impl TypeChecker<'_, '_> {
         // `{Drop x}` constraints cannot resolve does not count (e.g. `drop_maybe {Drop t}`
         // must not claim `Maybe NoDropStruct` -- the structural fallback handles that
         // payload; picking the impl would fail resolution loudly instead).
-        if let Some(item) = self.current_item {
-            let visible_implicits = VisibleImplicits(item.source_file).get(self.compiler);
-            let mut found = false;
-            visible_implicits.iter_possibly_matching_impls(&drop_of_t, |_name, name_id| {
-                let (name_type, _) = self.type_and_bindings_of_top_level_name(name_id);
-                if self.try_unify(&name_type, &drop_of_t).is_ok() {
+        // Memoized per (source file, raw concrete type) like `type_is_copy`'s search.
+        let Some(item) = self.current_item else { return false };
+        // Probe before the concreteness walk: non-concrete keys are never inserted, so
+        // their lookups just miss (see `type_needs_no_drop`).
+        let probe_key = (item.source_file, typ.clone());
+        if let Some(hit) = self.drop_search_cache.get(&probe_key) {
+            return *hit;
+        }
+
+        let visible_implicits = VisibleImplicits(item.source_file).get(self.compiler);
+        let mut found = false;
+        visible_implicits.iter_possibly_matching_impls(&drop_of_t, |_name, name_id| {
+            let (name_type, _) = self.type_and_bindings_of_top_level_name(name_id);
+            if self.try_unify(&name_type, &drop_of_t).is_ok() {
+                found = true;
+                return true;
+            }
+            if let Type::Function(f) = &name_type
+                && let Ok(bindings) = self.try_unify(&f.return_type, &drop_of_t)
+            {
+                let f = f.clone();
+                if self.drop_impl_constraints_hold(&f, bindings) {
                     found = true;
                     return true;
                 }
-                if let Type::Function(f) = &name_type
-                    && let Ok(bindings) = self.try_unify(&f.return_type, &drop_of_t)
-                {
-                    let f = f.clone();
-                    if self.drop_impl_constraints_hold(&f, bindings) {
-                        found = true;
-                        return true;
-                    }
-                }
-                false
-            });
-            if found {
-                return true;
             }
+            false
+        });
+        if self.type_is_concrete(&probe_key.1) {
+            self.drop_search_cache.insert(probe_key, found);
         }
+        found
+    }
 
-        false
+    /// Type-driven, place-independent proof that dropping a value of `typ` is a no-op: no
+    /// shared handle, closure environment, or visible `Drop` impl is reachable anywhere
+    /// inside it. `true` means the drop synthesis would provably return `None`, so callers
+    /// skip it without expanding; `false` just means "run the full synthesis" (it may still
+    /// prune). Memoized per concrete type -- the [`TypeChecker::type_is_concrete`] gate also
+    /// excludes generics, whose drops are scope-dependent through `{Drop t}` capabilities.
+    pub(super) fn type_needs_no_drop(&mut self, typ: &Type) -> bool {
+        // Probe first: concreteness only gates *inserts* (non-concrete keys are never in the
+        // table, so their lookups just miss), and the concreteness walk costs another pass
+        // over the type on every hit.
+        if let Some(hit) = self.no_drop_cache.get(typ) {
+            return *hit;
+        }
+        if !self.type_is_concrete(typ) {
+            return false;
+        }
+        let result = self.type_needs_no_drop_inner(typ, 0);
+        self.no_drop_cache.insert(typ.clone(), result);
+        result
+    }
+
+    /// Mirrors `try_synthesize_drop_for_place`'s decision order: Copy types never consult
+    /// `Drop` impls (a Copy `I32` ignores the prelude's `drop_i32`), non-Copy ones do; then
+    /// products recurse into fields and sums into variant payloads. The depth cap answers
+    /// `false` (never skip) so recursive types terminate; a capped `false` can only make an
+    /// ancestor run the full synthesis, never skip a real drop.
+    fn type_needs_no_drop_inner(&mut self, typ: &Type, depth: u32) -> bool {
+        if depth >= 16 {
+            return false;
+        }
+        let typ = self.follow_type(typ).clone();
+        match &typ {
+            Type::Primitive(_) | Type::U32(_) => true,
+            // Closure teardown is place-dependent (env slots, effect continuations).
+            Type::Function(_) => false,
+            // Excluded by the concrete gate; conservatively "may need a drop".
+            Type::Variable(_) | Type::Generic(_) | Type::Forall(..) => false,
+            Type::UserDefined(_) | Type::Application(..) | Type::Tuple(_) => {
+                if let Some(hit) = self.no_drop_cache.get(&typ) {
+                    return *hit;
+                }
+                if self.is_shared_user_defined(&typ) {
+                    return false;
+                }
+                if !self.type_is_copy(&typ) && self.type_has_drop_impl(&typ) {
+                    return false;
+                }
+                let fields = self.get_field_types(&typ, None);
+                if !fields.is_empty() {
+                    let field_types: Vec<Type> = fields.values().map(|(typ, _)| typ.clone()).collect();
+                    return field_types.iter().all(|field| self.type_needs_no_drop_inner(field, depth + 1));
+                }
+                match self.sum_variant_payload_types(&typ) {
+                    Some(variants) => variants
+                        .iter()
+                        .flatten()
+                        .all(|payload| self.type_needs_no_drop_inner(payload, depth + 1)),
+                    // Opaque: the structural synthesis has nothing to expand and skips.
+                    None => true,
+                }
+            },
+        }
+    }
+
+    /// The payload types of each variant when `typ` is an enum, via `type_body` (generics
+    /// substituted) -- the same source `synthesize_sum_drop` reads.
+    fn sum_variant_payload_types(&mut self, typ: &Type) -> Option<Vec<Vec<Type>>> {
+        let (type_name, args) = match self.follow_type(typ).clone() {
+            Type::UserDefined(Origin::TopLevelDefinition(name)) => (name, None),
+            Type::Application(constructor, args) => match self.follow_type(&constructor) {
+                Type::UserDefined(Origin::TopLevelDefinition(name)) => (*name, Some(args)),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let body = type_name.top_level_item.type_body(args.as_deref().map(|args| &args[..]), self.compiler);
+        let super::type_body::TypeBody::Sum(variants) = body else { return None };
+        Some(variants.into_iter().map(|(_, payloads)| payloads).collect())
     }
 
     /// Check that a candidate Drop impl's own `{Drop x}` constraints can resolve under the
