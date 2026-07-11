@@ -1,0 +1,40 @@
+type Res = tag: I32
+make (): Res = Res 1
+consume (_r: Res): Unit = ()
+
+test_e3 (m: Maybe Res): Unit =
+    match m
+    | Some r -> consume r
+    | None -> ()
+    match m
+    | Some r2 -> consume r2
+    | None -> ()
+
+main () =
+    x: Maybe Res = Some (make ())
+    test_e3 x
+
+// args: --check --no-color --auto-drop
+// expected exit status: 1
+// expected stderr:
+// examples/typechecking/auto_drop_match_binding_e3.an:9:11
+//  6 |     match m
+//  7 |     | Some r -> consume r	// note: m was previously moved here
+//    |                         -
+//  8 |     | None -> ()
+//  9 |     match m	// error: Use of moved value m
+//    |           ^
+// 10 |     | Some r2 -> consume r2
+// 
+// examples/typechecking/auto_drop_match_binding_e3.an:10:26
+//  6 |     match m
+//  7 |     | Some r -> consume r	// note: m.Some#0 was previously moved here
+//    |                         -
+//  8 |     | None -> ()
+//  9 |     match m
+// 10 |     | Some r2 -> consume r2	// error: Use of moved value m.Some#0
+//    |                          ^^
+// 11 |     | None -> ()
+// 
+// Found 2 errors and 0 warnings
+

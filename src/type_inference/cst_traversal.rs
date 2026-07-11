@@ -291,17 +291,46 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                     self.assign_binding_places(*alt, place.clone());
                 }
             },
-            Pattern::Constructor(_, args) => {
-                // Prefer real struct field names; enum payloads and tuples fall back to indices.
+            Pattern::Constructor(path, args) => {
+                // Prefer real struct field names. Enum payloads are qualified by their variant
+                // (`Ok#0` vs `Error#0`) so different variants' payloads get distinct places --
+                // `#` cannot appear in a member name, so these never collide with member-access
+                // paths. Tuples and unresolved types fall back to plain indices.
                 let names_by_index = self.field_names_by_index(id);
+                let variant = if names_by_index.is_empty() { self.pattern_variant_name(*path) } else { None };
                 for (i, arg) in args.iter().enumerate() {
-                    let field = names_by_index.get(&(i as u32)).cloned().unwrap_or_else(|| i.to_string());
+                    let field = names_by_index.get(&(i as u32)).cloned().unwrap_or_else(|| match &variant {
+                        Some(variant) => format!("{variant}#{i}"),
+                        None => i.to_string(),
+                    });
                     let child = super::affine::MovePath::field(place.clone(), field);
                     self.assign_binding_places(*arg, child);
                 }
             },
             Pattern::Literal(_) | Pattern::Error => (),
         }
+    }
+
+    /// If `path` resolves to an enum variant constructor, return that variant's name.
+    /// Returns `None` for structs (whose fields have real names) and anything unresolved.
+    fn pattern_variant_name(&mut self, path: PathId) -> Option<String> {
+        let mut origin = self.path_origin(path)?;
+        // Mirrors `path_to_constructor`: a `TypeResolution` origin needs one extra lookup.
+        for _ in 0..2 {
+            match origin {
+                Origin::TopLevelDefinition(top_level_name) => {
+                    let (item, item_context) = GetItemRaw(top_level_name.top_level_item).get(self.compiler);
+                    let cst::TopLevelItemKind::TypeDefinition(type_definition) = &item.kind else { return None };
+                    let cst::TypeDefinitionBody::Enum(variants) = &type_definition.body else { return None };
+                    let name = top_level_name.local_name_id;
+                    let is_variant = variants.iter().any(|(variant_name, _)| *variant_name == name);
+                    return is_variant.then(|| item_context.names[name].to_string());
+                },
+                Origin::Local(_) | Origin::Builtin(_) => return None,
+                Origin::TypeResolution => origin = self.current_extended_context().path_origin(path)?,
+            }
+        }
+        None
     }
 
     /// Map each field index of the constructor pattern `id` to its declared field name.
@@ -918,7 +947,37 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // to an `I32` before the decision tree checks occur. This lets us compile `match 1 | ...`
         // without errors that the type of `1` is not yet known.
         self.push_implicits_scope();
+
+        // Auto-drop: if the scrutinee is a tracked place, remember its exact move record so the
+        // whole-value move recorded while inferring it can be rolled back below.
+        let scrutinee_place = if self.auto_drop { self.try_build_move_path(match_.expression) } else { None };
+        let saved_scrutinee_move = scrutinee_place.as_ref().map(|place| self.move_tracker.save_move(place));
+
         let expr_type = self.infer_expr(match_.expression, &scrutinee_hint);
+
+        // Link constructor-pattern payload bindings to the scrutinee's place (per arm, below), so
+        // moving a payload marks the scrutinee partially moved and re-extraction or whole-value
+        // use afterwards is rejected -- without this the same owned payload can be consumed twice,
+        // a double-free once drops are automatic. Only for *owned* scrutinees: payload bindings
+        // under a `ref`/`mut`/`imm`/`uniq` (or pointer) scrutinee are not owned sub-places, and
+        // matching through a borrow must stay move-free (e.g. `Hash.hash` matches on `ref t`).
+        // The root must be owned too: `match s.field` where `s` is a reference borrows, not owns.
+        let scrutinee_place = scrutinee_place.filter(|place| {
+            let root_type = self.name_types.get(&place.root_variable()).cloned();
+            let root_is_indirect = root_type.is_some_and(|typ| {
+                typ.reference_element(&self.bindings).is_some() || typ.pointer_element(&self.bindings).is_some()
+            });
+            !root_is_indirect
+                && expr_type.reference_element(&self.bindings).is_none()
+                && expr_type.pointer_element(&self.bindings).is_none()
+        });
+
+        // An owned match is a place projection, not a consuming use: roll back the whole-value
+        // move recorded above (its use-of-moved check has already run) so the payload sub-places
+        // linked below are not spuriously ancestor-moved.
+        if let Some(place) = &scrutinee_place {
+            self.move_tracker.restore_move(place, saved_scrutinee_move.flatten());
+        }
 
         // Save move state before branches
         let pre_branch_moves = self.move_tracker.clone();
@@ -928,6 +987,9 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         for (pattern, branch) in match_.cases.iter() {
             self.move_tracker = pre_branch_moves.clone();
             self.check_pattern(*pattern, &expr_type);
+            if let Some(place) = &scrutinee_place {
+                self.assign_binding_places(*pattern, place.clone());
+            }
             self.push_implicits_scope();
             if self.diverges(&result_type) {
                 result_type = self.infer_expr(*branch, expected);

@@ -1,0 +1,20 @@
+type Res = tag: I32
+type Holder = slot: Maybe Res
+use_res (_r: Res): I32 = 1
+
+hash_like (m: Maybe t) (f: fn t -> I32): I32 =
+    match m
+    | Some x -> f x
+    | None -> 0
+
+from_field (holder: Holder): I32 =
+    match holder.slot
+    | Some r -> use_res r
+    | None -> 0
+
+main () =
+    h = Holder (Some (Res 1))
+    total = from_field h + hash_like (Some (Res 2)) use_res
+    print total
+
+// args: --check --no-color --auto-drop

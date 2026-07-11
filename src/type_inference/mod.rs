@@ -200,6 +200,11 @@ struct TypeChecker<'local, 'inner> {
     /// Cached TopLevelName for the Prelude's `Copy` type, lazily resolved on first use.
     copy_type_name: Option<TopLevelName>,
 
+    /// Whether `--auto-drop` is enabled (the `AutoDrop` DB input). Gates the parts of move
+    /// checking that only matter once drops are inserted automatically, e.g. linking match
+    /// payload bindings to the scrutinee's place.
+    auto_drop: bool,
+
     /// Names defined with `var` or as mutable parameters. Used by closure capture analysis
     /// to wrap mutable captures in a reference type so the closure shares the outer scope's storage.
     mutable_definitions: FxHashSet<NameId>,
@@ -250,6 +255,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             suppress_move_record: false,
             binding_places: Default::default(),
             copy_type_name: None,
+            auto_drop: crate::incremental::AutoDrop.get(compiler),
             mutable_definitions: Default::default(),
             integer_literal_vars: Default::default(),
             float_literal_vars: Default::default(),
