@@ -74,9 +74,12 @@ pub struct Cli {
     #[arg(long, short = 'i')]
     pub incremental: bool,
 
-    /// Insert automatic `Drop` calls at scope exit.
     #[arg(long)]
     pub auto_drop: bool,
+
+    /// Disable automatic `Drop` calls at scope exit (and the stricter checks that accompanies them).
+    #[arg(long, conflicts_with = "auto_drop")]
+    pub no_auto_drop: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, ValueEnum)]

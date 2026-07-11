@@ -113,7 +113,8 @@ fn compile(args: Cli) {
 
     // TODO: Pointer size should be configurable depending on the target machine
     TargetPointerSize.set(&mut compiler, 8);
-    AutoDrop.set(&mut compiler, args.auto_drop);
+    // Auto-drop is the default; --no-auto-drop opts out.
+    AutoDrop.set(&mut compiler, !args.no_auto_drop);
 
     if args.show_time {
         eprintln!("Phase timings:");

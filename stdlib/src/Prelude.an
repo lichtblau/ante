@@ -38,7 +38,7 @@ export String, from_parts, Maybe, None, Some, iff, unwrap, unwrap_or_else, Resul
     null, transmute,
     Print, print, println, print_unsigned, print_signed, print_float, print_u8, print_u16, print_u32, print_u64, print_usz, print_i8, print_i16, print_i32, print_i64, print_isz, print_char, print_f64, print_f32, print_pair, print_string, print_maybe, print_bool, print_array, print_ref,
     Iterator, next, iter, Range, iterator_range, iter_range, repeat,
-    panic, ignore, forget
+    panic, ignore, forget, discard
 
 type String =
     data: Ptr Char
@@ -1166,7 +1166,11 @@ forget (x: t): Unit =
     _ = transmute x : Usz
     ()
 
-// `ignore` takes ownership of its argument; under --auto-drop it drops it,
-// so it requires the ability to (add `{Copy t}` at the call site's type instead
-// if the value should live on).
-ignore (_x: t) {Drop t}: Unit = ()
+/// Discard a value WITHOUT running its destructor -- the pre-auto-drop behavior,
+/// kept constraint-free for source compatibility. Under auto-drop semantics,
+/// prefer discarding an expression as a plain statement (temporaries drop
+/// automatically) or `discard` to drop explicitly.
+ignore (x: t): Unit = forget x
+
+/// Discard a value, dropping it.
+discard (_x: t) {Drop t}: Unit = ()

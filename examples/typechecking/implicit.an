@@ -40,7 +40,7 @@ implicit_call () =
     implicit make_string {Bool} = ""
     requires_string ()
 
-// args: -e ast-t --no-color
+// args: -e ast-t --no-color --no-auto-drop
 // expected exit status: 1
 // expected stdout:
 // type Box a =

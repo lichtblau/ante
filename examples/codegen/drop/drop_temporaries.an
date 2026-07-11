@@ -13,4 +13,5 @@ main () =
 
 // args: --delete-binary --no-color
 // expected stdout:
+// drop 1
 // end

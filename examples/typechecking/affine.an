@@ -116,6 +116,13 @@ main () = ()
 //    |                  ^
 // 44 |     else ()
 // 
+// examples/typechecking/affine.an:50:13
+// 48 |     r = Resource 5
+// 49 |     _f () = consume r	// note: r was previously moved here
+//    |                     -
+// 50 |     consume r	// error: Use of moved value r
+//    |             ^
+// 
 // examples/typechecking/affine.an:63:16
 // 62 |     r = Resource 6
 //    |     // error: Use of moved value r
@@ -140,5 +147,4 @@ main () = ()
 // 89 |     take_two r r	// error: Use of moved value r
 //    |              ^
 // 
-// Found 6 errors and 0 warnings
-
+// Found 7 errors and 0 warnings
