@@ -220,6 +220,13 @@ impl NameId {
     pub fn new(id: u32) -> Self {
         Self(id)
     }
+
+    /// Reserved local name id (within a `shared` type's own top-level item) for that type's
+    /// synthesized `release_T` function. Real names count up from 0, so this never collides. It is
+    /// only ever used as a stable key for `Origin::TopLevelDefinition` / `name_to_id`; its location
+    /// and name string are supplied directly by the synthesizer, never looked up through this id,
+    /// so it needs no `name_locations` entry.
+    pub const RELEASE_FUNCTION: NameId = NameId(u32::MAX);
 }
 
 impl From<NameId> for usize {

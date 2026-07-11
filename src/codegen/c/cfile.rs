@@ -152,11 +152,19 @@ typedef double ante_f64;
         // Shared heap allocations carry a refcount header immediately *before* the
         // value. `AllocShared` allocates `{header, value}` and returns a pointer AT `value`; the
         // header is a max-aligned `size_t` so `value` keeps malloc's alignment and every
-        // load/GEP/store through the pointer is byte-identical. Only `FreeShared` and
-        // retain/release knows the offset: it frees `value_ptr - ANTE_RC_HEADER_SIZE`.  0-arg
-        // shared constructors' backing statics get `count = 0` (the immortal sentinel).
-        self.type_declarations += "#define ANTE_RC_HEADER_SIZE (sizeof(max_align_t))\n";
+        // load/GEP/store through the pointer is byte-identical. Only `FreeShared` knows the offset:
+        // it frees `value_ptr - ANTE_RC_HEADER_SIZE`.  0-arg shared constructors' backing statics
+        // get `count = 0` (the immortal sentinel).
+        //
+        // `ANTE_RC_HEADER_SIZE` must equal `sizeof(AnteRcHeader)`, not `sizeof(max_align_t)`: the
+        // immortal-sentinel backing static is laid out as `struct { AnteRcHeader _hdr; T value; }`,
+        // so `value` sits at `sizeof(AnteRcHeader)` -- and on platforms where `sizeof(max_align_t)`
+        // exceeds the header struct's size (align-16 header but a 32-byte `max_align_t`), the two
+        // disagree and retain/decrement read the count out of bounds. Keeping the offset tied to
+        // the struct keeps heap allocations and statics byte-identical.
+
         self.type_declarations += "typedef struct { _Alignas(max_align_t) size_t count; } AnteRcHeader;\n";
+        self.type_declarations += "#define ANTE_RC_HEADER_SIZE (sizeof(AnteRcHeader))\n";
 
         self.function_declarations += "void* malloc(size_t);\n";
         // `free` is declared here (matching the stdlib FFI's `Unit free(void*)`) so `FreeShared`

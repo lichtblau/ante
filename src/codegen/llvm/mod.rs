@@ -664,6 +664,58 @@ impl<'ctx> ModuleContext<'ctx> {
                     self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(1, false), "").unwrap();
                 reached_zero.as_basic_value_enum()
             },
+            mir::Instruction::RetainClosureEnv(value) => {
+                // Null-safe retain of a closure's heap environment (the env pointer). Branchless:
+                // read/write the header through `select(is_null, scratch, block)` so a null
+                // (capture-less) env touches a dead stack slot instead of faulting; a count of 0
+                // (immortal static) is left unchanged.
+                let ptr = self.lookup_value(value).into_pointer_value();
+                let i8_ty = self.llvm.i8_type();
+                let i64_ty = self.llvm.i64_type();
+                let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
+                let block = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
+                let scratch = self.builder.build_alloca(i64_ty, "").unwrap();
+                let null = ptr.get_type().const_null();
+                let is_null = self.builder.build_int_compare(IntPredicate::EQ, ptr, null, "").unwrap();
+                let addr = self.builder.build_select(is_null, scratch, block, "").unwrap().into_pointer_value();
+                let count = self.builder.build_load(i64_ty, addr, "").unwrap().into_int_value();
+                let is_immortal =
+                    self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(0, false), "").unwrap();
+                let incremented = self.builder.build_int_add(count, i64_ty.const_int(1, false), "").unwrap();
+                let via_immortal = self.builder.build_select(is_immortal, count, incremented, "").unwrap().into_int_value();
+                let to_store = self.builder.build_select(is_null, count, via_immortal, "").unwrap().into_int_value();
+                self.builder.build_store(addr, to_store).unwrap();
+                self.unit_value()
+            },
+            mir::Instruction::ReleaseClosureEnv(value) => {
+                // Null-safe decrement of a closure's heap environment (the env pointer); on
+                // reaching zero (count was exactly 1) free the block. Branchless like
+                // RetainClosureEnv; `free(null)` guards the not-reached-zero and immortal cases.
+                let ptr = self.lookup_value(value).into_pointer_value();
+                let i8_ty = self.llvm.i8_type();
+                let i64_ty = self.llvm.i64_type();
+                let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
+                let block = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
+                let scratch = self.builder.build_alloca(i64_ty, "").unwrap();
+                let null = ptr.get_type().const_null();
+                let is_null = self.builder.build_int_compare(IntPredicate::EQ, ptr, null, "").unwrap();
+                let addr = self.builder.build_select(is_null, scratch, block, "").unwrap().into_pointer_value();
+                let count = self.builder.build_load(i64_ty, addr, "").unwrap().into_int_value();
+                let is_immortal =
+                    self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(0, false), "").unwrap();
+                let decremented = self.builder.build_int_sub(count, i64_ty.const_int(1, false), "").unwrap();
+                let via_immortal = self.builder.build_select(is_immortal, count, decremented, "").unwrap().into_int_value();
+                let to_store = self.builder.build_select(is_null, count, via_immortal, "").unwrap().into_int_value();
+                self.builder.build_store(addr, to_store).unwrap();
+                // Reached zero iff non-null and the count was exactly 1 (immortal 0 → false).
+                let was_one =
+                    self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(1, false), "").unwrap();
+                let false_const = self.llvm.bool_type().const_int(0, false);
+                let reached_zero = self.builder.build_select(is_null, false_const, was_one, "").unwrap().into_int_value();
+                let free_arg = self.builder.build_select(reached_zero, block, null, "").unwrap().into_pointer_value();
+                self.builder.build_free(free_arg).unwrap();
+                self.unit_value()
+            },
             mir::Instruction::Transmute(value) => self.transmute(value, function, id),
             mir::Instruction::Id(value) => self.lookup_value(value),
             mir::Instruction::Instantiate(..) => {

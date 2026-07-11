@@ -411,6 +411,16 @@ impl Definition {
                     instr_assert_subtype!(pointer_type, Type::POINTER, self, id, mir, "RcDecrement argument must be a pointer, got `{pointer_type}`");
                     instr_assert_subtype!(*result_type, Type::BOOL, self, id, mir, "RcDecrement result must be a bool");
                 },
+                Instruction::RetainClosureEnv(pointer) => {
+                    let pointer_type = mir.type_of_value(pointer, self);
+                    instr_assert_subtype!(pointer_type, Type::POINTER, self, id, mir, "RetainClosureEnv argument must be a pointer, got `{pointer_type}`");
+                    instr_assert_subtype!(*result_type, Type::UNIT, self, id, mir, "RetainClosureEnv result must be unit");
+                },
+                Instruction::ReleaseClosureEnv(pointer) => {
+                    let pointer_type = mir.type_of_value(pointer, self);
+                    instr_assert_subtype!(pointer_type, Type::POINTER, self, id, mir, "ReleaseClosureEnv argument must be a pointer, got `{pointer_type}`");
+                    instr_assert_subtype!(*result_type, Type::UNIT, self, id, mir, "ReleaseClosureEnv result must be unit");
+                },
                 Instruction::GetFieldPtr { struct_ptr, .. } => {
                     let ptr_type = mir.type_of_value(struct_ptr, self);
                     instr_assert!(matches!(ptr_type, Type::POINTER), self, id, mir, "GetFieldPtr struct_ptr must be a pointer");

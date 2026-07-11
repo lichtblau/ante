@@ -8,7 +8,7 @@ use crate::{
     name_resolution::Origin,
     parser::{
         cst::{Expr, TopLevelItemKind},
-        ids::{ExprId, NameId, TopLevelName},
+        ids::{ExprId, NameId, TopLevelId, TopLevelName},
     },
     type_inference::{Locateable, TypeChecker, types::Type},
 };
@@ -414,6 +414,40 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
 
     pub(super) fn is_shared_user_defined(&self, typ: &Type) -> bool {
         matches!(self.shared_type_flags(typ), Some((true, _)))
+    }
+
+    /// True when `typ` is a closure whose environment is a bare `Pointer` -- the exact shape the MIR
+    /// builder heap-allocates via `AllocShared`. Such closure values are reference-counted like
+    /// shared handles: their env pointer carries a refcount header, so a copy retains it and a
+    /// death releases it. A `Ptr Unit` dictionary environment (ability method used as a first-class
+    /// value -- uniform-representation overhead, not a real capture) follows to `Type::Application`,
+    /// not the bare `Pointer` primitive, and is excluded. A slot of this shape filled by a
+    /// capture-less value carries a null env pointer, which the null-safe retain/release intrinsics
+    /// skip at runtime.
+    pub(super) fn is_heap_env_closure(&self, typ: &Type) -> bool {
+        match self.follow_type(typ) {
+            Type::Function(function) => {
+                matches!(function.environment.follow(&self.bindings), Type::Primitive(super::types::PrimitiveType::Pointer))
+            },
+            _ => false,
+        }
+    }
+
+    /// If `typ` resolves to a `shared` user-defined type, returns its defining item's id. Used to
+    /// name that type's synthesized `release_T` -- the same id both a release call site and the
+    /// type's own MIR emission derive the release function name from.
+    pub(super) fn shared_type_top_level_id(&self, typ: &Type) -> Option<TopLevelId> {
+        match typ.follow(&self.bindings) {
+            Type::Application(constructor, _) => self.shared_type_top_level_id(constructor),
+            Type::UserDefined(Origin::TopLevelDefinition(name)) => {
+                let (item, _) = GetItemRaw(name.top_level_item).get(self.compiler);
+                match &item.kind {
+                    TopLevelItemKind::TypeDefinition(td) if td.shared => Some(name.top_level_item),
+                    _ => None,
+                }
+            },
+            _ => None,
+        }
     }
 
     pub(super) fn is_shared_mut_user_defined(&self, typ: &Type) -> bool {

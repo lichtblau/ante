@@ -225,6 +225,13 @@ struct TypeChecker<'local, 'inner> {
     /// dropping the referent would dangle it. Skipping only leaks for now.
     captured_names: FxHashSet<NameId>,
 
+    /// Effect-continuation binding names -- a handler branch's `resume` (`--auto-drop` only).  A
+    /// `resume` continuation is a bare-`Pointer`-env closure would otherwise match it), but its
+    /// environment is supplied by the coroutine lowering -- a pointer to live coroutine/handler
+    /// state, **not** an `AllocShared` refcount block. Retaining or releasing it would read a bogus
+    /// header off the stack.
+    effect_continuation_names: FxHashSet<NameId>,
+
     /// Recursion guard for structural drop expansion (`--auto-drop`): recursive types
     /// cannot be expanded inline, so expansion stops at a fixed depth (skips leak).
     drop_expansion_depth: u32,
@@ -310,6 +317,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_method_name: None,
             drop_type_name: None,
             captured_names: Default::default(),
+            effect_continuation_names: Default::default(),
             drop_expansion_depth: 0,
             copy_check_depth: 0,
             function_local_names: Vec::new(),
@@ -457,6 +465,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.drop_scopes.clear();
         self.synthesizing_drops = false;
         self.captured_names.clear();
+        self.effect_continuation_names.clear();
         self.drop_expansion_depth = 0;
         self.function_local_names.clear();
         self.diagnosed_missing_drops.clear();

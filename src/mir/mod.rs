@@ -499,6 +499,21 @@ pub enum Instruction {
     /// unchanged, returns false. Only emitted for non-null user handles.
     RcDecrement(Value),
 
+    /// Null-safe retain of an escaping closure's heap environment. The argument is the environment
+    /// pointer (`IndexTuple(closure, 1)`) of a bare-`Pointer`-env closure. Unlike
+    /// [Instruction::RcRetain], it *is* null-guarded: a bare-pointer-env slot can be filled by a
+    /// capture-less value whose environment is null. A `count == 0` allocation is an immortal
+    /// static, left unchanged. Returns unit.
+    RetainClosureEnv(Value),
+
+    /// Null-safe release of an escaping closure's heap environment. The argument is the environment
+    /// pointer (`IndexTuple(closure, 1)`). Decrements the count and, on reaching zero, frees the
+    /// block (`ptr - header`). Null-safe (see [Instruction:: RetainClosureEnv]); immortal (`count
+    /// == 0`) statics are left unchanged. Unlike a shared type's `release_T`, it runs no pointee
+    /// glue in v1: owned captures inside the environment are leaked, never double-freed. Returns
+    /// unit.
+    ReleaseClosureEnv(Value),
+
     /// Store a value into a pointer location. Returns unit.
     Store {
         pointer: Value,
@@ -614,6 +629,8 @@ impl Instruction {
             Instruction::FreeShared(value) => f(value),
             Instruction::RcRetain(value) => f(value),
             Instruction::RcDecrement(value) => f(value),
+            Instruction::RetainClosureEnv(value) => f(value),
+            Instruction::ReleaseClosureEnv(value) => f(value),
             Instruction::Store { pointer, value } => two(pointer, value),
             Instruction::Transmute(value) => f(value),
             Instruction::Instantiate(_, _) => (),

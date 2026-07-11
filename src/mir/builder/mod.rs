@@ -268,6 +268,11 @@ where
     }
 
     fn get_definition_name(&self, name: &TopLevelName) -> Name {
+        // A shared type's synthesized `release_T` uses a reserved name id that has no entry in the
+        // parsed name arrays; give it a stable synthetic name.
+        if name.local_name_id == NameId::RELEASE_FUNCTION {
+            return Arc::new("release".to_string());
+        }
         let (_, context) = GetItemRaw(name.top_level_item).get(self.compiler);
         context.names[name.local_name_id].clone()
     }
@@ -286,12 +291,28 @@ where
     fn expression(&mut self, expr: ExprId) -> Value {
         let value = self.expression_inner(expr);
 
+        // A shared handle place escaping via this (tail-position) expression is a new owning
+        // location for the caller, so retain it -- before the scope-exit releases below, which would
+        // otherwise free the returned handle/env. The frontend marks only shared and
+        // heap-env-closure places.
+        if self.context().is_escape_retain(expr) {
+            self.emit_place_retain(expr, value);
+        }
+
         // Auto-drop: lower any synthesized scope-exit drop calls recorded against this
         // expression (block-fallthrough and function-exit edges), after its value is computed.
         if let Some(drops) = self.context().post_expr_drops(expr) {
             for drop_call in drops.clone() {
                 self.expression(drop_call);
             }
+        }
+
+        // A heap-env closure place dying on this edge releases its environment's refcount (freeing
+        // the env block at zero). The frontend records the release place directly here (rather than
+        // as a synthesized call -- closures have no nominal `release_T`).
+        if self.context().is_closure_env_release(expr) {
+            let env = self.push_instruction(Instruction::IndexTuple { tuple: value, index: 1 }, Type::POINTER);
+            self.push_instruction(Instruction::ReleaseClosureEnv(env), Type::UNIT);
         }
 
         value
@@ -495,6 +516,13 @@ where
         };
 
         self.bind_pattern(definition.pattern, value);
+        // Binding from an existing shared handle creates a new owning location; the binding's
+        // scope-exit release balances this retain. Only *real* drop-registered bindings are
+        // retained -- synthesized match-variable copies (`$mv = l`, payload binds) are borrows the
+        // frontend never releases, so retaining them would leak.
+        if self.context().is_retain_binding(definition.rhs) {
+            self.retain_if_shared_place(definition.rhs, value);
+        }
 
         // TODO: Globals should probably never be stack allocated
         if definition.mutable {
@@ -541,6 +569,31 @@ where
                 _ => Type::ERROR,
             };
             self.push_instruction(Instruction::IndexTuple { tuple, index }, element_type)
+        }
+    }
+
+    /// Retain (bump the refcount of) `value` when `expr` is a shared or heap-env-closure *place* --
+    /// a variable or field access naming an existing handle. Copying a handle into a new owning
+    /// location (a call argument under callee-owns, a binding, a `:=` store, a stored field) takes
+    /// a reference. A `Call`/`Constructor`/`Lambda` result is freshly allocated (already count 1),
+    /// i.e. a move, so it is not retained.
+    fn retain_if_shared_place(&mut self, expr: ExprId, value: Value) {
+        let is_place = matches!(&self.context()[expr], cst::Expr::Variable(_) | cst::Expr::MemberAccess(_));
+        if is_place {
+            self.emit_place_retain(expr, value);
+        }
+    }
+
+    /// Emit the appropriate refcount retain for a place `expr` producing `value`: a shared handle is
+    /// the pointer itself (`RcRetain`); a heap-env closure carries its refcount on its environment
+    /// pointer (`IndexTuple(closure, 1)` + null-safe `RetainClosureEnv`). Everything else is a no-op.
+    /// The caller has already established `expr` is a place worth retaining.
+    fn emit_place_retain(&mut self, expr: ExprId, value: Value) {
+        if self.expr_tc_is_shared(expr) {
+            self.push_instruction(Instruction::RcRetain(value), Type::UNIT);
+        } else if self.expr_tc_is_heap_env_closure(expr) {
+            let env = self.push_instruction(Instruction::IndexTuple { tuple: value, index: 1 }, Type::POINTER);
+            self.push_instruction(Instruction::RetainClosureEnv(env), Type::UNIT);
         }
     }
 
@@ -602,7 +655,19 @@ where
         }
 
         let function = self.expression(call.function);
-        let arguments = mapvec(&call.arguments, |expr| self.expression(expr.expr));
+        // A synthesized `release_T` call *consumes* a reference (it decrements), so its argument
+        // must not be retained -- retaining would cancel the decrement and leak. Every other call is
+        // callee-owns: a shared handle passed by value is a new owning location, so retain it (the
+        // callee's parameter release, or the constructed value's later release, balances it).
+        let is_release_call = matches!(&self.context()[call.function], cst::Expr::Variable(path)
+            if matches!(self.context().path_origin(*path), Some(Origin::TopLevelDefinition(name)) if name.local_name_id == NameId::RELEASE_FUNCTION));
+        let arguments = mapvec(&call.arguments, |arg| {
+            let value = self.expression(arg.expr);
+            if !is_release_call {
+                self.retain_if_shared_place(arg.expr, value);
+            }
+            value
+        });
 
         let instruction = if self.type_of_value(&function).is_closure() {
             Instruction::CallClosure { closure: function, arguments }
@@ -1783,12 +1848,228 @@ where
             self.define_type_constructor(constructor_name, constructor_type, parameters, tag, shared);
         }
 
+        // A shared type owns a synthesized `release_T`: decrement the refcount, and on the last
+        // reference run the pointee-drop glue then free the block.
+        if type_definition.shared {
+            self.define_release_function(type_definition);
+        }
+
         // Abilities are sugar for a struct of function-typed fields, however each "field" is treated
         // as a function by the frontend so we must generate actual functions for each field such
         // that `Cast.cast` is an actual function accepting a `Cast` instance and forwarding the
         // appropriate arguments to the `cast` field.
         if type_definition.is_ability {
             self.define_ability_methods(type_definition);
+        }
+    }
+
+    /// Emit a shared type's `release_T` function: `release(p) = if RcDecrement(p) then { <release
+    /// pointee's shared fields>; FreeShared(p) }`.  The glue is built directly in MIR from the
+    /// type's structure -- it cannot be synthesized in the frontend, which would need this type's
+    /// own (in-progress) `TypeCheck` result. Nested shared fields become recursive `release_U`
+    /// calls (terminating -- calls, not inline); non- shared owned fields are left un-dropped for
+    /// now.  Generic over the type's parameters so monomorphization specializes it per element
+    /// type, reached only through the `Instantiate` a release call site emits.
+    fn define_release_function(&mut self, type_definition: &cst::TypeDefinition) {
+        // Recover the type's generics so recursive-release `Instantiate` bindings map to the right
+        // MIR generics (the last constructor already left them in scope, but be explicit).
+        let tc_generics: Vec<_> = type_definition
+            .generics
+            .iter()
+            .map(|p| type_inference::generics::Generic::Named(Origin::Local(p.name)))
+            .collect();
+        if tc_generics.is_empty() {
+            self.generics_in_scope.clear();
+        } else {
+            let forall = TCType::Forall(Arc::new(tc_generics), Arc::new(TCType::UNIT));
+            self.set_generics_in_scope(&forall);
+        }
+        let generic_count = self.generics_in_scope.len() as u32;
+
+        // The shared type applied to its own generics -- the TC type of the handle, used to read the
+        // pointee layout and to name recursive releases. `generic_args` (the same generics as
+        // in-scope MIR generics) are also passed to `type_body` so it substitutes the type's
+        // parameters with *these* -- passing `None` would instantiate them as fresh, unbound type
+        // variables that convert to `Type::Error`.
+        let type_name = TopLevelName::new(self.top_level_id, type_definition.name);
+        let generic_args = mapvec(&type_definition.generics, |p| {
+            TCType::Generic(type_inference::generics::Generic::Named(Origin::Local(p.name)))
+        });
+        let mut self_tc = TCType::UserDefined(Origin::TopLevelDefinition(type_name));
+        if !generic_args.is_empty() {
+            self_tc = TCType::Application(Arc::new(self_tc), Arc::new(generic_args.clone()));
+        }
+
+        let name: Name = Arc::new(format!("release_{}", self.context()[type_definition.name].as_ref()));
+        // The handle is a shared pointer regardless of the element type, so the signature is
+        // `fn(Pointer) -> Unit`; genericity lives in `generic_count` + the body's Instantiates.
+        let fn_type = Type::Function(Arc::new(crate::mir::FunctionType {
+            parameters: vec![Type::POINTER],
+            environment: Type::NO_CLOSURE_ENV,
+            return_type: Type::UNIT,
+        }));
+
+        let old_scope = std::mem::take(&mut self.local_variables);
+        let old_mutables = std::mem::take(&mut self.mutable_locals);
+
+        let id = self.new_definition(name, Some(NameId::RELEASE_FUNCTION), generic_count, fn_type, |this| {
+            this.push_parameter(Type::POINTER);
+            let handle = Value::Parameter(this.current_block, 0);
+
+            let reached_zero = this.push_instruction(Instruction::RcDecrement(handle), Type::BOOL);
+            let glue_block = this.push_block_no_params();
+            let cont = this.push_block_no_params();
+            this.terminate_block(TerminatorInstruction::if_(reached_zero, glue_block, cont, cont));
+
+            // Last reference: release the pointee's shared fields, then free the whole block.
+            this.switch_to_block(glue_block);
+            this.build_release_glue(handle, &self_tc, &generic_args);
+            this.push_instruction(Instruction::FreeShared(handle), Type::UNIT);
+            this.terminate_block(TerminatorInstruction::jmp_no_args(cont));
+
+            this.switch_to_block(cont);
+            this.terminate_block(TerminatorInstruction::Return(Value::Unit));
+        });
+
+        self.local_variables = old_scope;
+        self.mutable_locals = old_mutables;
+        self.name_to_id.insert(TopLevelName::new(self.top_level_id, NameId::RELEASE_FUNCTION), id);
+    }
+
+    /// Emit the pointee-field releases for a shared type's `release_T`. Derefs the handle to the
+    /// pointee layout, then walks it via [Self::release_inline_body]. Leaves the builder positioned
+    /// at a single continuation block.
+    fn build_release_glue(&mut self, handle: Value, self_tc: &TCType, generic_args: &[TCType]) {
+        let inner = self.deref_if_shared(handle, self_tc);
+        // The pointee is processed as an inline aggregate of *this* type -- but not through
+        // [Self::release_inline_value], which would re-enter `release_T` recursively (a self-call).
+        self.release_inline_body(inner, self.top_level_id, generic_args);
+    }
+
+    /// Release every shared handle reachable from `value`, an inline aggregate value laid out as the
+    /// body of user type `type_id` applied to `args`. For a product this releases each field in
+    /// place; for a sum it switches on the tag and releases the active variant's payloads, leaving
+    /// the builder at a single merge block. Directly-shared fields become recursive `release_T`
+    /// calls; nested non-shared aggregates (`Maybe (shared T)`, tuples, …) are traversed inline so
+    /// the shared values they wrap are still released. Bare generics are skipped (v1 leak).
+    fn release_inline_body(&mut self, value: Value, type_id: TopLevelId, args: &[TCType]) {
+        // Substitute the type's parameters with these args; `None` would instantiate them as fresh
+        // unbound type variables (→ `Type::Error` at codegen).
+        let args = (!args.is_empty()).then_some(args);
+        match type_id.type_body(args, self.compiler) {
+            crate::type_inference::TypeBody::Product { fields, .. } => {
+                let variant = self.extract_variant(value, 0);
+                for (i, (_, field_tc)) in fields.iter().enumerate() {
+                    self.release_inline_field(variant, i as u32, &field_tc);
+                }
+            },
+            crate::type_inference::TypeBody::Sum(variants) => {
+                let tag = self.extract_tag_value(value);
+                // `else_`, the per-variant cases, and the merge `end` must all be distinct blocks
+                // (the topological sort treats `end` as the merge of the others).
+                let else_block = self.push_block_no_params();
+                let end = self.push_block_no_params();
+                let case_blocks: Vec<(u32, (BlockId, Option<Value>))> =
+                    (0..variants.len()).map(|i| (i as u32, (self.push_block_no_params(), None))).collect();
+                self.terminate_block(TerminatorInstruction::Switch {
+                    int_value: tag,
+                    cases: case_blocks.clone(),
+                    else_: (else_block, None),
+                    end,
+                });
+                // All tags are covered; the else edge is unreachable but must be well-formed.
+                self.switch_to_block(else_block);
+                self.terminate_block(TerminatorInstruction::jmp_no_args(end));
+                for (idx, (_, payloads)) in variants.iter().enumerate() {
+                    self.switch_to_block(case_blocks[idx].1.0);
+                    if !payloads.is_empty() {
+                        let variant = self.extract_variant(value, idx);
+                        for (j, payload_tc) in payloads.iter().enumerate() {
+                            self.release_inline_field(variant, j as u32, payload_tc);
+                        }
+                    }
+                    self.terminate_block(TerminatorInstruction::jmp_no_args(end));
+                }
+                self.switch_to_block(end);
+            },
+        }
+    }
+
+    /// Project field `index` out of `tuple` and release the shared handles reachable from it.
+    fn release_inline_field(&mut self, tuple: Value, index: u32, field_tc: &TCType) {
+        if self.shared_release_target(field_tc).is_none() && self.aggregate_type_target(field_tc).is_none() {
+            return; // primitives and bare generics carry no shared handle to release.
+        }
+        let field_type = self.convert_type(field_tc, None);
+        let field = self.push_instruction(Instruction::IndexTuple { tuple, index }, field_type);
+        self.release_inline_value(field, field_tc);
+    }
+
+    /// Release the shared handles reachable from `value` of type `tc`: a directly-shared handle
+    /// becomes a recursive `release_T` call; a non-shared aggregate is traversed inline via
+    /// [Self::release_inline_body]; anything else carries no shared handle and is skipped.
+    fn release_inline_value(&mut self, value: Value, tc: &TCType) {
+        if let Some((type_id, type_args)) = self.shared_release_target(tc) {
+            self.emit_release_call(value, type_id, &type_args);
+        } else if let Some((type_id, type_args)) = self.aggregate_type_target(tc) {
+            self.release_inline_body(value, type_id, &type_args);
+        }
+    }
+
+    /// Emit `release_T(handle)` for shared type `type_id` applied to `type_args` (instantiating the
+    /// generic release function when the type is generic).
+    fn emit_release_call(&mut self, handle: Value, type_id: TopLevelId, type_args: &[TCType]) {
+        let release_name = TopLevelName::new(type_id, NameId::RELEASE_FUNCTION);
+        let release_id = self.get_definition_id(&release_name);
+        let fn_type = Type::Function(Arc::new(crate::mir::FunctionType {
+            parameters: vec![Type::POINTER],
+            environment: Type::NO_CLOSURE_ENV,
+            return_type: Type::UNIT,
+        }));
+        let callee = if type_args.is_empty() {
+            self.make_definition_value(release_id, Arc::new("release".to_string()), fn_type)
+        } else {
+            let mir_args = mapvec(type_args, |a| self.convert_type(a, None));
+            self.push_instruction(Instruction::Instantiate(release_id, Arc::new(mir_args)), fn_type)
+        };
+        self.push_instruction(Instruction::Call { function: callee, arguments: vec![handle] }, Type::UNIT);
+    }
+
+    /// If `typ` resolves to a *non-shared* user-defined type (a product/sum whose inline layout may
+    /// still wrap shared handles), return its item id and type arguments so its body can be walked.
+    /// Shared types return `None` here -- [Self::shared_release_target] handles those.
+    fn aggregate_type_target(&self, typ: &TCType) -> Option<(TopLevelId, Vec<TCType>)> {
+        if self.shared_release_target(typ).is_some() {
+            return None;
+        }
+        match typ.follow(&self.types.bindings) {
+            TCType::Application(constructor, args) => match constructor.follow(&self.types.bindings) {
+                TCType::UserDefined(Origin::TopLevelDefinition(name)) => Some((name.top_level_item, args.to_vec())),
+                _ => None,
+            },
+            TCType::UserDefined(Origin::TopLevelDefinition(name)) => Some((name.top_level_item, Vec::new())),
+            _ => None,
+        }
+    }
+
+    /// If `typ` resolves to a `shared` user-defined type, return its item id and type arguments --
+    /// enough to name and (if generic) instantiate that type's `release_T` for a recursive call.
+    fn shared_release_target(&self, typ: &TCType) -> Option<(TopLevelId, Vec<TCType>)> {
+        let is_shared = |name: &TopLevelName| {
+            let (item, _) = GetItemRaw(name.top_level_item).get(self.compiler);
+            matches!(&item.kind, cst::TopLevelItemKind::TypeDefinition(td) if td.shared)
+        };
+        match typ.follow(&self.types.bindings) {
+            TCType::Application(constructor, args) => match constructor.follow(&self.types.bindings) {
+                TCType::UserDefined(Origin::TopLevelDefinition(name)) if is_shared(name) => {
+                    Some((name.top_level_item, args.to_vec()))
+                },
+                _ => None,
+            },
+            TCType::UserDefined(Origin::TopLevelDefinition(name)) if is_shared(name) => {
+                Some((name.top_level_item, Vec::new()))
+            },
+            _ => None,
         }
     }
 

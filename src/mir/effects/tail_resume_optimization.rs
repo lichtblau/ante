@@ -609,6 +609,8 @@ pub(super) fn substitute_value(definition: &mut Definition, find: Value, replace
             | Instruction::FreeShared(v)
             | Instruction::RcRetain(v)
             | Instruction::RcDecrement(v)
+            | Instruction::RetainClosureEnv(v)
+            | Instruction::ReleaseClosureEnv(v)
             | Instruction::Transmute(v)
             | Instruction::Id(v) => sub(v),
             Instruction::Store { pointer, value } => {

@@ -1,0 +1,33 @@
+get_closure () =
+    msg = "hi"
+    stuff () = println msg
+    stuff
+
+main () =
+    // returned closure (the closure_return.an pattern)
+    f = get_closure ()
+    f ()
+
+    // a capturing closure created and discarded each loop iteration
+    var i = 0
+    while i < 3 do
+        n = i
+        g = fn () -> println (n + 10)
+        g ()
+        i := i + 1
+
+    // a move closure capturing by value
+    var x = 100
+    m = move fn () -> println x
+    x := 200
+    m ()
+    println x
+
+// args: --delete-binary --no-color
+// expected stdout:
+// hi
+// 10
+// 11
+// 12
+// 100
+// 200

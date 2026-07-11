@@ -1,0 +1,85 @@
+// A shared (reference-counted) red-black tree, exercised through direct recursion rather than
+// `foldl`/effects, so every node is reclaimed by dropping -- this file is leak-clean.
+// (Contrast examples/codegen/shared.an, whose `foldl` accumulator escapes into an effect handler.)
+//
+// It covers the ARC-relevant shapes: recursion + accumulator threading (build), node
+// destructure-and-rebuild (make_black/balance), persistent structural sharing (t vs t2),
+// and plain aliasing (a = t).
+
+shared type Color = | R | B
+
+shared type RbTree t =
+    | Empty
+    | Tree Color (RbTree t) t (RbTree t)
+
+balance (tree: RbTree t): RbTree t =
+    match tree
+    | Tree B (Tree R (Tree R a x b) y c) z d
+    | Tree B (Tree R a x (Tree R b y c)) z d
+    | Tree B a x (Tree R (Tree R b y c) z d)
+    | Tree B a x (Tree R b y (Tree R c z d)) -> Tree R (Tree B a x b) y (Tree B c z d)
+    | other -> other
+
+count (tree: RbTree t): U32 =
+    match tree
+    | Empty -> 0
+    | Tree _ l _ r -> 1 + count l + count r
+
+make_black (tree: RbTree t): RbTree t =
+    match tree
+    | Empty -> Empty
+    | Tree _ l x r -> Tree B l x r
+
+ins (tree: RbTree t) (x: t) {Cmp t} {Copy t}: RbTree t =
+    match tree
+    | Empty -> Tree R Empty x Empty
+    | Tree color l y r ->
+        if x < y then balance (Tree color (ins l x) y r)
+        else if y < x then balance (Tree color l y (ins r x))
+        else tree
+
+insert (tree: RbTree t) (x: t) {Cmp t} {Copy t}: RbTree t =
+    make_black (ins tree x)
+
+contains (tree: RbTree t) (x: t) {Cmp t} {Copy t}: Bool =
+    match tree
+    | Empty -> false
+    | Tree _ l y r ->
+        if x < y then contains l x
+        else if y < x then contains r x
+        else true
+
+// Insert n, n-1, .., 1 into `acc` (keys 1..n), threading the accumulator by recursion.
+build (n: I32) (acc: RbTree I32): RbTree I32 =
+    if 0 < n then build (n - 1) (insert acc n)
+    else acc
+
+main () =
+    t = build 100 RbTree.Empty
+    println (count t)            // 100
+    println (contains t 50)      // true
+    println (contains t 100)     // true
+    println (contains t 0)       // false
+
+    // Persistent update: t2 shares almost all of t's nodes; t is unchanged.
+    t2 = insert t 500
+    println (count t2)           // 101
+    println (count t)            // 100
+    println (contains t2 500)    // true
+    println (contains t 500)     // false
+
+    // Plain aliasing: a and t are the same handle.
+    a = t
+    println (count a)            // 100
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 100
+// true
+// true
+// false
+// 101
+// 100
+// true
+// false
+// 100

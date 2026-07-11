@@ -383,6 +383,8 @@ fn fmt_instruction(
         mir::Instruction::FreeShared(value) => write!(f, "free_shared {}", v(value))?,
         mir::Instruction::RcRetain(value) => write!(f, "rc_retain {}", v(value))?,
         mir::Instruction::RcDecrement(value) => write!(f, "rc_decrement {}", v(value))?,
+        mir::Instruction::RetainClosureEnv(value) => write!(f, "retain_closure_env {}", v(value))?,
+        mir::Instruction::ReleaseClosureEnv(value) => write!(f, "release_closure_env {}", v(value))?,
         mir::Instruction::Extern(name) => write!(f, "extern \"{name}\"")?,
     }
 

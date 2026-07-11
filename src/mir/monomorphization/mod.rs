@@ -294,6 +294,8 @@ impl<'local> FunctionContext<'local> {
             | Instruction::FreeShared(v)
             | Instruction::RcRetain(v)
             | Instruction::RcDecrement(v)
+            | Instruction::RetainClosureEnv(v)
+            | Instruction::ReleaseClosureEnv(v)
             | Instruction::Transmute(v)
             | Instruction::Id(v) => self.remap_value(v),
             Instruction::StackAllocUninit(typ) => {

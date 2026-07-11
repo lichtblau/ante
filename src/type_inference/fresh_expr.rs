@@ -85,6 +85,29 @@ pub struct ExtendedTopLevelContext {
     /// by reference. Used by the MIR builder to determine capture semantics.
     move_closures: FxHashSet<ExprId>,
 
+    /// RHS expressions of *real* (user-written, drop-registered) local bindings, keyed by the
+    /// binding's rhs [ExprId]. The MIR builder emits an `RcRetain` when such an rhs is a shared
+    /// handle place -- the binding is a new owning location whose scope-exit release balances the
+    /// retain. Synthesized match-variable definitions (`$mv = l`, payload copies) are *not*
+    /// recorded here: the frontend never drop-registers them, so retaining them would leak (an
+    /// unmatched increment).
+    retain_bindings: FxHashSet<ExprId>,
+
+    /// Tail-position shared-handle *place* expressions (variables / field accesses) that escape as
+    /// a function's return value. A `shared` value is Copy, never move-tracked, so a function
+    /// returning one of its locals/params would release it at scope exit while the caller also owns
+    /// it. The MIR builder emits an `RcRetain` when lowering such an expression to fund the
+    /// caller's reference; the scope-exit release then balances it.
+    escape_retains: FxHashSet<ExprId>,
+
+    /// Heap-env closure *place* expressions (variables / field accesses) whose environment refcount
+    /// must be released here. Recorded by drop elaboration at scope-exit edges and threaded through
+    /// the drop tables (`post_expr_drops` / `pre_exit_drops`) like a synthesized drop call; the MIR
+    /// builder emits a null-safe `ReleaseClosureEnv` on the place's env pointer after computing its
+    /// value. Unlike shared handles, closures have no nominal `release_T`, so the place is recorded
+    /// directly rather than as a synthesized call.
+    closure_env_releases: FxHashSet<ExprId>,
+
     /// Drop calls synthesized by drop elaboration (`--auto-drop`), keyed by the expression
     /// whose value immediately precedes the scope-exit edge. The MIR builder lowers them
     /// right after that expression's value is computed. Keys today: a `Sequence` (block
@@ -147,6 +170,9 @@ impl ExtendedTopLevelContext {
             instantiations: Default::default(),
             closure_environments: Default::default(),
             move_closures: Default::default(),
+            retain_bindings: Default::default(),
+            escape_retains: Default::default(),
+            closure_env_releases: Default::default(),
             post_expr_drops: Default::default(),
             pre_exit_drops: Default::default(),
             implicit_else_drops: Default::default(),
@@ -363,6 +389,15 @@ impl ExtendedTopLevelContext {
         if self.move_closures.contains(&from) {
             self.move_closures.insert(to);
         }
+        if self.retain_bindings.contains(&from) {
+            self.retain_bindings.insert(to);
+        }
+        if self.escape_retains.contains(&from) {
+            self.escape_retains.insert(to);
+        }
+        if self.closure_env_releases.contains(&from) {
+            self.closure_env_releases.insert(to);
+        }
         if let Some(drops) = self.post_expr_drops.get(&from).cloned() {
             self.post_expr_drops.insert(to, drops);
         }
@@ -376,6 +411,34 @@ impl ExtendedTopLevelContext {
 
     pub fn is_move_closure(&self, expr: ExprId) -> bool {
         self.move_closures.contains(&expr)
+    }
+
+    /// Record `expr` (a real binding's rhs) as a retain site; see [Self::retain_bindings].
+    pub(crate) fn mark_retain_binding(&mut self, expr: ExprId) {
+        self.retain_bindings.insert(expr);
+    }
+
+    pub fn is_retain_binding(&self, expr: ExprId) -> bool {
+        self.retain_bindings.contains(&expr)
+    }
+
+    /// Record `expr` as a tail-position escaping shared place; see [Self::escape_retains].
+    pub(crate) fn mark_escape_retain(&mut self, expr: ExprId) {
+        self.escape_retains.insert(expr);
+    }
+
+    pub fn is_escape_retain(&self, expr: ExprId) -> bool {
+        self.escape_retains.contains(&expr)
+    }
+
+    /// Record `expr` (a heap-env closure place) as a closure-env release site; see
+    /// [Self::closure_env_releases].
+    pub(crate) fn mark_closure_env_release(&mut self, expr: ExprId) {
+        self.closure_env_releases.insert(expr);
+    }
+
+    pub fn is_closure_env_release(&self, expr: ExprId) -> bool {
+        self.closure_env_releases.contains(&expr)
     }
 
     /// Append synthesized drop calls to run after `expr`'s value is computed.

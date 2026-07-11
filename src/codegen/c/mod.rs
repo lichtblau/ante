@@ -933,6 +933,33 @@ impl Builder {
                      if ({id}_c) {{ {id}_h->count = {id}_c - 1; {id} = ({id}_c == 1); }}"
                 );
             },
+            mir::Instruction::RetainClosureEnv(value) => {
+                // Null-safe retain of a closure's heap environment (the env pointer). A
+                // bare-pointer-env slot may hold a capture-less value whose env is null, so guard
+                // the header access; a count of 0 marks an immortal static, left untouched.
+                let _ = write!(self.current_item, "Unit {id} = (Unit){{0}}; if (");
+                self.write_value(value, mir);
+                let _ = write!(self.current_item, ") {{ AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
+                self.write_value(value, mir);
+                let _ =
+                    write!(self.current_item, " - ANTE_RC_HEADER_SIZE); if ({id}_h->count) {id}_h->count += 1; }}");
+            },
+            mir::Instruction::ReleaseClosureEnv(value) => {
+                // Null-safe decrement of a closure's heap environment (the env pointer); on
+                // reaching zero, free the block (`value - header`). No pointee glue in v1 (owned
+                // captures leak, never double-free). Null-safe + immortal-safe like retain.
+                let _ = write!(self.current_item, "Unit {id} = (Unit){{0}}; if (");
+                self.write_value(value, mir);
+                let _ = write!(self.current_item, ") {{ AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
+                self.write_value(value, mir);
+                let _ = write!(
+                    self.current_item,
+                    " - ANTE_RC_HEADER_SIZE); size_t {id}_c = {id}_h->count; \
+                     if ({id}_c) {{ {id}_h->count = {id}_c - 1; if ({id}_c == 1) free((char*)"
+                );
+                self.write_value(value, mir);
+                let _ = write!(self.current_item, " - ANTE_RC_HEADER_SIZE); }} }}");
+            },
             mir::Instruction::Store { pointer, value } => {
                 let typ = mir.type_of_value(value, definition);
                 self.write("*(");
