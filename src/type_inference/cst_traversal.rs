@@ -30,6 +30,19 @@ struct LambdaOptions {
     /// it should be reported. The set is the names visible before the branch
     /// introduces its own pattern bindings.
     repeated_context: Option<(RepeatedContext, FxHashSet<NameId>)>,
+
+    /// True for a `handle`'s case-branch and body lambdas.
+    /// These closures cannot outlive their handle expression -- the branches are consumed
+    /// by the drive function and the body by the coroutine init, and the coroutine is
+    /// freed unconditionally when the handle completes -- so their captures do NOT poison
+    /// `captured_names`: the owning scope may drop them normally at its exit (which runs
+    /// after the handle). By-value escapes out of these lambdas (a branch returning its
+    /// capture, `resume <capture>`) are covered by `merge_moves_rooted_in`, which marks
+    /// the outer binding moved so the owner skips it; resume-using branches cannot move
+    /// captures at all (`check_moves_in_repeated_context`). Names ALSO captured by an
+    /// ordinary (escapable) closure keep their exclusion via that closure's own
+    /// `record_captured_names`.
+    handler_scoped: bool,
 }
 
 impl<'local, 'inner> TypeChecker<'local, 'inner> {
@@ -895,8 +908,13 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         if let Some(outer_names) = outer_names {
             self.move_tracker.merge_moves_rooted_in(&body_tracker, &outer_names);
             // Names this lambda captures must not be auto-dropped by their owning scope:
-            // the closure (e.g. one returned from the function) would dangle.
-            self.record_captured_names(expr);
+            // the closure (e.g. one returned from the function) would dangle. Handle-scoped
+            // lambdas (handler branches + handle bodies) are exempt -- they cannot outlive
+            // their handle expression, so the owner's scope-exit drop (which runs after the
+            // handle completes) is sound; see `LambdaOptions::handler_scoped`.
+            if !options.handler_scoped {
+                self.record_captured_names(expr);
+            }
         }
 
         // Must run before `check_for_closure` may be deferred, so later uses see the move.
@@ -1422,7 +1440,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 .handler_branch_uses_resume(pattern.resume_name, *branch)
                 .then(|| (RepeatedContext::HandlerBranch, outer_names.clone()));
 
-            let options = LambdaOptions { repeated_context };
+            let options = LambdaOptions { repeated_context, handler_scoped: true };
 
             // `resume` is a bare-`Pointer`-env closure but its environment is coroutine state, not
             // an `AllocShared` refcount block -- exclude it from closure-env RC.
@@ -1436,7 +1454,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.push_implicits_scope();
         self.add_implicit_name(handle.handler_name);
 
-        let options = LambdaOptions::default();
+        let options = LambdaOptions { handler_scoped: true, ..LambdaOptions::default() };
         let body_lambda = self.unwrap_lambda(handle.expression);
 
         // `Some(handler_name)` exempts the variable from being captured as a closure.

@@ -623,23 +623,17 @@ where
         if let cst::Expr::Variable(path_id) = &self.context()[call.function]
             && let Some((effect_op, op_index)) = self.try_resolve_ability_method(*path_id)
         {
-            // A capability built by applying a constrained impl (`drop_vec drop_i32`) heap-
-            // allocates each method closure's environment inside the impl function, freshly
-            // per call site execution. A `Drop` capability cannot outlive its method call
-            // (unlike e.g. Stream combinators, which legitimately capture their caps in
-            // returned closures), so for Drop calls we lower application-shaped capability
-            // arguments through `lower_drop_capability` -- collecting every nesting level's
-            // environments -- and free them once the drop completes. Static impls and
-            // capability parameters lower as plain variables and are never freed.
-            let is_drop_call = matches!(
-                self.context().path_origin(*path_id),
-                Some(Origin::TopLevelDefinition(name)) if self.is_prelude_drop_ability(name.top_level_item)
-            );
-
-            let mut cap_env_frees = Vec::new();
+            // An implicit capability (`print_vec print_i32`, `drop_vec drop_i32`) heap-allocates
+            // each method closure's environment inside the impl function, freshly per call-site
+            // execution. The caller owns those envs: release them (count-zero free via the
+            // null-safe, immortal-safe ReleaseClosureEnv) once the call completes. Static impls and
+            // capability parameters lower as plain variables -- nothing is collected for them, so
+            // effect capabilities (stack cap_state envs, no RC header) are never touched. A callee
+            // that legitimately stores a method closure beyond the call must retain it.
+            let mut cap_env_releases = Vec::new();
             let arguments = mapvec(&call.arguments, |argument| {
-                if is_drop_call && argument.is_implicit {
-                    self.lower_drop_capability(argument.expr, &mut cap_env_frees)
+                if argument.is_implicit {
+                    self.lower_drop_capability(argument.expr, &mut cap_env_releases)
                 } else {
                     let value = self.expression(argument.expr);
                     // Callee-owns retain, same as the plain-call path below: an effect-op or
@@ -648,17 +642,15 @@ where
                     // refcount bumped or the arm's release double-frees the caller's handle.
                     // Implicit capability tuples are excluded: they are not shared handles,
                     // and their ownership is audited separately.
-                    if !argument.is_implicit {
-                        self.retain_if_shared_place(argument.expr, value);
-                    }
+                    self.retain_if_shared_place(argument.expr, value);
                     value
                 }
             });
 
             let result = self.emit_ability_method_call(effect_op, op_index, arguments, result_type, diverges);
             if !diverges {
-                for environment in cap_env_frees {
-                    self.emit_free(environment);
+                for environment in cap_env_releases {
+                    self.push_instruction(Instruction::ReleaseClosureEnv(environment), Type::UNIT);
                 }
             }
             return result;
@@ -671,12 +663,21 @@ where
         // callee's parameter release, or the constructed value's later release, balances it).
         let is_release_call = matches!(&self.context()[call.function], cst::Expr::Variable(path)
             if matches!(self.context().path_origin(*path), Some(Origin::TopLevelDefinition(name)) if name.local_name_id == NameId::RELEASE_FUNCTION));
+        // Implicit capability arguments to plain calls (a generic wrapper like `println x
+        // {Print t}`) get the same treatment as ability-method calls above: an
+        // application-shaped cap is freshly allocated for this call, so the caller releases
+        // its method-closure environments once the call completes.
+        let mut cap_env_releases = Vec::new();
         let arguments = mapvec(&call.arguments, |arg| {
-            let value = self.expression(arg.expr);
-            if !is_release_call {
-                self.retain_if_shared_place(arg.expr, value);
+            if arg.is_implicit && !is_release_call {
+                self.lower_drop_capability(arg.expr, &mut cap_env_releases)
+            } else {
+                let value = self.expression(arg.expr);
+                if !is_release_call {
+                    self.retain_if_shared_place(arg.expr, value);
+                }
+                value
             }
-            value
         });
 
         let instruction = if self.type_of_value(&function).is_closure() {
@@ -688,6 +689,10 @@ where
         let value = self.push_instruction(instruction, result_type);
         if diverges {
             self.terminate_block(TerminatorInstruction::Unreachable);
+        } else {
+            for environment in cap_env_releases {
+                self.push_instruction(Instruction::ReleaseClosureEnv(environment), Type::UNIT);
+            }
         }
         value
     }
@@ -729,24 +734,11 @@ where
         value
     }
 
-    /// True if `item` is the Prelude's `Drop` ability definition.
-    fn is_prelude_drop_ability(&mut self, item: TopLevelId) -> bool {
-        if item.source_file != crate::name_resolution::namespace::SourceFileId::prelude() {
-            return false;
-        }
-        let (raw_item, context) = GetItemRaw(item).get(self.compiler);
-        match &raw_item.kind {
-            cst::TopLevelItemKind::AbilityDefinition(ability) => context.names[ability.name].as_ref() == "Drop",
-            _ => false,
-        }
-    }
-
-    /// Lower a Drop call's capability argument. Application-shaped arguments (a constrained
-    /// impl applied to its own capabilities, e.g. `drop_vec drop_i32`) are lowered manually,
-    /// recursing into their arguments, so that every nesting level's freshly-constructed
-    /// capability value is at hand: each one's method-closure environments are recorded in
-    /// `env_frees` for release after the drop runs. Anything else (a static impl reference,
-    /// a `{Drop t}` parameter) lowers normally and owns nothing to free.
+    /// True if `item` is the Prelude's `Drop` ability definition.  Lower an ability-method call's
+    /// capability argument. Recursing into the arguments, so that every nesting level's
+    /// freshly-constructed capability value is at hand: each one's method-closure environments are
+    /// recorded in `env_frees` for release after the call runs. Anything else (a static impl
+    /// reference, a capability parameter) lowers normally and owns nothing to release.
     fn lower_drop_capability(&mut self, expr: ExprId, env_frees: &mut Vec<Value>) -> Value {
         let call = match &self.context()[expr] {
             cst::Expr::Call(call) => call.clone(),
@@ -786,15 +778,6 @@ where
                 env_frees.push(environment);
             }
         }
-    }
-
-    /// Free a heap pointer the drop machinery owns. These pointers come from [Instruction::
-    /// AllocShared] (closure/capability-method environments), which carry a refcount header before
-    /// the value; [Instruction::FreeShared] subtracts that offset and is null-safe (capture-less
-    /// methods carry a null environment). Raw `Ptr` frees in the stdlib use a plain `free` and are
-    /// unaffected.
-    fn emit_free(&mut self, pointer: Value) {
-        self.push_instruction(Instruction::FreeShared(pointer), Type::UNIT);
     }
 
     /// Like [Self::try_resolve_effect_op] but also returns the op's position within its
