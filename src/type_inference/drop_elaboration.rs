@@ -229,6 +229,18 @@ impl TypeChecker<'_, '_> {
         if typ == Type::ERROR {
             return None;
         }
+        // A reference (`ref`/`mut`/...) or raw `Ptr` value never owns its referent: its drop
+        // is a no-op (the Prelude's `Drop (Ptr t)` impl is explicitly empty). Cutting here
+        // matters beyond the no-op: `get_field_types` sees *through* these constructors
+        // (returning the pointee's fields re-wrapped, for member access), so a structural
+        // expansion below would walk the pointee -- and for a self-referential pointer
+        // struct (`ExecCtx` holding three `Ptr ExecCtx` fields) that walk is exponential in
+        // the depth cap, with the wrapped types growing at every level. Every leaf of that
+        // walk stays ref/`Ptr`-wrapped, so no release, `Drop` impl, or sum drop can ever
+        // match inside it: it can only re-derive `None`.
+        if self.type_is_reference_or_pointer(&typ) {
+            return None;
+        }
         // Fast bail-out: a memoized, type-driven proof that dropping this value is a no-op
         // (no shared handles, closures, or Drop impls anywhere inside). Every check below
         // and the whole structural expansion would re-derive `None` from scratch per site,
@@ -1264,7 +1276,10 @@ impl TypeChecker<'_, '_> {
             return None;
         }
         let typ = self.follow_type(typ).clone();
-        if typ == Type::ERROR || !typ.free_vars(&self.bindings).is_empty() || self.type_is_copy(&typ) {
+        if typ == Type::ERROR || self.type_is_reference_or_pointer(&typ) {
+            return None;
+        }
+        if !typ.free_vars(&self.bindings).is_empty() || self.type_is_copy(&typ) {
             return None;
         }
         // A type with its own Drop impl cannot run it on a partially-moved value (Rust
@@ -1533,6 +1548,20 @@ impl TypeChecker<'_, '_> {
         found
     }
 
+    /// True when `typ`'s head constructor is a reference (`ref`/`mut`/`imm`/`uniq`) or the
+    /// raw `Ptr` primitive -- the constructors `compute_field_types` sees through for member
+    /// access. A value of such a type never owns its referent, so drop elaboration must
+    /// treat it as an opaque no-drop leaf rather than expanding the pointee.
+    fn type_is_reference_or_pointer(&self, typ: &Type) -> bool {
+        match self.follow_type(typ) {
+            Type::Application(constructor, _) => matches!(
+                self.follow_type(constructor),
+                Type::Primitive(super::types::PrimitiveType::Reference(_) | super::types::PrimitiveType::Pointer)
+            ),
+            _ => false,
+        }
+    }
+
     /// Type-driven, place-independent proof that dropping a value of `typ` is a no-op: no
     /// shared handle, closure environment, or visible `Drop` impl is reachable anywhere
     /// inside it. `true` means the drop synthesis would provably return `None`, so callers
@@ -1545,6 +1574,11 @@ impl TypeChecker<'_, '_> {
         // over the type on every hit.
         if let Some(hit) = self.no_drop_cache.get(typ) {
             return *hit;
+        }
+        // Before the concreteness gate: a ref-headed type carries a lifetime *variable*, so
+        // it is never concrete and would bypass the memo (and this proof) at every site.
+        if self.type_is_reference_or_pointer(typ) {
+            return true;
         }
         if !self.type_is_concrete(typ) {
             return false;
@@ -1570,6 +1604,11 @@ impl TypeChecker<'_, '_> {
             Type::Function(_) => false,
             // Excluded by the concrete gate; conservatively "may need a drop".
             Type::Variable(_) | Type::Generic(_) | Type::Forall(..) => false,
+            // A ref/`Ptr` application owns nothing (see `try_synthesize_drop_for_place`);
+            // without this cut the see-through field walk below diverges on
+            // self-referential pointer structs (the wrapped key grows per level, so the
+            // memo never hits and the depth cap answers `false` -- "expand at every site").
+            Type::Application(..) if self.type_is_reference_or_pointer(&typ) => true,
             Type::UserDefined(_) | Type::Application(..) | Type::Tuple(_) => {
                 if let Some(hit) = self.no_drop_cache.get(&typ) {
                     return *hit;
