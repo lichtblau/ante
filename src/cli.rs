@@ -73,6 +73,10 @@ pub struct Cli {
     /// Enable incremental compilation by reading from and writing to metadata for the current program
     #[arg(long, short = 'i')]
     pub incremental: bool,
+
+    /// Insert automatic `Drop` calls at scope exit.
+    #[arg(long)]
+    pub auto_drop: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, ValueEnum)]

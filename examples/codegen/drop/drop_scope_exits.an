@@ -1,0 +1,50 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+fallthrough () =
+    var x = R 1
+    drop (mut x)
+
+early_return () =
+    var x = R 2
+    drop (mut x)
+    return ()
+
+break_scenario () =
+    for i in 0..3 do
+        var x = R 3
+        drop (mut x)
+        if i == 0 then break
+
+continue_scenario () =
+    for _i in 0..2 do
+        var x = R 4
+        drop (mut x)
+        continue
+
+match_scenario (m: Maybe I32) =
+    var x = R 5
+    match m
+    | Some _ -> drop (mut x)
+    | None -> drop (mut x)
+
+main () =
+    fallthrough ()
+    early_return ()
+    break_scenario ()
+    continue_scenario ()
+    arg: Maybe I32 = Some 1
+    match_scenario arg
+
+// args: --delete-binary --no-color
+// expected stdout:
+// drop 1
+// drop 2
+// drop 3
+// drop 4
+// drop 4
+// drop 5
