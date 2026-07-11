@@ -428,9 +428,24 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 if !self.suppress_move_check {
                     self.check_use_of_move_path(&move_path, path);
                 }
-                if !self.suppress_move_record && !self.type_is_copy(&typ) {
-                    let location = path.locate(self);
-                    self.move_tracker.record_move(move_path, location);
+                if !self.suppress_move_record {
+                    let non_copy = !self.type_is_copy(&typ);
+                    // Auto-drop: also record *tentative* moves for bare generic variables
+                    // the lenient Copy search let through. Their Copy-ness may only be
+                    // settled by later unification (an unannotated `first (a, _) = a`
+                    // connects `a` to the signature at the final unify), so the exit-time
+                    // drop logic needs the use recorded. Tentative records never produce
+                    // use-of-moved errors while the type still reads as Copy (the check
+                    // gate in `check_use_of_move_path`), and suppressing a drop of a value
+                    // that turns out Copy drops nothing anyway.
+                    let tentative = !non_copy
+                        && self.auto_drop
+                        && matches!(self.follow_type(&typ),
+                            Type::Variable(id) if !self.is_literal_variable(*id));
+                    if non_copy || tentative {
+                        let location = path.locate(self);
+                        self.move_tracker.record_move(move_path, location);
+                    }
                 }
                 typ
             },

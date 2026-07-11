@@ -103,6 +103,30 @@ struct FreeVars {
 
 impl FreeVars {
     fn find_free_variables(&mut self, expr: ExprId, checker: &TypeChecker) {
+        self.find_free_variables_inner(expr, checker);
+
+        // Auto-drop: synthesized drop calls live in side tables keyed by this expression,
+        // not in the expression tree itself -- but they are real code lowered at this
+        // point, and they may reference `{Drop t}` capability parameters (a capture when
+        // inside a closure). Walk them too -- after the expression itself, since e.g. a
+        // block's end-of-scope drops refer to locals the block declares.
+        let context = checker.current_extended_context();
+        let table_drops: Vec<ExprId> = [
+            context.post_expr_drops(expr),
+            context.pre_exit_drops(expr),
+            context.implicit_else_drops(expr),
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .collect();
+        for drop_call in table_drops {
+            self.find_free_variables(drop_call, checker);
+        }
+    }
+
+    fn find_free_variables_inner(&mut self, expr: ExprId, checker: &TypeChecker) {
         match &checker.current_extended_context()[expr] {
             cst::Expr::Error => (),
             cst::Expr::Literal(_) => (),

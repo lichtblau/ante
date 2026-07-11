@@ -238,6 +238,16 @@ struct TypeChecker<'local, 'inner> {
     /// this function's own locals (dropped at its exit) from captured outers.
     function_local_names: Vec<FxHashSet<NameId>>,
 
+    /// Places already reported by the strict `{Drop t}` diagnostic (`--auto-drop`), so a
+    /// value dying on several edges is reported once.
+    diagnosed_missing_drops: FxHashSet<affine::MovePath>,
+
+    /// The free type variables of the current item's own signature (`--auto-drop`): its
+    /// rigid generics. Honest Copy/Drop treatment applies to these; other bare variables
+    /// are in-flight unification variables (lambda params before their call site unifies
+    /// them, unconstrained element types) and keep the legacy lenient behavior.
+    signature_type_vars: FxHashSet<TypeVariableId>,
+
     /// Names defined with `var` or as mutable parameters. Used by closure capture analysis
     /// to wrap mutable captures in a reference type so the closure shares the outer scope's storage.
     mutable_definitions: FxHashSet<NameId>,
@@ -297,6 +307,8 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_expansion_depth: 0,
             copy_check_depth: 0,
             function_local_names: Vec::new(),
+            diagnosed_missing_drops: Default::default(),
+            signature_type_vars: Default::default(),
             mutable_definitions: Default::default(),
             integer_literal_vars: Default::default(),
             float_literal_vars: Default::default(),
@@ -440,14 +452,24 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.captured_names.clear();
         self.drop_expansion_depth = 0;
         self.function_local_names.clear();
+        self.diagnosed_missing_drops.clear();
 
         // Iterating over every item type here should be fine for performance.
         // The expected length of `self.item_types` is 1 in the vast majority of cases,
         // and is only a bit longer with mutually recursive type-inferred definitions
         // and definitions defining multiple names (e.g. `a, b = 1, 2`).
-        for (name, typ) in self.item_types.iter() {
+        self.signature_type_vars.clear();
+        let item_types = self.item_types.clone();
+        for (name, typ) in item_types.iter() {
             if name.top_level_item == item_id {
                 self.name_types.insert(name.local_name_id, typ.clone());
+                if self.auto_drop {
+                    for generic in typ.free_vars(&self.bindings) {
+                        if let generics::Generic::Inferred(id) = generic {
+                            self.signature_type_vars.insert(id);
+                        }
+                    }
+                }
             }
         }
     }

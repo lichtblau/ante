@@ -423,7 +423,11 @@ where
                 },
                 Some(Origin::Local(name)) => {
                     let ptr = *self.local_variables.get(&name).unwrap_or_else(|| {
-                        panic!("No cached variable for {} with name {name}", self.context()[path_id])
+                        let function = self.current_function.as_ref().map(|f| f.name.to_string());
+                        panic!(
+                            "No cached variable for {} with name {name} while lowering {function:?}",
+                            self.context()[path_id]
+                        )
                     });
                     if self.mutable_locals.contains(&name) {
                         // Mutable locals are StackAlloc'd pointers; auto-deref to load the value.

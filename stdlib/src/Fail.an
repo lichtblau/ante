@@ -23,7 +23,7 @@ or_panic (f: fn Fail => a) (message: String): a =
     on_fail f do panic message
 
 /// Ignores a `Fail` effect, discarding it and returning Unit
-ignore_fail (f: fn Fail => a): Unit =
+ignore_fail (f: fn Fail => a) {Drop a}: Unit =
     on_fail (fn h -> ignore (f h)) do ()
 
 /// Retry a function until it succeeds (doesn't call fail).

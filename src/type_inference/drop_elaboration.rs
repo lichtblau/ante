@@ -129,6 +129,9 @@ impl TypeChecker<'_, '_> {
         let mut names = Vec::new();
         self.collect_pattern_binding_names(pattern, &mut names);
         names.retain(|name| !self.binding_places.contains_key(name));
+        // `_` bindings are wildcards the MIR builder never materializes: a synthesized
+        // `drop (mut _)` would reference an unbound variable. Their values leak in v1.
+        names.retain(|name| self.current_extended_context()[*name].as_ref() != "_");
         if let Some(function_locals) = self.function_local_names.last_mut() {
             function_locals.extend(names.iter().copied());
         }
@@ -201,22 +204,84 @@ impl TypeChecker<'_, '_> {
             return None;
         }
         let typ = self.follow_type(typ).clone();
-        // Not fully concrete (generics included): dropping needs `{Drop t}` propagation,
-        // which lands with the derived-impls increment. Skip (leak).
-        if typ == Type::ERROR || !typ.free_vars(&self.bindings).is_empty() {
+        if typ == Type::ERROR {
             return None;
         }
+        // Honest for bare variables under the flag: literal vars and `{Copy t}`-bounded
+        // generics are Copy; everything else falls through to the generic rules below.
         if self.type_is_copy(&typ) {
             return None;
         }
+        // A rigid generic: a named signature generic (`Type::Generic`, from annotated
+        // signatures) or a bare type variable connected to the signature (unannotated
+        // ones). Literal vars and `{Copy t}`-bounded generics returned Copy above;
+        // in-flight unification variables are skipped silently. Drop through an in-scope
+        // `{Drop t}` capability, or demand one -- the strict rule.
+        if let Type::Generic(_) = &typ {
+            let drop_ability = self.get_drop_type_name();
+            if self.constraint_in_scope_for_generic(&typ, drop_ability) {
+                return Some(self.synthesize_drop_call(place, &typ, location));
+            }
+            self.report_missing_drop_constraint(place, &typ, location);
+            return None;
+        }
+        if let Type::Variable(id) = &typ {
+            let drop_ability = self.get_drop_type_name();
+            if self.constraint_in_scope_for_variable(*id, drop_ability) {
+                return Some(self.synthesize_drop_call(place, &typ, location));
+            }
+            if self.is_signature_variable(*id) {
+                self.report_missing_drop_constraint(place, &typ, location);
+            }
+            return None;
+        }
+        // Partially generic (`Vec u`, `Maybe u`): resolve through an impl when one exists
+        // and every free variable has its `{Drop v}` in scope (guaranteed resolvable);
+        // otherwise derive structurally -- recursion reaches the bare-variable rules above
+        // for generic components (`Maybe u`'s payload), and prunes what needs nothing.
+        // In-flight element variables that never get constrained are left alone (leak)
+        // rather than erroring on dead values like a never-pushed `Vec.empty ()`.
+        if !typ.free_vars(&self.bindings).is_empty() {
+            let drop_ability = self.get_drop_type_name();
+            let free_vars = typ.free_vars(&self.bindings);
+            let all_vars_bounded = free_vars.iter().all(|generic| {
+                let target = match generic {
+                    super::generics::Generic::Inferred(id) => Type::Variable(*id),
+                    named => Type::Generic(named.clone()),
+                };
+                self.constraint_in_scope_for_generic(&target, drop_ability)
+            });
+            if all_vars_bounded && self.type_has_drop_impl(&typ) {
+                return Some(self.synthesize_drop_call(place, &typ, location));
+            }
+            return self.synthesize_structural_drop(place, &typ, location);
+        }
         // No direct impl: derive a structural drop -- for concrete product types, drop
         // each field that needs one, in declaration order. `None` when no component needs a
-        // drop, so `needs_drop` pruning falls out naturally. Sums are handled by the
-        // residual-drop increment; anything else is skipped (leak).
+        // drop, so `needs_drop` pruning falls out naturally.
         if !self.type_has_drop_impl(&typ) {
             return self.synthesize_structural_drop(place, &typ, location);
         }
         Some(self.synthesize_drop_call(place, &typ, location))
+    }
+
+    /// The strict `{Drop t}` rule: a value of bare generic type dies here with no way to
+    /// drop it. Reported once per place, pointing at the value's binding.
+    fn report_missing_drop_constraint(&mut self, place: &MovePath, typ: &Type, fallback: &Location) {
+        if !self.diagnosed_missing_drops.insert(place.clone()) {
+            return;
+        }
+        let root = place.root_variable();
+        let location = {
+            use crate::parser::ids::NameStore;
+            if self.current_extended_context().try_get_name(root).is_some() {
+                self.current_extended_context().name_location(root)
+            } else {
+                fallback.clone()
+            }
+        };
+        let typ = self.type_to_string(typ);
+        self.compiler.accumulate(crate::diagnostics::Diagnostic::MissingDropConstraint { typ, location });
     }
 
     /// Derive the structural drop for a product type as an inline `Sequence` of per-field
@@ -332,7 +397,9 @@ impl TypeChecker<'_, '_> {
         let mut ordered = Vec::new();
         for scope in self.drop_scopes.iter().rev() {
             for name in scope.names.iter().rev() {
-                if moved_somewhere.contains(name) {
+                // Only this function's own locals: equalizing a captured outer variable
+                // would drop through the closure's capture reference.
+                if moved_somewhere.contains(name) && self.name_is_local_to_current_function(*name) {
                     ordered.push(*name);
                 }
             }
@@ -351,6 +418,12 @@ impl TypeChecker<'_, '_> {
         }
         let Some(place) = self.try_build_move_path(assignment.lhs) else { return };
         let root = place.root_variable();
+        // Assigning to a captured outer variable writes through the closure's capture
+        // reference: dropping the old value there is a through-reference drop (excluded in
+        // v1, and the capture set is not even known until the lambda ends). Locals only.
+        if !self.name_is_local_to_current_function(root) {
+            return;
+        }
         let Some(root_type) = self.name_types.get(&root).cloned() else { return };
         if root_type.reference_element(&self.bindings).is_some()
             || root_type.pointer_element(&self.bindings).is_some()
@@ -841,7 +914,10 @@ impl TypeChecker<'_, '_> {
             }
         }
 
-        // Global impls visible from the current item's file.
+        // Global impls visible from the current item's file. A candidate whose own
+        // `{Drop x}` constraints cannot resolve does not count (e.g. `drop_maybe {Drop t}`
+        // must not claim `Maybe NoDropStruct` -- the structural fallback handles that
+        // payload; picking the impl would fail resolution loudly instead).
         if let Some(item) = self.current_item {
             let visible_implicits = VisibleImplicits(item.source_file).get(self.compiler);
             let mut found = false;
@@ -852,10 +928,13 @@ impl TypeChecker<'_, '_> {
                     return true;
                 }
                 if let Type::Function(f) = &name_type
-                    && self.try_unify(&f.return_type, &drop_of_t).is_ok()
+                    && let Ok(bindings) = self.try_unify(&f.return_type, &drop_of_t)
                 {
-                    found = true;
-                    return true;
+                    let f = f.clone();
+                    if self.drop_impl_constraints_hold(&f, bindings) {
+                        found = true;
+                        return true;
+                    }
                 }
                 false
             });
@@ -865,6 +944,46 @@ impl TypeChecker<'_, '_> {
         }
 
         false
+    }
+
+    /// Check that a candidate Drop impl's own `{Drop x}` constraints can resolve under the
+    /// unification `bindings` from matching its return type: through another impl (checked
+    /// recursively, depth-guarded) or an in-scope `{Drop v}` capability for bare variables.
+    /// Non-Drop constraints are assumed satisfiable, mirroring the Copy-side check.
+    fn drop_impl_constraints_hold(
+        &mut self, function: &super::types::FunctionType, bindings: super::types::TypeBindings,
+    ) -> bool {
+        if self.copy_check_depth >= 8 {
+            return false;
+        }
+        self.copy_check_depth += 1;
+        let mut merged = self.bindings.clone();
+        merged.extend(bindings);
+        let drop_name = self.get_drop_type_name();
+        let mut holds = true;
+        for parameter in function.parameters.iter().filter(|parameter| parameter.is_implicit) {
+            let constraint = parameter.typ.follow_all(&merged);
+            let Type::Application(constructor, args) = &constraint else { continue };
+            let is_drop_constraint = matches!(
+                constructor.follow(&merged),
+                Type::UserDefined(Origin::TopLevelDefinition(name)) if *name == drop_name
+            );
+            if !is_drop_constraint {
+                continue;
+            }
+            let Some(arg) = args.first() else { continue };
+            let arg = arg.follow_all(&merged);
+            let satisfiable = match &arg {
+                Type::Variable(_) | Type::Generic(_) => self.constraint_in_scope_for_generic(&arg, drop_name),
+                _ => self.type_has_drop_impl(&arg),
+            };
+            if !satisfiable {
+                holds = false;
+                break;
+            }
+        }
+        self.copy_check_depth -= 1;
+        holds
     }
 
     /// Returns the TopLevelName for the Prelude's `Drop` ability type, caching it.

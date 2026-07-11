@@ -215,6 +215,30 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         let copy_name = self.get_copy_type_name();
+
+        // Under --auto-drop, bare type variables are handled honestly. The historic search
+        // below lets an unbound variable unify with any concrete impl's target (`Copy I8`),
+        // silently treating every generic value as Copy: moves unrecorded, drops skipped --
+        // and a monomorphization-time double-free once `t = String`. A variable is Copy iff
+        // it is an int/float literal variable (it will default to a Copy primitive) or an
+        // in-scope `{Copy t}` constraint names exactly this variable (unification is too
+        // loose even for local implicits: it would bind an unrelated `{Copy u}`'s variable).
+        if self.auto_drop && let Type::Variable(id) = &typ {
+            if self.is_literal_variable(*id) {
+                return true;
+            }
+            if self.constraint_in_scope_for_variable(*id, copy_name) {
+                return true;
+            }
+            if self.is_signature_variable(*id) {
+                return false;
+            }
+            // In-flight unification variables (a lambda parameter before its call site
+            // unifies it, an unconstrained element type) keep the legacy lenient search
+            // below -- treating them as affine mid-flight would reject loop-carried uses
+            // of values that end up Copy.
+        }
+
         let copy_constructor = Type::UserDefined(Origin::TopLevelDefinition(copy_name));
 
         let copy_of_t = Type::Application(Arc::new(copy_constructor), Arc::new(vec![typ.clone()]));
@@ -260,6 +284,64 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         false
+    }
+
+    /// True if the variable will default to an int/float primitive (both Copy): either it
+    /// is itself a literal variable, or some literal variable's binding chain leads to it
+    /// (unification may bind the literal variable to another variable, making that one the
+    /// representative -- e.g. the parameters of a desugared `loop (len = 0)`).
+    pub(super) fn is_literal_variable(&self, id: super::types::TypeVariableId) -> bool {
+        if self.integer_literal_vars.contains(&id) || self.float_literal_vars.contains(&id) {
+            return true;
+        }
+        let follows_to_id = |lit: &super::types::TypeVariableId| {
+            matches!(Type::Variable(*lit).follow(&self.bindings), Type::Variable(v) if *v == id)
+        };
+        self.integer_literal_vars.iter().any(follows_to_id) || self.float_literal_vars.iter().any(follows_to_id)
+    }
+
+    /// True if the variable is (or is the binding representative of) one of the current
+    /// item's signature type variables -- a rigid generic, which gets honest Copy/Drop
+    /// treatment under `--auto-drop`.
+    pub(super) fn is_signature_variable(&self, id: super::types::TypeVariableId) -> bool {
+        if self.signature_type_vars.contains(&id) {
+            return true;
+        }
+        self.signature_type_vars
+            .iter()
+            .any(|var| matches!(Type::Variable(*var).follow(&self.bindings), Type::Variable(v) if *v == id))
+    }
+
+    /// True if a local implicit of shape `<ability> x` -- where `x` follows to exactly the
+    /// given rigid/unbound generic type (a named generic or a bare type variable) -- is in
+    /// scope. Used where unifying against candidates is too loose: unification would bind
+    /// the variable to whatever it is compared with instead of matching it.
+    pub(super) fn constraint_in_scope_for_generic(&mut self, target: &Type, ability: TopLevelName) -> bool {
+        let target = target.follow(&self.bindings).clone();
+        let local_implicits = self.collect_implicits_in_scope();
+        for name in &local_implicits {
+            let Some(name_type) = self.name_types.get(name) else { continue };
+            let name_type = name_type.follow_all(&self.bindings);
+            let Type::Application(constructor, args) = &name_type else { continue };
+            let matches_ability = matches!(
+                constructor.follow(&self.bindings),
+                Type::UserDefined(Origin::TopLevelDefinition(name)) if *name == ability
+            );
+            if matches_ability
+                && let Some(arg) = args.first()
+                && *arg.follow(&self.bindings) == target
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// [`Self::constraint_in_scope_for_generic`] for a bare type-variable target.
+    pub(super) fn constraint_in_scope_for_variable(
+        &mut self, var: super::types::TypeVariableId, ability: TopLevelName,
+    ) -> bool {
+        self.constraint_in_scope_for_generic(&Type::Variable(var), ability)
     }
 
     /// Check that a candidate Copy impl's implicit `{Copy x}` constraints are satisfiable
@@ -343,6 +425,18 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     /// Only emits the first error per path to avoid noisy duplicate diagnostics.
     pub(super) fn check_use_of_move_path(&mut self, path: &MovePath, locator: impl Locateable) {
         if self.move_tracker.errored.contains(path) {
+            return;
+        }
+
+        // Auto-drop: tentative move records exist for bare generic variables whose
+        // Copy-ness is not settled yet (see `infer_path`). While the value's type still
+        // reads as Copy, a recorded "move" must not produce use-of-moved errors -- it only
+        // informs the drop planner. Once the type is provably non-Copy (a `{Drop t}`-bound
+        // signature generic, or a later-bound concrete type), errors fire as usual.
+        if self.auto_drop
+            && let Some(root_type) = self.name_types.get(&path.root_variable()).cloned()
+            && self.type_is_copy(&root_type)
+        {
             return;
         }
 

@@ -227,6 +227,10 @@ pub enum Diagnostic {
     ReferenceEscapesScope {
         location: Location,
     },
+    MissingDropConstraint {
+        typ: String,
+        location: Location,
+    },
     ReturnNotInFunction {
         location: Location,
     },
@@ -614,6 +618,12 @@ impl Diagnostic {
             Diagnostic::ReferenceEscapesScope { location: _ } => {
                 "This returns a reference to a value that is dropped when this function returns".to_string()
             },
+            Diagnostic::MissingDropConstraint { typ, location: _ } => {
+                format!(
+                    "This value of generic type {} is dropped here; add a {{Drop {}}} (or {{Copy {}}}) constraint to the enclosing function",
+                    color_type(typ), typ, typ,
+                )
+            },
             Diagnostic::ExpectedTypeKind { actual, location: _ } => {
                 let n = actual.required_argument_count();
                 let s = if n == 1 { "" } else { "s" };
@@ -735,6 +745,7 @@ impl Diagnostic {
             | Diagnostic::TopLevelImplicitTypeAnnotationRequired { location }
             | Diagnostic::DropImplForSharedType { location }
             | Diagnostic::ReferenceEscapesScope { location }
+            | Diagnostic::MissingDropConstraint { location, .. }
             | Diagnostic::ExpectedTypeKind { location, .. }
             | Diagnostic::ExpectedKind { location, .. }
             | Diagnostic::ReturnNotInFunction { location }

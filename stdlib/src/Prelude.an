@@ -32,13 +32,13 @@ export String, from_parts, Maybe, None, Some, iff, unwrap, unwrap_or_else, Resul
     Bitwise, band, bor, bxor, bitwise_i32, bitwise_u64,
     Type, MkType, size_of,
     offset, offset_bytes, deref, deref_ptr, ptr_store, array_insert, ptr_to_mut, ptr_to_uniq,
-    Clone, clone, Drop, drop, drop_string,
+    Clone, clone, Drop, drop, drop_string, drop_maybe, drop_result, drop_pair,
     drop_i8, drop_i16, drop_i32, drop_i64, drop_isz, drop_u8, drop_u16, drop_u32, drop_u64, drop_usz, drop_f32, drop_f64, drop_unit, drop_bool, drop_char, drop_ptr,
     Copy, (.*), copy_i8, copy_i16, copy_i32, copy_i64, copy_isz, copy_u8, copy_u16, copy_u32, copy_u64, copy_usz, copy_f32, copy_f64, copy_unit, copy_bool, copy_char, copy_ptr, copy_ref, copy_mut, copy_imm, copy_uniq, clone_string, copy_pair, copy_maybe,
     null, transmute,
     Print, print, println, print_unsigned, print_signed, print_float, print_u8, print_u16, print_u32, print_u64, print_usz, print_i8, print_i16, print_i32, print_i64, print_isz, print_char, print_f64, print_f32, print_pair, print_string, print_maybe, print_bool, print_array, print_ref,
     Iterator, next, iter, Range, iterator_range, iter_range, repeat,
-    panic, ignore
+    panic, ignore, forget
 
 type String =
     data: Ptr Char
@@ -553,7 +553,9 @@ impl eq_maybe {Eq e}: Eq (Maybe e) with
 impl eq_pair {Eq a} {Eq b}: Eq (a, b) with
     (==) l r = l.first == r.first and l.second == r.second
 
-(!=) (l: t) (r: t) {Eq t} = not (l == r)
+// By reference: (!=) never consumes its operands, and holding generic values
+// by value would demand {Drop t} under --auto-drop. Call sites auto-ref.
+(!=) (l: ref t) (r: ref t) {Eq t} = not (l == r)
 
 ability Not t =
     (not): fn t -> t
@@ -954,6 +956,32 @@ impl drop_bool: Drop Bool with drop _ = ()
 impl drop_char: Drop Char with drop _ = ()
 impl drop_ptr: Drop (Ptr t) with drop _ = ()
 
+impl drop_maybe {Drop t}: Drop (Maybe t) with
+    drop m =
+        match deref m
+        | Some x ->
+            var vx = x
+            drop (mut vx)
+        | None -> ()
+
+impl drop_result {Drop t} {Drop e}: Drop (Result t e) with
+    drop r =
+        match deref r
+        | Ok x ->
+            var vx = x
+            drop (mut vx)
+        | Error err ->
+            var verr = err
+            drop (mut verr)
+
+impl drop_pair {Drop a} {Drop b}: Drop (a, b) with
+    drop p =
+        f, s = deref p
+        var vf = f
+        drop (mut vf)
+        var vs = s
+        drop (mut vs)
+
 impl drop_string: Drop String with
     drop (s: mut String) =
         if s.refcount != null () then
@@ -1131,4 +1159,14 @@ panic (msg: t) {Print t}: Never =
     // Unreachable, return any type
     deref_ptr (null ())
 
-ignore _x = ()
+/// Take ownership of a value without running its Drop (cf. Rust's mem::forget).
+/// Any heap the value owns is leaked unless another copy of its bits owns it --
+/// the usual use is after transferring ownership via a `deref` bit-copy.
+forget (x: t): Unit =
+    _ = transmute x : Usz
+    ()
+
+// `ignore` takes ownership of its argument; under --auto-drop it drops it,
+// so it requires the ability to (add `{Copy t}` at the call site's type instead
+// if the value should live on).
+ignore (_x: t) {Drop t}: Unit = ()

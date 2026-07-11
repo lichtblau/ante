@@ -1,0 +1,14 @@
+leaky (_x: t): Unit = ()
+
+main () = leaky 5
+
+// args: --check --no-color --auto-drop
+// expected exit status: 1
+// expected stderr:
+// examples/typechecking/auto_drop_missing_constraint.an:1:8
+//   | // error: This value of generic type t is dropped here; add a {Drop t} (or {Copy t}) constraint to the enclosing function
+// 1 | leaky (_x: t): Unit = ()
+//   |        ^^
+// 
+// Found 1 error and 0 warnings
+

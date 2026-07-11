@@ -1,0 +1,19 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+with_drop (_x: t) {Drop t}: Unit = ()
+with_copy (_x: t) {Copy t}: Unit = ()
+
+main () =
+    with_drop (R 1)
+    with_copy 5
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// drop 1
+// end
