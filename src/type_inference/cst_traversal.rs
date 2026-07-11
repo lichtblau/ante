@@ -659,7 +659,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
 
     /// Read the expression for `id`, preferring one added by this type-checking pass and
     /// falling back to the original parsed expression.
-    fn expr_of(&self, id: ExprId) -> Cow<'local, Expr> {
+    pub(super) fn expr_of(&self, id: ExprId) -> Cow<'local, Expr> {
         match self.current_extended_context().extended_expr(id) {
             Some(expr) => Cow::Owned(expr.clone()),
             None => Cow::Borrowed(&self.current_context()[id]),
@@ -819,6 +819,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         };
 
         let body_type = self.check_expr(lambda.body, &return_type, TypeErrorKind::FunctionBody);
+
+        // Auto-drop: The body's value is this function's return value; a reference
+        // derived from an owned local must not escape through it.
+        if self.drop_elaboration_active() {
+            self.check_reference_escape(lambda.body);
+        }
 
         // Function-exit drops for the parameters (run after the body's own block drops when
         // the body is a Sequence: same key, appended). Must happen while this lambda's move
@@ -1577,6 +1583,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 // marked moved and excluded. Keyed by the returned expression; the builder
                 // lowers these between computing the value and the Return terminator.
                 if self.drop_elaboration_active() {
+                    self.check_reference_escape(returned_expr);
                     let location = id.locate(self);
                     let drops = self.drops_for_return(&location);
                     if !drops.is_empty() {

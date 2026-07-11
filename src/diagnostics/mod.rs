@@ -224,6 +224,9 @@ pub enum Diagnostic {
     DropImplForSharedType {
         location: Location,
     },
+    ReferenceEscapesScope {
+        location: Location,
+    },
     ReturnNotInFunction {
         location: Location,
     },
@@ -608,6 +611,9 @@ impl Diagnostic {
             Diagnostic::DropImplForSharedType { location: _ } => {
                 "Cannot implement Drop for a shared type: shared handles are Copy, so there is no coherent point to run it".to_string()
             },
+            Diagnostic::ReferenceEscapesScope { location: _ } => {
+                "This returns a reference to a value that is dropped when this function returns".to_string()
+            },
             Diagnostic::ExpectedTypeKind { actual, location: _ } => {
                 let n = actual.required_argument_count();
                 let s = if n == 1 { "" } else { "s" };
@@ -728,6 +734,7 @@ impl Diagnostic {
             | Diagnostic::AmbiguousImplicit { location, .. }
             | Diagnostic::TopLevelImplicitTypeAnnotationRequired { location }
             | Diagnostic::DropImplForSharedType { location }
+            | Diagnostic::ReferenceEscapesScope { location }
             | Diagnostic::ExpectedTypeKind { location, .. }
             | Diagnostic::ExpectedKind { location, .. }
             | Diagnostic::ReturnNotInFunction { location }

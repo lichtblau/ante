@@ -68,6 +68,9 @@ impl TypeChecker<'_, '_> {
     pub(super) fn push_drop_scope(&mut self, kind: DropScopeKind) {
         if self.drop_elaboration_active() {
             self.drop_scopes.push(DropScope { kind, names: Vec::new() });
+            if kind == DropScopeKind::Function {
+                self.function_local_names.push(Default::default());
+            }
         }
     }
 
@@ -79,6 +82,9 @@ impl TypeChecker<'_, '_> {
             return Vec::new();
         }
         let scope = self.drop_scopes.pop().expect("unbalanced drop scopes");
+        if scope.kind == DropScopeKind::Function {
+            self.function_local_names.pop();
+        }
         if diverges {
             return Vec::new();
         }
@@ -123,6 +129,9 @@ impl TypeChecker<'_, '_> {
         let mut names = Vec::new();
         self.collect_pattern_binding_names(pattern, &mut names);
         names.retain(|name| !self.binding_places.contains_key(name));
+        if let Some(function_locals) = self.function_local_names.last_mut() {
+            function_locals.extend(names.iter().copied());
+        }
         let scope = self.drop_scopes.last_mut().unwrap();
         for name in names {
             if !scope.names.contains(&name) {
@@ -621,6 +630,158 @@ impl TypeChecker<'_, '_> {
 
         self.drop_expansion_depth -= 1;
         result
+    }
+
+    /// Reject returning a reference derived from an owned local -- auto-drop frees the referent at
+    /// function exit, so the escaped reference dangles. Parameter-derived references (roots of
+    /// reference/pointer type) stay legal. Gaps: References laundered through intermediate
+    /// ref-typed bindings, stored into escaping structs via bindings, or captured by escaping
+    /// closures.
+    pub(super) fn check_reference_escape(&mut self, returned: ExprId) {
+        if !self.drop_elaboration_active() {
+            return;
+        }
+        let Some(typ) = self.expr_types.get(&returned).cloned() else { return };
+        if !self.type_contains_reference(&typ) {
+            return;
+        }
+        let mut returned_elements = Vec::new();
+        self.collect_reference_elements(&typ, &mut returned_elements);
+        if let Some(location) = self.find_escaping_local_ref(returned, &returned_elements) {
+            self.compiler.accumulate(crate::diagnostics::Diagnostic::ReferenceEscapesScope { location });
+        }
+    }
+
+    /// Collect the element types of every reference type occurring in `typ`.
+    fn collect_reference_elements(&self, typ: &Type, out: &mut Vec<Type>) {
+        let typ = self.follow_type(typ);
+        match typ {
+            Type::Application(constructor, args) => {
+                if constructor.reference_constructor(&self.bindings).is_some() && args.len() == 2 {
+                    out.push(args[1].clone());
+                }
+                for arg in args.iter() {
+                    self.collect_reference_elements(arg, out);
+                }
+            },
+            Type::Tuple(elements) => {
+                for element in elements.iter() {
+                    self.collect_reference_elements(element, out);
+                }
+            },
+            _ => (),
+        }
+    }
+
+    /// True if `needle` occurs anywhere within `haystack` (followed, structural equality).
+    fn type_occurs_in(&self, needle: &Type, haystack: &Type) -> bool {
+        let haystack = self.follow_type(haystack);
+        if self.follow_type(needle) == haystack {
+            return true;
+        }
+        match haystack {
+            Type::Application(constructor, args) => {
+                self.type_occurs_in(needle, constructor) || args.iter().any(|arg| self.type_occurs_in(needle, arg))
+            },
+            Type::Tuple(elements) => elements.iter().any(|element| self.type_occurs_in(needle, element)),
+            _ => false,
+        }
+    }
+
+    fn type_contains_reference(&self, typ: &Type) -> bool {
+        let typ = self.follow_type(typ);
+        match typ {
+            Type::Application(constructor, args) => {
+                constructor.reference_constructor(&self.bindings).is_some()
+                    || args.iter().any(|arg| self.type_contains_reference(arg))
+            },
+            Type::Tuple(elements) => elements.iter().any(|element| self.type_contains_reference(element)),
+            _ => false,
+        }
+    }
+
+    /// Walk the returned expression through value-forwarding positions looking for a
+    /// reference whose referent dies with this function: a `ref`/`mut`/`imm`/`uniq` of an
+    /// owned local (or of an rvalue temporary). Call results may alias any argument, so
+    /// call arguments are scanned for such references too.
+    fn find_escaping_local_ref(&self, expr: ExprId, returned_elements: &[Type]) -> Option<Location> {
+        match self.expr_of(expr).as_ref() {
+            Expr::Reference(reference) => self
+                .reference_target_is_function_local(reference.rhs)
+                .then(|| self.current_extended_context().expr_location(expr)),
+            Expr::Sequence(items) => {
+                let last = items.last()?;
+                self.find_escaping_local_ref(last.expr, returned_elements)
+            },
+            Expr::TypeAnnotation(annotation) => self.find_escaping_local_ref(annotation.lhs, returned_elements),
+            Expr::If(if_) => self
+                .find_escaping_local_ref(if_.then, returned_elements)
+                .or_else(|| if_.else_.and_then(|else_| self.find_escaping_local_ref(else_, returned_elements))),
+            Expr::Match(match_) => {
+                match_.cases.iter().find_map(|(_, branch)| self.find_escaping_local_ref(*branch, returned_elements))
+            },
+            Expr::Constructor(constructor) => {
+                constructor.fields.iter().find_map(|(_, field)| self.find_escaping_local_ref(*field, returned_elements))
+            },
+            // A call's result may alias its reference arguments. Flag only explicit arguments
+            // (capability args are checker-inserted) whose referent could plausibly contain the
+            // returned reference's element type -- this is what separates `Vec.get_unchecked (imm v)
+            // i : imm t` (t occurs in Vec t -- reject when v is an owned local) from `HashMap.get
+            // (mut m) (ref key) : ref v` (v does not occur in k -- the key borrow cannot be the
+            // returned storage).
+            Expr::Call(call) => call.arguments.iter().filter(|argument| !argument.is_implicit).find_map(|argument| {
+                match self.expr_of(argument.expr).as_ref() {
+                    Expr::Reference(reference) if self.reference_target_is_function_local(reference.rhs) => {
+                        let referent_type = self.expr_types.get(&reference.rhs)?;
+                        let may_alias_return = returned_elements
+                            .iter()
+                            .any(|element| self.type_occurs_in(element, &referent_type.clone()));
+                        may_alias_return.then(|| self.current_extended_context().expr_location(argument.expr))
+                    },
+                    _ => None,
+                }
+            }),
+            _ => None,
+        }
+    }
+
+    /// True if the reference target is a place owned by the current function (an owned
+    /// local or by-value parameter) or an rvalue temporary -- anything auto-drop frees on
+    /// exit. References rooted at reference/pointer-typed bindings or at globals point at
+    /// storage that outlives the call.
+    fn reference_target_is_function_local(&self, target: ExprId) -> bool {
+        match self.expr_of(target).as_ref() {
+            Expr::Variable(path) => match self.path_origin(*path) {
+                Some(Origin::Local(name)) => {
+                    // Captured outer locals are not dropped when *this* function returns;
+                    // only names owned by the current function's own scopes count.
+                    if !self.name_is_local_to_current_function(name) {
+                        return false;
+                    }
+                    let Some(typ) = self.name_types.get(&name) else { return false };
+                    typ.reference_element(&self.bindings).is_none() && typ.pointer_element(&self.bindings).is_none()
+                },
+                // Globals and builtins outlive everything; unresolved paths already errored.
+                _ => false,
+            },
+            Expr::MemberAccess(access) => self.reference_target_is_function_local(access.object),
+            Expr::TypeAnnotation(annotation) => self.reference_target_is_function_local(annotation.lhs),
+            // An rvalue temporary dies at the end of the statement -- unless it diverges
+            // (`fail ()` auto-ref'd to meet a reference-typed branch never comes back).
+            _ => {
+                let diverges =
+                    self.expr_types.get(&target).is_some_and(|typ| self.diverges(&typ.clone()));
+                !diverges
+            },
+        }
+    }
+
+    /// True if `name` is an owned local registered anywhere within the innermost enclosing
+    /// lambda (block scopes may already be popped by the time the body-end escape check
+    /// runs, so this uses the per-function persistent set). Names owned by outer lambdas
+    /// are captured outers and are not dropped when *this* function returns.
+    fn name_is_local_to_current_function(&self, name: NameId) -> bool {
+        self.function_local_names.last().is_some_and(|locals| locals.contains(&name))
     }
 
     /// Reject a user `Drop` impl whose target is a `shared` type: shared handles are

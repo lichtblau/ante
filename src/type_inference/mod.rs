@@ -233,6 +233,11 @@ struct TypeChecker<'local, 'inner> {
     /// type is assumed non-Copy (tracked and dropped -- the safe direction).
     copy_check_depth: u32,
 
+    /// One set per enclosing lambda (`--auto-drop`): every owned local registered anywhere
+    /// within that lambda, surviving block-scope pops. Used by the escape check to tell
+    /// this function's own locals (dropped at its exit) from captured outers.
+    function_local_names: Vec<FxHashSet<NameId>>,
+
     /// Names defined with `var` or as mutable parameters. Used by closure capture analysis
     /// to wrap mutable captures in a reference type so the closure shares the outer scope's storage.
     mutable_definitions: FxHashSet<NameId>,
@@ -291,6 +296,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             captured_names: Default::default(),
             drop_expansion_depth: 0,
             copy_check_depth: 0,
+            function_local_names: Vec::new(),
             mutable_definitions: Default::default(),
             integer_literal_vars: Default::default(),
             float_literal_vars: Default::default(),
@@ -433,6 +439,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.synthesizing_drops = false;
         self.captured_names.clear();
         self.drop_expansion_depth = 0;
+        self.function_local_names.clear();
 
         // Iterating over every item type here should be fine for performance.
         // The expected length of `self.item_types` is 1 in the vast majority of cases,
