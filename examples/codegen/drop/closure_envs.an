@@ -1,6 +1,6 @@
 get_closure () =
     msg = "hi"
-    stuff () = println msg
+    stuff = move fn () -> println msg
     stuff
 
 main () =

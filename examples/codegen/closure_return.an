@@ -1,6 +1,8 @@
+// A returned closure may not *borrow* an owned local -- the capture would outlive
+// `foo`. It must own it, so the closure is `move`.
 get_closure () =
     foo = "hi there"
-    stuff () = println foo
+    stuff = move fn () -> println foo
     stuff
 
 main () =
