@@ -536,11 +536,12 @@ impl TypeChecker<'_, '_> {
     /// analysis is purely syntactic over resolved names -- so the release skip is in place when the
     /// function scope pops.
     ///
-    /// A parameter is borrowing iff it is by-value (immutable), its annotated type is concretely
-    /// `shared`, and the body never references it in tail/return position nor captures it in a
-    /// nested lambda. The whole function is disqualified when any explicit parameter is function-
-    /// or ability-typed: calling those is a suspension avenue the call site cannot vet (implicit
-    /// capabilities are vetted per call site instead).
+    /// A parameter is borrowing iff it is by-value (immutable), its annotated type is
+    /// concretely `shared`, and the body never captures it in a nested lambda (tail/return
+    /// references are fine -- see [`Self::param_escapes_in_body`]). The whole function is
+    /// disqualified when any explicit parameter is function- or ability-typed: calling
+    /// those is a suspension avenue the call site cannot vet (implicit capabilities are
+    /// vetted per call site instead).
     pub(super) fn compute_borrowed_param_mask(&mut self, fn_name: NameId, lambda: &cst::Lambda, expected: &Type) {
         if !self.drop_elaboration_active() {
             return;
@@ -593,59 +594,52 @@ impl TypeChecker<'_, '_> {
         }
     }
 
-    /// True when `name` (a parameter) escapes the function through `expr`: referenced in
-    /// tail/return position (its handle would outlive the call) or captured by a nested
-    /// lambda. Call arguments, field reads, and stores are NOT escapes -- each of those
-    /// sites carries its own balanced retain.
-    fn param_escapes_in_body(&self, body: ExprId, name: NameId) -> bool {
-        self.param_escape_walk(body, name, true)
-    }
-
-    fn param_escape_walk(&self, expr: ExprId, name: NameId, tail: bool) -> bool {
-        let walk = |this: &Self, e: ExprId, tail: bool| this.param_escape_walk(e, name, tail);
+    /// True when `name` (a parameter) escapes the function through `expr` by being CAPTURED
+    /// by a nested lambda (the closure's bit-copy has no count of its own and may outlive
+    /// the call). Tail/return references are NOT escapes: a returned shared place gets an
+    /// escape retain (`mark_tail_escape_retains`, applied to lambda-body tails and explicit
+    /// `return`s alike), so the returned copy carries its own count -- the exact invariant
+    /// callee-owns parameters already rely on when they are returned. Call arguments, field
+    /// reads, and stores each carry their own balanced retain.
+    fn param_escapes_in_body(&self, expr: ExprId, name: NameId) -> bool {
+        let walk = |this: &Self, e: ExprId| this.param_escapes_in_body(e, name);
         match self.expr_of(expr).as_ref() {
-            Expr::Variable(path) => {
-                tail && matches!(self.path_origin(*path), Some(Origin::Local(n)) if n == name)
-            },
-            Expr::Error | Expr::Literal(_) | Expr::Extern(_) | Expr::Break | Expr::Continue | Expr::Quoted(_) => false,
-            Expr::Sequence(items) => {
-                let last = items.len().saturating_sub(1);
-                items.iter().enumerate().any(|(i, item)| walk(self, item.expr, tail && i == last))
-            },
-            Expr::Definition(definition) => walk(self, definition.rhs, false),
-            Expr::MemberAccess(access) => walk(self, access.object, false),
-            Expr::Call(call) => {
-                walk(self, call.function, false)
-                    || call.arguments.iter().any(|arg| walk(self, arg.expr, false))
-            },
             Expr::Lambda(_) => self.lambda_captures_name(expr, name),
+            Expr::Error
+            | Expr::Variable(_)
+            | Expr::Literal(_)
+            | Expr::Extern(_)
+            | Expr::Break
+            | Expr::Continue
+            | Expr::Quoted(_) => false,
+            Expr::Sequence(items) => items.iter().any(|item| walk(self, item.expr)),
+            Expr::Definition(definition) => walk(self, definition.rhs),
+            Expr::MemberAccess(access) => walk(self, access.object),
+            Expr::Call(call) => {
+                walk(self, call.function) || call.arguments.iter().any(|arg| walk(self, arg.expr))
+            },
             Expr::If(if_) => {
-                walk(self, if_.condition, false)
-                    || walk(self, if_.then, tail)
-                    || if_.else_.is_some_and(|e| walk(self, e, tail))
+                walk(self, if_.condition) || walk(self, if_.then) || if_.else_.is_some_and(|e| walk(self, e))
             },
             Expr::Match(match_) => {
-                walk(self, match_.expression, false)
-                    || match_.cases.iter().any(|(_, branch)| walk(self, *branch, tail))
+                walk(self, match_.expression) || match_.cases.iter().any(|(_, branch)| walk(self, *branch))
             },
-            // Conservative: a handle's body/branches feed its result value; treat every part
-            // as tail so a param flowing out through the handle disqualifies.
+            // A handle's body and branches are lambdas; the Lambda arm above applies to them.
             Expr::Handle(handle) => {
-                walk(self, handle.expression, true)
-                    || handle.cases.iter().any(|(_, branch)| walk(self, *branch, true))
+                walk(self, handle.expression) || handle.cases.iter().any(|(_, branch)| walk(self, *branch))
             },
-            Expr::Reference(reference) => walk(self, reference.rhs, false),
-            Expr::TypeAnnotation(annotation) => walk(self, annotation.lhs, tail),
-            Expr::Constructor(constructor) => constructor.fields.iter().any(|(_, e)| walk(self, *e, false)),
-            Expr::While(w) => walk(self, w.condition, false) || walk(self, w.body, false),
-            Expr::For(f) => walk(self, f.start, false) || walk(self, f.end, false) || walk(self, f.body, false),
-            Expr::Return(return_) => walk(self, return_.expression, true),
+            Expr::Reference(reference) => walk(self, reference.rhs),
+            Expr::TypeAnnotation(annotation) => walk(self, annotation.lhs),
+            Expr::Constructor(constructor) => constructor.fields.iter().any(|(_, e)| walk(self, *e)),
+            Expr::While(w) => walk(self, w.condition) || walk(self, w.body),
+            Expr::For(f) => walk(self, f.start) || walk(self, f.end) || walk(self, f.body),
+            Expr::Return(return_) => walk(self, return_.expression),
             Expr::Assignment(assignment) => {
-                walk(self, assignment.lhs, false)
-                    || walk(self, assignment.rhs, false)
-                    || assignment.op.as_ref().is_some_and(|(_, op)| walk(self, *op, false))
+                walk(self, assignment.lhs)
+                    || walk(self, assignment.rhs)
+                    || assignment.op.as_ref().is_some_and(|(_, op)| walk(self, *op))
             },
-            Expr::ArrayLiteral(elements) => elements.iter().any(|e| walk(self, *e, false)),
+            Expr::ArrayLiteral(elements) => elements.iter().any(|e| walk(self, *e)),
             // Not yet desugared here (or unexpected): be conservative.
             Expr::Is(_) | Expr::Do(_) | Expr::Loop(_) | Expr::InterpolatedString(_) => true,
         }
