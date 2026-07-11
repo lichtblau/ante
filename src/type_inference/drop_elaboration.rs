@@ -222,9 +222,9 @@ impl TypeChecker<'_, '_> {
         // drop each captured slot. Runs before the `Copy` fast path below: a closure value is
         // Copy-by-fiat, so it would otherwise synthesize nothing.
         if let MovePath::Variable(binding) = place
-            && self.move_closure_captures.contains_key(binding)
+            && (self.move_closure_captures.contains_key(binding) || self.shared_closure_captures.contains_key(binding))
         {
-            return self.synthesize_move_env_drop(*binding, location);
+            return self.synthesize_closure_binding_env_drops(*binding, location);
         }
         let typ = self.follow_type(typ).clone();
         if typ == Type::ERROR {
@@ -468,10 +468,16 @@ impl TypeChecker<'_, '_> {
         }
         let Some(place) = self.try_build_move_path(assignment.lhs) else { return };
         let root = place.root_variable();
-        // Assigning to a captured outer variable writes through the closure's capture
-        // reference: dropping the old value there is a through-reference drop (excluded in
-        // v1, and the capture set is not even known until the lambda ends). Locals only.
-        if !self.name_is_local_to_current_function(root) {
+        // Assigning to a captured outer variable writes through the closure's capture reference:
+        // dropping the old value there is a through-reference drop. Excluded in v1 -- EXCEPT inside
+        // a handler-scoped lambda, which provably cannot outlive its handle expression: the
+        // captured slot then outlives every run of this lambda, so releasing the overwritten value
+        // through the capture is sound. This is the foldl-accumulator fix (`shared.an`): `result :=
+        // f result value` in the emit handler now releases each old accumulator instead of
+        // orphaning it. Ordinary (escapable) closures keep the v1 skip.
+        let through_handler_capture =
+            self.in_handler_scoped_lambda && self.name_is_local_to_any_enclosing_function(root);
+        if !self.name_is_local_to_current_function(root) && !through_handler_capture {
             return;
         }
         let Some(root_type) = self.name_types.get(&root).cloned() else { return };
@@ -875,8 +881,23 @@ impl TypeChecker<'_, '_> {
     /// name frees the env's heap; `captured_names` normally suppresses that drop, so it is
     /// force-enabled for the capture's whole subtree while its drop is synthesized. Returns a
     /// `Sequence` of the drops, or `None` when every capture needs nothing (Copy prunes away).
-    fn synthesize_move_env_drop(&mut self, binding: NameId, location: &Location) -> Option<ExprId> {
-        let captures = self.move_closure_captures.get(&binding).cloned()?;
+    fn synthesize_closure_binding_env_drops(&mut self, binding: NameId, location: &Location) -> Option<ExprId> {
+        let mut drops = self.synthesize_move_env_captures(binding, location);
+        drops.extend(self.synthesize_shared_env_release(binding, location));
+        if drops.is_empty() {
+            return None;
+        }
+        let items = drops.into_iter().map(|expr| cst::SequenceItem { comments: Vec::new(), expr }).collect();
+        Some(self.push_expr(Expr::Sequence(items), Type::UNIT, location.clone()))
+    }
+
+    /// One drop per non-Copy, non-`var` capture of a dying `move` closure, in capture order. Each
+    /// capture aliases its env slot (a `move` closure holds the captured value by value,
+    /// `pack_closure_environment`), so dropping it by its own name frees the env's heap;
+    /// `captured_names` normally suppresses that drop, so it is force-enabled for the capture's
+    /// whole subtree while its drop is synthesized.
+    fn synthesize_move_env_captures(&mut self, binding: NameId, location: &Location) -> Vec<ExprId> {
+        let Some(captures) = self.move_closure_captures.get(&binding).cloned() else { return Vec::new() };
         let mut drops = Vec::new();
         for capture in captures {
             let Some(typ) = self.name_types.get(&capture).cloned() else { continue };
@@ -889,11 +910,24 @@ impl TypeChecker<'_, '_> {
                 drops.push(drop);
             }
         }
-        if drops.is_empty() {
-            return None;
+        drops
+    }
+
+    /// Release each `shared` capture of a dying closure `binding` -- the env's own reference,
+    /// balancing the pack-time `RcRetain`. Unlike the owned move-env drop these captures were
+    /// already removed from `captured_names` (`record_shared_captures`, the owner restore), so no
+    /// `force_drop_captured` lift is needed; `try_synthesize_drop_for_place` resolves each shared
+    /// type to its `release_T`. Fires for `move` and non-`move` closures alike.
+    fn synthesize_shared_env_release(&mut self, binding: NameId, location: &Location) -> Vec<ExprId> {
+        let Some(captures) = self.shared_closure_captures.get(&binding).cloned() else { return Vec::new() };
+        let mut drops = Vec::new();
+        for capture in captures {
+            let Some(typ) = self.name_types.get(&capture).cloned() else { continue };
+            if let Some(drop) = self.try_synthesize_drop_for_place(&MovePath::Variable(capture), &typ, location) {
+                drops.push(drop);
+            }
         }
-        let items = drops.into_iter().map(|expr| cst::SequenceItem { comments: Vec::new(), expr }).collect();
-        Some(self.push_expr(Expr::Sequence(items), Type::UNIT, location.clone()))
+        drops
     }
 
     /// A `move` closure is Copy-by-fiat (`affine.rs`), so returning, storing, or passing it records
@@ -904,21 +938,32 @@ impl TypeChecker<'_, '_> {
     /// scope uses as anything other than the *direct callee of a call* -- the one value use that
     /// provably keeps the closure in place. Capture by a nested lambda counts as an escape too.
     pub(super) fn retract_escaping_move_closures(&mut self, expr: ExprId) {
-        if self.move_closure_captures.is_empty() || !self.drop_elaboration_active() {
+        if (self.move_closure_captures.is_empty() && self.shared_closure_captures.is_empty())
+            || !self.drop_elaboration_active()
+        {
             return;
         }
         self.scan_move_closure_escapes(expr);
     }
 
+    /// Retract an escaped closure binding from **both** env-teardown tables: Releasing the shared
+    /// slot at the local binding's death while the escaped copy still aliases the handle would free
+    /// it too early (a use-after-free), exactly the owned-capture hazard. The owner-restore release
+    /// and the pack-time retain still stand, so a retracted shared capture leaks by one count.
+    fn retract_escaped_closure(&mut self, name: NameId) {
+        self.move_closure_captures.remove(&name);
+        self.shared_closure_captures.remove(&name);
+    }
+
     fn scan_move_closure_escapes(&mut self, expr: ExprId) {
-        if self.move_closure_captures.is_empty() {
+        if self.move_closure_captures.is_empty() && self.shared_closure_captures.is_empty() {
             return;
         }
         match self.expr_of(expr).as_ref() {
             Expr::Variable(path) => {
                 // A bare value use (return tail, `:=` rhs, non-callee argument, …) escapes.
                 if let Some(Origin::Local(name)) = self.path_origin(*path) {
-                    self.move_closure_captures.remove(&name);
+                    self.retract_escaped_closure(name);
                 }
             },
             Expr::Call(call) => {
@@ -933,10 +978,15 @@ impl TypeChecker<'_, '_> {
             },
             Expr::Lambda(_) => {
                 // Capture by a nested lambda copies the closure into another env -- an escape.
-                let captured: Vec<NameId> =
-                    self.move_closure_captures.keys().copied().filter(|k| self.lambda_captures_name(expr, *k)).collect();
+                let captured: Vec<NameId> = self
+                    .move_closure_captures
+                    .keys()
+                    .chain(self.shared_closure_captures.keys())
+                    .copied()
+                    .filter(|k| self.lambda_captures_name(expr, *k))
+                    .collect();
                 for name in captured {
-                    self.move_closure_captures.remove(&name);
+                    self.retract_escaped_closure(name);
                 }
             },
             Expr::Sequence(items) => {
@@ -1390,6 +1440,13 @@ impl TypeChecker<'_, '_> {
     /// are captured outers and are not dropped when *this* function returns.
     fn name_is_local_to_current_function(&self, name: NameId) -> bool {
         self.function_local_names.last().is_some_and(|locals| locals.contains(&name))
+    }
+
+    /// True when `name` is an owned local of *some* enclosing function on the scope stack -- i.e. a
+    /// captured outer local (as opposed to a global or a through-pointer parameter).  Used only
+    /// inside a handler-scoped lambda, where such a capture provably outlives the lambda.
+    fn name_is_local_to_any_enclosing_function(&self, name: NameId) -> bool {
+        self.function_local_names.iter().any(|locals| locals.contains(&name))
     }
 
     /// Reject a user `Drop` impl whose target is a `shared` type: shared handles are

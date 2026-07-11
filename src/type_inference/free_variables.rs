@@ -99,12 +99,62 @@ impl TypeChecker<'_, '_> {
                 }
             }
         }
+        // A `move`-captured owned value is recorded moved above, so the owner's scope-exit drop is
+        // already suppressed by the move tracker (not by the blanket). Remove it from
+        // `captured_names` so the blanket's remaining population is meaningful -- exactly the
+        // escaping non-`move` owned captures task 10 turns into borrows.  Nothing changes at the
+        // owner (a moved value has no owner-side drop either way).
+        for capture in &owned_captures {
+            self.captured_names.remove(capture);
+        }
         // Only a *bound* move closure gets an env-drop obligation (`m = move fn …`); an anonymous
         // move closure passed straight into a call escapes by move and is never scope-dropped.
         if let Some(binding) = self_name
             && !owned_captures.is_empty()
         {
             self.move_closure_captures.insert(binding, owned_captures);
+        }
+    }
+
+    /// A `shared` handle captured **by value** into a closure env is a bit-copy the owner still
+    /// holds too (shared handles are `Copy`, so `record_move_captures` never sees them). Rather
+    /// than pick a unique owner, take a reference: the pack-time `RcRetain`
+    /// (`pack_closure_environment`) gives the env its own count, so:
+    ///   - the capture is **restored** to the owner's scope -- removed from `captured_names` so the
+    ///     owner's scope-exit `release_T` fires again (safe now: the retain kept the count above what
+    ///     the closure still needs), and
+    ///   - for a **bound** closure, the balancing env-side release is recorded as an obligation of the
+    ///     binding (`shared_closure_captures`), fired when the closure value dies un-escaped
+    ///     (`try_synthesize_drop_for_place`).
+    ///
+    /// `var` captures are excluded. Anonymous closures get only the owner restore: their retain has
+    /// no binding death to balance it and leaks by one count -- the leak-not-UAF fallback.  Runs
+    /// after `record_captured_names` so the removal sticks; auto-drop only.
+    pub(super) fn record_shared_captures(&mut self, id: ExprId, self_name: Option<NameId>) {
+        let mut context = FreeVars::default();
+        if let Some(name) = self_name {
+            context.defined_in_fn.insert(name);
+        }
+        context.find_free_variables(id, self);
+
+        let mut shared_captures = Vec::new();
+        for name in &context.free_vars {
+            let typ = self.name_types[name].clone();
+            if self.is_shared_user_defined(&typ) && !self.mutable_definitions.contains(name) {
+                shared_captures.push(*name);
+            }
+        }
+        if shared_captures.is_empty() {
+            return;
+        }
+        // Owner restore: the pack-time retain balances the owner's release, so let the owner drop
+        // its copy again (both owner and env now hold a real count).
+        for name in &shared_captures {
+            self.captured_names.remove(name);
+        }
+        // Only a *bound* closure has a scope-exit death to release the env's reference at.
+        if let Some(binding) = self_name {
+            self.shared_closure_captures.insert(binding, shared_captures);
         }
     }
 

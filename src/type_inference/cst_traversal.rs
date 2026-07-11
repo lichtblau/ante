@@ -938,7 +938,13 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Cow::Borrowed(&function_type.return_type)
         };
 
+        // A handler-scoped lambda (handle body / handler branch) cannot outlive its handle
+        // expression, so a `:=` through one of its captures may release the old value even though
+        // the slot lives in an enclosing function. Reflects only the innermost lambda: a nested
+        // ordinary lambda resets it to `false`.
+        let old_handler_scoped = std::mem::replace(&mut self.in_handler_scoped_lambda, options.handler_scoped);
         let body_type = self.check_expr(lambda.body, &return_type, TypeErrorKind::FunctionBody);
+        self.in_handler_scoped_lambda = old_handler_scoped;
 
         // Auto-drop: The body's value is this function's return value; a reference
         // derived from an owned local must not escape through it.
@@ -977,6 +983,16 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             // handle completes) is sound; see `LambdaOptions::handler_scoped`.
             if !options.handler_scoped {
                 self.record_captured_names(expr);
+                // Restore shared captures to the owner and record the env-side release obligation
+                // for a bound closure. After `record_captured_names` so the owner-restore removal
+                // sticks. Fenced to stack (tuple) envs: a bare-`Pointer` env is a capability/method
+                // dictionary. that the builder's pack-retain also skips -- keeping the owner-restore
+                // release paired with a retain.  Handler-scoped lambdas are already exempt (their
+                // captures never entered `captured_names`, and the pack-retain is fenced off in the
+                // builder).
+                if !super::free_variables::is_pointer_env(&function_type.environment, &self.bindings) {
+                    self.record_shared_captures(expr, self_name);
+                }
             }
         }
 

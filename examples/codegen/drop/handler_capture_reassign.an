@@ -1,0 +1,49 @@
+// A `:=` reassignment of a captured outer variable through a **handler-scoped**
+// closure now releases the overwritten value. A handler branch provably cannot
+// outlive its handle expression, so the captured slot outlives every run of the
+// branch -- dropping the old value through the capture is sound.
+//
+// Before: `assignment_overwrite_drop` bailed on any through-capture write (`result` is not local
+// to the handler-branch lambda), so each `result := Cons value result` orphaned the previous
+// accumulator -- the concrete shape of `shared.an`'s foldl leak. Now the emit handler releases
+// each old accumulator; the whole shared list is reclaimed (ASan/LeakSanitizer-clean).
+
+shared type L a =
+    | Nil
+    | Cons a (L a)
+
+len (l: L a): I32 =
+    match l
+    | Nil -> 0
+    | Cons _ r -> 1 + len r
+
+ability Emit a =
+    emit: resume fn a -> Unit
+
+drive {Emit I32} (n: I32): Unit =
+    if 0 < n then
+        emit n
+        drive (n - 1)
+    else ()
+
+// The emit handler reassigns `result` (an outer `var`) on every element -- the foldl shape.
+collect (n: I32): L I32 =
+    var result: L I32 = Nil
+    handler h for emit value ->
+        result := Cons value result
+        resume ()
+    in drive h n
+    result
+
+main () =
+    xs = collect 5
+    println (len xs)          // 5
+
+    // A second round to exercise repeated construction/teardown across the whole run.
+    ys = collect 100
+    println (len ys)          // 100
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 5
+// 100

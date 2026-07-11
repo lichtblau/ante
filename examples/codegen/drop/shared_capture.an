@@ -1,0 +1,68 @@
+// A `shared` handle captured **by value** into a closure env is retained when
+// the env is packed (`pack_closure_environment`) and released when the closure
+// value dies un-escaped, with the owner's own release restored (the capture
+// leaves `captured_names`). The whole shared structure is reclaimed --
+// ASan/LeakSanitizer-clean. Previously the owner's release was suppressed by
+// `captured_names` and the env never released either, so the structure leaked
+// outright.
+//
+// Shared handles are `Copy`, so a capture is a bit-copy the owner keeps too; RC (not a unique
+// owner) settles it: +1 pack retain, −1 env death, −1 owner exit, against the original +1.
+
+shared type Tree a =
+    | Leaf
+    | Node (Tree a) a (Tree a)
+
+size (tree: Tree a): I32 =
+    match tree
+    | Leaf -> 0
+    | Node l _ r -> 1 + size l + size r
+
+// A three-node heap-allocated shared tree.
+build3 (): Tree I32 = Node (Node Leaf 1 Leaf) 2 (Node Leaf 3 Leaf)
+
+main () =
+    // (1) basic: capture, call, then both die at scope exit (closure first, owner after) -- freed.
+    t = build3 ()
+    m = fn () -> size t
+    println (m ())             // 3
+
+    // (2) N closures capturing the same handle: reclaimed only after the last releases.
+    u = build3 ()
+    f = fn () -> size u
+    g = fn () -> size u + 1
+    println (f () + g ())      // 3 + 4 = 7
+
+    // (3) A `move` closure owning a String *and* sharing a handle in one env --
+    // the String is dropped and the handle released when the closure dies.
+    v = build3 ()
+    label = "size=" ++ "3"
+    p = move fn () ->
+        println label
+        size v
+    println (p ())             // size=3 \n 3
+
+    // (4) per-iteration capture in a loop: flat leak bytes, freed each turn.
+    var i = 0
+    while i < 3 do
+        w = build3 ()
+        q = fn () -> size w
+        println (q ())         // 3
+        i := i + 1
+
+    // (5) immortal (nullary-constructor) handle captured: the retain/release pair is a runtime
+    //     no-op (null/immortal-safe), never freed, never crashes.
+    e: Tree I32 = Leaf
+    r = fn () -> size e
+    println (r ())             // 0
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 3
+// 7
+// size=3
+// 3
+// 3
+// 3
+// 3
+// 0

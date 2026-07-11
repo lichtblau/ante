@@ -1154,7 +1154,8 @@ where
         let env_is_pointer = matches!(env_type, Type::Primitive(crate::mir::PrimitiveType::Pointer));
         if free_vars.is_some() || env_is_pointer {
             let environment = if let Some(free_vars) = &free_vars {
-                self.pack_closure_environment(free_vars, is_move, &env_type)
+                let retain_shared = !env_is_pointer && handle_body_handler_name.is_none();
+                self.pack_closure_environment(free_vars, is_move, &env_type, retain_shared)
             } else {
                 // Pointer-env slot with no captures (e.g. an ability impl assigning a plain function):
                 // use a null pointer for the env. Transmute from Unit so constant-folding works
@@ -1169,7 +1170,9 @@ where
     /// Packs each given variable into a closure environment.
     /// When `env_type` is a pointer, the capture tuple is heap-allocated (via [Instruction::AllocShared])
     /// and the returned value is the resulting pointer. Otherwise returns the tuple directly.
-    fn pack_closure_environment(&mut self, free_vars: &BTreeSet<NameId>, is_move: bool, env_type: &Type) -> Value {
+    fn pack_closure_environment(
+        &mut self, free_vars: &BTreeSet<NameId>, is_move: bool, env_type: &Type, retain_shared: bool,
+    ) -> Value {
         assert!(!free_vars.is_empty());
 
         let values = mapvec(free_vars, |var| {
@@ -1182,6 +1185,15 @@ where
                 let val_type = self.convert_type(tc_type, None);
                 self.push_instruction(Instruction::Deref(value), val_type)
             } else {
+                // A `shared` handle captured by value is a new owning location -- retain it so the
+                // env carries its own count. `var` captures are Mut-refs into the owner's slot (no
+                // handle copy), so they are excluded, matching the frontend's owner-restore fence.
+                if retain_shared
+                    && !self.mutable_locals.contains(var)
+                    && self.types.result.maps.name_types.get(var).is_some_and(|tc| self.shared_inner_layout_of(tc).is_some())
+                {
+                    self.push_instruction(Instruction::RcRetain(value), Type::UNIT);
+                }
                 value
             }
         });

@@ -233,6 +233,14 @@ struct TypeChecker<'local, 'inner> {
     /// dropping the referent would dangle it. Skipping only leaks for now.
     captured_names: FxHashSet<NameId>,
 
+    /// True while inferring the body of a **handler-scoped** lambda (a handle body
+    /// or handler branch, `LambdaOptions::handler_scoped`). Such a lambda provably cannot outlive
+    /// its handle expression, so its captures cannot outlive their owner -- a `:=` through one of
+    /// them (`assignment_overwrite_drop`) may release the old value even though the slot lives in an
+    /// enclosing function. Reset per lambda (a nested ordinary lambda sets it back to `false`), so
+    /// it reflects only the innermost lambda directly containing the assignment.
+    in_handler_scoped_lambda: bool,
+
     /// Masks computed by [`Self::compute_borrowed_param_mask`], keyed by
     /// item then function name, moved into each [`IndividualTypeCheckResult`] at `finish`.
     borrowed_param_masks: FxHashMap<TopLevelId, FxHashMap<NameId, Vec<bool>>>,
@@ -271,6 +279,16 @@ struct TypeChecker<'local, 'inner> {
     /// here. Keyed by the binding name (`m = move fn …`); an escaping closure is recorded moved, so
     /// its scope-exit drop -- and this env drop with it -- never fires.
     move_closure_captures: FxHashMap<NameId, Vec<NameId>>,
+
+    /// Each closure binding (`move` *or* not) → the concretely `shared`-typed, non-`var` variables
+    /// it captured by value. A shared handle is `Copy`, so the capture is a bit-copy the owner
+    /// keeps too; the pack-time `RcRetain` (`pack_closure_environment`) gives the env its own
+    /// reference, and this table drives the balancing release when the closure value dies
+    /// un-escaped. The owner's own release is restored in tandem (the capture is removed from
+    /// `captured_names`), so the pair is: +1 capture retain, −1 env death, −1 owner exit against
+    /// the original +1 ownership. Keyed by the binding name; an escaping closure is retracted from
+    /// this table (`retract_escaping_move_closures`) so only the leak-not-UAF fallback remains.
+    shared_closure_captures: FxHashMap<NameId, Vec<NameId>>,
 
     /// Names whose `captured_names` skip is temporarily lifted because their owning `move` closure
     /// is dying on this edge and we are synthesizing its env drop. Covers the whole subtree rooted
@@ -362,6 +380,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_method_name: None,
             drop_type_name: None,
             captured_names: Default::default(),
+            in_handler_scoped_lambda: false,
             borrowed_param_masks: Default::default(),
             borrowed_local_params: Default::default(),
             borrowed_bindings: Default::default(),
@@ -369,6 +388,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             pending_autoref_temp_drops: Vec::new(),
             effect_continuation_names: Default::default(),
             move_closure_captures: Default::default(),
+            shared_closure_captures: Default::default(),
             force_drop_captured: Default::default(),
             drop_expansion_depth: 0,
             copy_check_depth: 0,
@@ -518,12 +538,14 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.drop_scopes.clear();
         self.synthesizing_drops = false;
         self.captured_names.clear();
+        self.in_handler_scoped_lambda = false;
         self.borrowed_local_params.clear();
         self.borrowed_bindings.clear();
         self.call_argument_depth = 0;
         self.pending_autoref_temp_drops.clear();
         self.effect_continuation_names.clear();
         self.move_closure_captures.clear();
+        self.shared_closure_captures.clear();
         self.force_drop_captured.clear();
         self.drop_expansion_depth = 0;
         self.function_local_names.clear();
