@@ -194,8 +194,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 }
                 // Block-fallthrough drops for this scope's locals. Synthesized before
                 // pop_implicits_scope so delayed `Drop` implicits resolve in this scope.
+                // Retract env-drop obligations of any move closure that escapes this
+                // block (returned/stored/passed), so the drop below never frees an aliased escapee.
                 let diverges = self.diverges(&result);
                 let location = self.current_extended_context().expr_location(id);
+                self.retract_escaping_move_closures(id);
                 let drops = self.pop_drop_scope(diverges, &location);
                 if !drops.is_empty() {
                     self.current_extended_context_mut().push_post_expr_drops(id, drops);

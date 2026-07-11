@@ -265,6 +265,18 @@ struct TypeChecker<'local, 'inner> {
     /// header off the stack. Excluded from closure-env RC for now.
     effect_continuation_names: FxHashSet<NameId>,
 
+    /// Each `move`-closure binding → the non-Copy, non-`var` variables it captured by value. The
+    /// env is those captures' sole owner (the moves are recorded, the outer scope neither uses nor
+    /// drops them), so when the closure value itself dies un-moved its captures are dropped
+    /// here. Keyed by the binding name (`m = move fn …`); an escaping closure is recorded moved, so
+    /// its scope-exit drop -- and this env drop with it -- never fires.
+    move_closure_captures: FxHashMap<NameId, Vec<NameId>>,
+
+    /// Names whose `captured_names` skip is temporarily lifted because their owning `move` closure
+    /// is dying on this edge and we are synthesizing its env drop. Covers the whole subtree rooted
+    /// at the capture (a structural drop recurses through `captured_names.contains`).
+    force_drop_captured: FxHashSet<NameId>,
+
     /// Recursion guard for structural drop expansion (`--auto-drop`): recursive types
     /// cannot be expanded inline, so expansion stops at a fixed depth (skips leak).
     drop_expansion_depth: u32,
@@ -356,6 +368,8 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             call_argument_depth: 0,
             pending_autoref_temp_drops: Vec::new(),
             effect_continuation_names: Default::default(),
+            move_closure_captures: Default::default(),
+            force_drop_captured: Default::default(),
             drop_expansion_depth: 0,
             copy_check_depth: 0,
             function_local_names: Vec::new(),
@@ -509,6 +523,8 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.call_argument_depth = 0;
         self.pending_autoref_temp_drops.clear();
         self.effect_continuation_names.clear();
+        self.move_closure_captures.clear();
+        self.force_drop_captured.clear();
         self.drop_expansion_depth = 0;
         self.function_local_names.clear();
         self.diagnosed_missing_drops.clear();

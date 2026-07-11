@@ -80,13 +80,31 @@ impl TypeChecker<'_, '_> {
         context.find_free_variables(id, self);
 
         let location = id.locate(self);
+        let mut owned_captures = Vec::new();
         for name in &context.free_vars {
             let typ = self.name_types[name].clone();
             if !self.type_is_copy(&typ) {
                 // Capturing a binding moves the place it denotes, as a direct use would.
                 let move_path = self.binding_place(*name);
                 self.move_tracker.record_move(move_path, location.clone());
+                // The env is this capture's sole owner, so record it as an env-drop obligation of
+                // the closure's binding. `var` captures are excluded: a `move` closure snapshots
+                // them by value (`pack_closure_environment` Derefs the current value) while the
+                // outer slot stays live, so dropping both would double-free -- `var` env drops are
+                // out of scope here (tasks 06/10). Shared handles and function values are Copy, so
+                // they never reach this branch (05 owns shared captures; heap-env closure captures
+                // are 04/05).
+                if !self.mutable_definitions.contains(name) {
+                    owned_captures.push(*name);
+                }
             }
+        }
+        // Only a *bound* move closure gets an env-drop obligation (`m = move fn …`); an anonymous
+        // move closure passed straight into a call escapes by move and is never scope-dropped.
+        if let Some(binding) = self_name
+            && !owned_captures.is_empty()
+        {
+            self.move_closure_captures.insert(binding, owned_captures);
         }
     }
 

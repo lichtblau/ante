@@ -199,9 +199,12 @@ impl TypeChecker<'_, '_> {
     pub(super) fn try_synthesize_drop_for_place(
         &mut self, place: &MovePath, typ: &Type, location: &Location,
     ) -> Option<ExprId> {
-        // Captured by some closure: the closure may outlive this scope; dropping the
-        // referent would dangle it. Skip (leak) for now.
-        if self.captured_names.contains(&place.root_variable()) {
+        // Captured by some closure: the closure may outlive this scope; dropping the referent would
+        // dangle it. Skip (leak) for now. We lift this for a capture whose owning `move` closure is
+        // dying on this edge (`force_drop_captured`).
+        if self.captured_names.contains(&place.root_variable())
+            && !self.force_drop_captured.contains(&place.root_variable())
+        {
             return None;
         }
         // A borrowed alias binding elided its bind-retain; its scope-exit release is elided with it
@@ -213,6 +216,15 @@ impl TypeChecker<'_, '_> {
         // balances it with a post-call release; never release here.
         if self.borrowed_local_params.contains(&place.root_variable()) {
             return None;
+        }
+        // A `move` closure's env owns its non-Copy captures. When the closure value itself dies
+        // un-moved (this edge -- `synthesize_partial_drop` already returned early if it escaped),
+        // drop each captured slot. Runs before the `Copy` fast path below: a closure value is
+        // Copy-by-fiat, so it would otherwise synthesize nothing.
+        if let MovePath::Variable(binding) = place
+            && self.move_closure_captures.contains_key(binding)
+        {
+            return self.synthesize_move_env_drop(*binding, location);
         }
         let typ = self.follow_type(typ).clone();
         if typ == Type::ERROR {
@@ -855,6 +867,170 @@ impl TypeChecker<'_, '_> {
 
         self.current_extended_context_mut().mark_closure_env_release(place_expr);
         place_expr
+    }
+
+    /// Synthesize the env drop for a dying `move` closure `binding` -- one drop per non-Copy,
+    /// non-`var` capture, in capture order. Each capture aliases its env slot (a `move` closure
+    /// holds the captured value by value, `pack_closure_environment`), so dropping it by its own
+    /// name frees the env's heap; `captured_names` normally suppresses that drop, so it is
+    /// force-enabled for the capture's whole subtree while its drop is synthesized. Returns a
+    /// `Sequence` of the drops, or `None` when every capture needs nothing (Copy prunes away).
+    fn synthesize_move_env_drop(&mut self, binding: NameId, location: &Location) -> Option<ExprId> {
+        let captures = self.move_closure_captures.get(&binding).cloned()?;
+        let mut drops = Vec::new();
+        for capture in captures {
+            let Some(typ) = self.name_types.get(&capture).cloned() else { continue };
+            let newly_forced = self.force_drop_captured.insert(capture);
+            let drop = self.try_synthesize_drop_for_place(&MovePath::Variable(capture), &typ, location);
+            if newly_forced {
+                self.force_drop_captured.remove(&capture);
+            }
+            if let Some(drop) = drop {
+                drops.push(drop);
+            }
+        }
+        if drops.is_empty() {
+            return None;
+        }
+        let items = drops.into_iter().map(|expr| cst::SequenceItem { comments: Vec::new(), expr }).collect();
+        Some(self.push_expr(Expr::Sequence(items), Type::UNIT, location.clone()))
+    }
+
+    /// A `move` closure is Copy-by-fiat (`affine.rs`), so returning, storing, or passing it records
+    /// **no** move -- its by-value env tuple is bit-copied to the escaping location and the copy
+    /// aliases the captured values. Dropping those captures when the closure's own scope exits
+    /// would then free heap the escaped copy still points at (a use-after-free). Before a scope's
+    /// drops are synthesized, retract the env-drop obligation of every move-closure binding this
+    /// scope uses as anything other than the *direct callee of a call* -- the one value use that
+    /// provably keeps the closure in place. Capture by a nested lambda counts as an escape too.
+    pub(super) fn retract_escaping_move_closures(&mut self, expr: ExprId) {
+        if self.move_closure_captures.is_empty() || !self.drop_elaboration_active() {
+            return;
+        }
+        self.scan_move_closure_escapes(expr);
+    }
+
+    fn scan_move_closure_escapes(&mut self, expr: ExprId) {
+        if self.move_closure_captures.is_empty() {
+            return;
+        }
+        match self.expr_of(expr).as_ref() {
+            Expr::Variable(path) => {
+                // A bare value use (return tail, `:=` rhs, non-callee argument, …) escapes.
+                if let Some(Origin::Local(name)) = self.path_origin(*path) {
+                    self.move_closure_captures.remove(&name);
+                }
+            },
+            Expr::Call(call) => {
+                let call = call.clone();
+                // `m arg…` (a direct variable callee) does not escape `m`; a compound callee is scanned.
+                if !matches!(self.expr_of(call.function).as_ref(), Expr::Variable(_)) {
+                    self.scan_move_closure_escapes(call.function);
+                }
+                for arg in &call.arguments {
+                    self.scan_move_closure_escapes(arg.expr);
+                }
+            },
+            Expr::Lambda(_) => {
+                // Capture by a nested lambda copies the closure into another env -- an escape.
+                let captured: Vec<NameId> =
+                    self.move_closure_captures.keys().copied().filter(|k| self.lambda_captures_name(expr, *k)).collect();
+                for name in captured {
+                    self.move_closure_captures.remove(&name);
+                }
+            },
+            Expr::Sequence(items) => {
+                let items = items.clone();
+                for item in &items {
+                    self.scan_move_closure_escapes(item.expr);
+                }
+            },
+            Expr::Definition(def) => {
+                let rhs = def.rhs;
+                self.scan_move_closure_escapes(rhs);
+            },
+            Expr::MemberAccess(access) => {
+                let object = access.object;
+                self.scan_move_closure_escapes(object);
+            },
+            Expr::If(if_) => {
+                let (condition, then, else_) = (if_.condition, if_.then, if_.else_);
+                self.scan_move_closure_escapes(condition);
+                self.scan_move_closure_escapes(then);
+                if let Some(else_) = else_ {
+                    self.scan_move_closure_escapes(else_);
+                }
+            },
+            Expr::Match(match_) => {
+                let match_ = match_.clone();
+                self.scan_move_closure_escapes(match_.expression);
+                for (_, branch) in &match_.cases {
+                    self.scan_move_closure_escapes(*branch);
+                }
+            },
+            Expr::Handle(handle) => {
+                let handle = handle.clone();
+                self.scan_move_closure_escapes(handle.expression);
+                for (_, branch) in &handle.cases {
+                    self.scan_move_closure_escapes(*branch);
+                }
+            },
+            Expr::Reference(reference) => {
+                let rhs = reference.rhs;
+                self.scan_move_closure_escapes(rhs);
+            },
+            Expr::TypeAnnotation(annotation) => {
+                let lhs = annotation.lhs;
+                self.scan_move_closure_escapes(lhs);
+            },
+            Expr::Constructor(constructor) => {
+                let fields: Vec<ExprId> = constructor.fields.iter().map(|(_, e)| *e).collect();
+                for field in fields {
+                    self.scan_move_closure_escapes(field);
+                }
+            },
+            Expr::While(while_) => {
+                let (condition, body) = (while_.condition, while_.body);
+                self.scan_move_closure_escapes(condition);
+                self.scan_move_closure_escapes(body);
+            },
+            Expr::For(for_) => {
+                let (start, end, body) = (for_.start, for_.end, for_.body);
+                self.scan_move_closure_escapes(start);
+                self.scan_move_closure_escapes(end);
+                self.scan_move_closure_escapes(body);
+            },
+            Expr::Return(return_) => {
+                let expression = return_.expression;
+                self.scan_move_closure_escapes(expression);
+            },
+            Expr::Assignment(assignment) => {
+                let (lhs, rhs, op) = (assignment.lhs, assignment.rhs, assignment.op.clone());
+                self.scan_move_closure_escapes(lhs);
+                self.scan_move_closure_escapes(rhs);
+                if let Some((_, op)) = op {
+                    self.scan_move_closure_escapes(op);
+                }
+            },
+            Expr::ArrayLiteral(elements) => {
+                let elements = elements.clone();
+                for element in elements {
+                    self.scan_move_closure_escapes(element);
+                }
+            },
+            // `Is`/`Do`/`Loop`/`InterpolatedString` are desugared before type inference (the infer
+            // arms `unreachable!` on them), so they never reach this CST walk.
+            Expr::Error
+            | Expr::Literal(_)
+            | Expr::Extern(_)
+            | Expr::Break
+            | Expr::Continue
+            | Expr::Quoted(_)
+            | Expr::Is(_)
+            | Expr::Do(_)
+            | Expr::Loop(_)
+            | Expr::InterpolatedString(_) => {},
+        }
     }
 
     /// Derive the drop for a (possibly partially-moved) sum-typed place: an exhaustive

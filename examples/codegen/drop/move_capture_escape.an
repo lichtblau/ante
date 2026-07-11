@@ -1,0 +1,26 @@
+// A `move` closure is Copy-by-fiat, so a closure that escapes its defining
+// scope (returned here) is bit-copied to the caller and the copy aliases the
+// captured String. Dropping the capture at the closure's scope exit would free
+// heap the returned copy still references -- a use-after-free. The env-drop
+// obligation is therefore retracted for any move closure used as anything but a
+// direct call: the capture leaks, never double-frees.
+
+make_anon () =
+    payload = "escaped " ++ "anon"
+    move fn () -> println payload
+
+make_bound () =
+    payload = "escaped " ++ "bound"
+    m = move fn () -> println payload
+    m
+
+main () =
+    f = make_anon ()
+    f ()
+    g = make_bound ()
+    g ()
+
+// args: --delete-binary --no-color
+// expected stdout:
+// escaped anon
+// escaped bound
