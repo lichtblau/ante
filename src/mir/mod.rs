@@ -31,6 +31,7 @@ mod display;
 mod effects;
 mod lower_closures;
 pub(crate) mod monomorphization;
+mod elide_borrow_pairs;
 mod remove_unreachable;
 mod validation;
 
@@ -122,6 +123,26 @@ pub struct Definition {
 
     /// The result type of each instruction in this function
     instruction_result_types: VecMap<InstructionId, Type>,
+
+    /// Retain/release pairs emitted for borrowing-parameter arguments whose implicit purity could
+    /// not be proven pre-mono. Instruction ids are stable through every definition-cloning path, so
+    /// each specialization carries its pairs; the post-mono `elide_pure_borrow_pairs` pass
+    /// re-judges purity on the specialized capability values and removes pairs that are then
+    /// provably elidable.
+    pub(crate) borrow_pairs: Vec<BorrowPair>,
+}
+
+/// See [Definition::borrow_pairs].
+#[derive(Debug, Clone)]
+pub(crate) struct BorrowPair {
+    /// The `RcRetain` emitted before the call.
+    pub(crate) retain: InstructionId,
+    /// The `release_T` call emitted after the call.
+    pub(crate) release_call: InstructionId,
+    /// The bracketed call itself.
+    pub(crate) call: InstructionId,
+    /// Positions within the call's argument vector holding its implicit capability values.
+    pub(crate) implicit_args: Vec<u32>,
 }
 
 impl Definition {
@@ -138,6 +159,7 @@ impl Definition {
             generic_count,
             instructions: VecMap::default(),
             instruction_result_types: VecMap::default(),
+            borrow_pairs: Vec::new(),
         }
     }
 

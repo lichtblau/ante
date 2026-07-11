@@ -94,6 +94,7 @@ where
             acc.extend(monomorphized)
         })
         //.reduce(Mir::default, Mir::extend)
+        .elide_pure_borrow_pairs()
         .lower_closures()
         .assert_fully_linked()
         .assert_type_checks()

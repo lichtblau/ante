@@ -678,10 +678,14 @@ where
         // application-shaped cap is freshly allocated for this call, so the caller releases
         // its method-closure environments once the call completes.
         let mut cap_env_releases = Vec::new();
-        let mut post_call_releases: Vec<(Value, ExprId)> = Vec::new();
+        // (value, expr, retain id when this is an elidable pair)
+        let mut post_call_releases: Vec<(Value, ExprId, Option<crate::mir::InstructionId>)> = Vec::new();
+        let mut implicit_positions: Vec<u32> = Vec::new();
         let mut explicit_index = 0usize;
+        let mut arg_index = 0u32;
         let arguments = mapvec(&call.arguments, |arg| {
-            if arg.is_implicit && !is_release_call {
+            let value = if arg.is_implicit && !is_release_call {
+                implicit_positions.push(arg_index);
                 self.lower_drop_capability(arg.expr, &mut cap_env_releases)
             } else {
                 let value = self.expression(arg.expr);
@@ -695,11 +699,19 @@ where
                             matches!(&self.context()[arg.expr], cst::Expr::Variable(_) | cst::Expr::MemberAccess(_));
                         if is_place && implicits_pure {
                             // Pair elided: no retain here, no release in the callee.
+                        } else if is_place {
+                            // Impure implicits: retain + post-call release, recorded as a
+                            // borrow pair so the post-mono pass can elide it when the
+                            // specialized capability values turn out pure.
+                            let retain = self.push_instruction(Instruction::RcRetain(value), Type::UNIT);
+                            let retain_id = match retain {
+                                Value::InstructionResult(id) => Some(id),
+                                _ => None,
+                            };
+                            post_call_releases.push((value, arg.expr, retain_id));
                         } else {
-                            if is_place {
-                                self.retain_if_shared_place(arg.expr, value);
-                            }
-                            post_call_releases.push((value, arg.expr));
+                            // Rvalue: caller-owned regardless of purity; never elidable.
+                            post_call_releases.push((value, arg.expr, None));
                         }
                     } else {
                         self.retain_if_shared_place(arg.expr, value);
@@ -707,7 +719,9 @@ where
                 }
                 explicit_index += 1;
                 value
-            }
+            };
+            arg_index += 1;
+            value
         });
 
         let instruction = if self.type_of_value(&function).is_closure() {
@@ -717,14 +731,29 @@ where
         };
 
         let value = self.push_instruction(instruction, result_type);
+        let call_id = match value {
+            Value::InstructionResult(id) => Some(id),
+            _ => None,
+        };
         if diverges {
             self.terminate_block(TerminatorInstruction::Unreachable);
         } else {
             for environment in cap_env_releases {
                 self.push_instruction(Instruction::ReleaseClosureEnv(environment), Type::UNIT);
             }
-            for (arg_value, arg_expr) in post_call_releases {
-                self.emit_shared_release_for_expr(arg_value, arg_expr);
+            for (arg_value, arg_expr, retain_id) in post_call_releases {
+                let release = self.emit_shared_release_for_expr(arg_value, arg_expr);
+                if let (Some(retain), Some(call), Some(Value::InstructionResult(release_call))) =
+                    (retain_id, call_id, release)
+                {
+                    let pair = crate::mir::BorrowPair {
+                        retain,
+                        release_call,
+                        call,
+                        implicit_args: implicit_positions.clone(),
+                    };
+                    self.current_function().borrow_pairs.push(pair);
+                }
             }
         }
         value
@@ -756,11 +785,12 @@ where
 
     /// Release a shared handle the caller owns past the call (`release_T` derived from the argument
     /// expression's TC type). No-op for non-shared types.
-    fn emit_shared_release_for_expr(&mut self, value: Value, expr: ExprId) {
+    fn emit_shared_release_for_expr(&mut self, value: Value, expr: ExprId) -> Option<Value> {
         let tc_type = self.types.result.maps.expr_types[&expr].follow(&self.types.bindings);
         if let Some((type_id, type_args)) = self.shared_release_target(&tc_type) {
-            self.emit_release_call(value, type_id, &type_args);
+            return Some(self.emit_release_call(value, type_id, &type_args));
         }
+        None
     }
 
     /// Emit the `IndexTuple cap op_index + CallClosure` sequence for an ability-method call.
@@ -2173,7 +2203,7 @@ where
 
     /// Emit `release_T(handle)` for shared type `type_id` applied to `type_args` (instantiating the
     /// generic release function when the type is generic).
-    fn emit_release_call(&mut self, handle: Value, type_id: TopLevelId, type_args: &[TCType]) {
+    fn emit_release_call(&mut self, handle: Value, type_id: TopLevelId, type_args: &[TCType]) -> Value {
         let release_name = TopLevelName::new(type_id, NameId::RELEASE_FUNCTION);
         let release_id = self.get_definition_id(&release_name);
         let fn_type = Type::Function(Arc::new(crate::mir::FunctionType {
@@ -2187,7 +2217,7 @@ where
             let mir_args = mapvec(type_args, |a| self.convert_type(a, None));
             self.push_instruction(Instruction::Instantiate(release_id, Arc::new(mir_args)), fn_type)
         };
-        self.push_instruction(Instruction::Call { function: callee, arguments: vec![handle] }, Type::UNIT);
+        self.push_instruction(Instruction::Call { function: callee, arguments: vec![handle] }, Type::UNIT)
     }
 
     /// If `typ` resolves to a *non-shared* user-defined type (a product/sum whose inline layout may
