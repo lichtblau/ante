@@ -148,7 +148,20 @@ typedef double ante_f64;
 ";
 
         self.type_declarations += "typedef struct { char _unused; } Unit;\n";
+
+        // Shared heap allocations carry a refcount header immediately *before* the
+        // value. `AllocShared` allocates `{header, value}` and returns a pointer AT `value`; the
+        // header is a max-aligned `size_t` so `value` keeps malloc's alignment and every
+        // load/GEP/store through the pointer is byte-identical. Only `FreeShared` and
+        // retain/release knows the offset: it frees `value_ptr - ANTE_RC_HEADER_SIZE`.  0-arg
+        // shared constructors' backing statics get `count = 0` (the immortal sentinel).
+        self.type_declarations += "#define ANTE_RC_HEADER_SIZE (sizeof(max_align_t))\n";
+        self.type_declarations += "typedef struct { _Alignas(max_align_t) size_t count; } AnteRcHeader;\n";
+
         self.function_declarations += "void* malloc(size_t);\n";
+        // `free` is declared here (matching the stdlib FFI's `Unit free(void*)`) so `FreeShared`
+        // can call it even when the program imports no `Std.C.free` of its own.
+        self.function_declarations += "Unit free(void*);\n";
         self.function_declarations += "void* memcpy(void*, void*, size_t);\n";
         self.function_declarations += "void* memset(void*, int, size_t);\n";
         self.function_declarations += "double fmod(double, double);\n";

@@ -380,6 +380,7 @@ fn fmt_instruction(
         mir::Instruction::ArrayLen(x) => write!(f, "array_len {x}")?,
         mir::Instruction::StackAllocUninit(x) => write!(f, "stack_alloc_uninit {x}")?,
         mir::Instruction::AllocShared(value) => write!(f, "alloc_shared {}", v(value))?,
+        mir::Instruction::FreeShared(value) => write!(f, "free_shared {}", v(value))?,
         mir::Instruction::Extern(name) => write!(f, "extern \"{name}\"")?,
     }
 

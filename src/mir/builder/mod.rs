@@ -713,15 +713,13 @@ where
         }
     }
 
-    /// Emit a call to libc `free` for a heap pointer the drop machinery owns.
+    /// Free a heap pointer the drop machinery owns. These pointers come from [Instruction::
+    /// AllocShared] (closure/capability-method environments), which carry a refcount header before
+    /// the value; [Instruction::FreeShared] subtracts that offset and is null-safe (capture-less
+    /// methods carry a null environment). Raw `Ptr` frees in the stdlib use a plain `free` and are
+    /// unaffected.
     fn emit_free(&mut self, pointer: Value) {
-        let free_type = Type::Function(Arc::new(crate::mir::FunctionType {
-            parameters: vec![Type::POINTER],
-            environment: Type::NO_CLOSURE_ENV,
-            return_type: Type::UNIT,
-        }));
-        let free_function = self.push_instruction(Instruction::Extern("free".to_string()), free_type);
-        self.push_instruction(Instruction::Call { function: free_function, arguments: vec![pointer] }, Type::UNIT);
+        self.push_instruction(Instruction::FreeShared(pointer), Type::UNIT);
     }
 
     /// Like [Self::try_resolve_effect_op] but also returns the op's position within its

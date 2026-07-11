@@ -291,6 +291,7 @@ impl<'local> FunctionContext<'local> {
             },
             Instruction::StackAlloc(v)
             | Instruction::AllocShared(v)
+            | Instruction::FreeShared(v)
             | Instruction::Transmute(v)
             | Instruction::Id(v) => self.remap_value(v),
             Instruction::StackAllocUninit(typ) => {

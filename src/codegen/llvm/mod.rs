@@ -29,6 +29,13 @@ pub struct CodegenLlvmResult {
     pub module_bitcode: Arc<Vec<u8>>,
 }
 
+/// Byte offset of a shared allocation's value from its block start -- the size of the refcount
+/// header. Two i64 words (16 bytes), matching the C backend's max-aligned `AnteRcHeader`, so
+/// `value` lands at a fixed offset regardless of the payload type and
+/// [mir::Instruction::FreeShared] -- which only sees a type-erased pointer -- can subtract it
+/// blindly.
+const RC_HEADER_BYTES: u64 = 16;
+
 pub fn initialize_native_target() {
     let config = InitializationConfig::default();
     Target::initialize_native(&config).unwrap();
@@ -241,10 +248,25 @@ impl<'ctx> ModuleContext<'ctx> {
             },
             ConstantValue::Shared { value, typ } => {
                 // No malloc in a constant initializer, so back the value with a global instead.
+                // Give the static the same fixed 16-byte header `{count, pad, value}` with `count =
+                // 0` (the immortal sentinel), and hand back a constant GEP to the value field so
+                // the pointer sits at the same negative offset as a heap allocation. Statics are
+                // never freed, so `FreeShared` is never emitted for these.
                 let init_value = self.lower_constant(value);
-                let backing = self.module.add_global(self.convert_type(typ), None, "__shared_static");
-                backing.set_initializer(&init_value);
-                backing.as_pointer_value().into()
+                let i64_ty = self.llvm.i64_type();
+                let value_ty = self.convert_type(typ);
+                let struct_ty = self.llvm.struct_type(&[i64_ty.into(), i64_ty.into(), value_ty], false);
+                let init_struct =
+                    self.llvm.const_struct(&[i64_ty.const_zero().into(), i64_ty.const_zero().into(), init_value], false);
+                let backing = self.module.add_global(struct_ty, None, "__shared_static");
+                backing.set_initializer(&init_struct);
+                let i32_ty = self.llvm.i32_type();
+                let value_ptr = unsafe {
+                    backing
+                        .as_pointer_value()
+                        .const_in_bounds_gep(struct_ty, &[i32_ty.const_zero(), i32_ty.const_int(2, false)])
+                };
+                value_ptr.into()
             },
             ConstantValue::Transmute { typ } => Self::undef_value(self.convert_type(typ)),
         }
@@ -575,10 +597,35 @@ impl<'ctx> ModuleContext<'ctx> {
                 self.builder.build_alloca(typ, "").unwrap().into()
             },
             mir::Instruction::AllocShared(value) => {
+                // Allocate `{count, pad, value}` -- a fixed 16-byte header before the value (two i64
+                // words, matching the C backend's max-aligned `AnteRcHeader`, so `value` lands at a
+                // constant offset regardless of `T`). Init count = 1 and return a pointer to the
+                // value field. `FreeShared` frees at `value - RC_HEADER_BYTES`.
                 let value = self.lookup_value(value);
-                let ptr = self.builder.build_malloc(value.get_type(), "").unwrap();
-                self.builder.build_store(ptr, value).unwrap();
-                ptr.into()
+                let i64_ty = self.llvm.i64_type();
+                let struct_ty = self.llvm.struct_type(&[i64_ty.into(), i64_ty.into(), value.get_type()], false);
+                let block = self.builder.build_malloc(struct_ty, "").unwrap();
+                let count_ptr = self.builder.build_struct_gep(struct_ty, block, 0, "").unwrap();
+                self.builder.build_store(count_ptr, i64_ty.const_int(1, false)).unwrap();
+                let value_ptr = self.builder.build_struct_gep(struct_ty, block, 2, "").unwrap();
+                self.builder.build_store(value_ptr, value).unwrap();
+                value_ptr.into()
+            },
+            mir::Instruction::FreeShared(value) => {
+                // Free a shared allocation: The pointer is at the value; the block starts one
+                // header before it, so free `value - RC_HEADER_BYTES`. Null-safe: capture-less
+                // method environments are null, so a `select` yields null (and `free(null)` is a
+                // no-op) rather than freeing a wild `null - offset`.
+                let ptr = self.lookup_value(value).into_pointer_value();
+                let i8_ty = self.llvm.i8_type();
+                let i64_ty = self.llvm.i64_type();
+                let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
+                let block = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
+                let null = ptr.get_type().const_null();
+                let is_null = self.builder.build_int_compare(IntPredicate::EQ, ptr, null, "").unwrap();
+                let block = self.builder.build_select(is_null, null, block, "").unwrap().into_pointer_value();
+                self.builder.build_free(block).unwrap();
+                self.unit_value()
             },
             mir::Instruction::Transmute(value) => self.transmute(value, function, id),
             mir::Instruction::Id(value) => self.lookup_value(value),

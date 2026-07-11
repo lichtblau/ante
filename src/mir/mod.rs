@@ -474,7 +474,18 @@ pub enum Instruction {
     StackAllocUninit(Type),
 
     /// Heap-allocate and store a shared value, returning its pointer.
+    ///
+    /// The allocation carries a refcount header immediately *before* the value (padded to
+    /// max-align), and the returned pointer points at the value. Loads/GEPs/ stores through it are
+    /// unchanged; only [Instruction::FreeShared] knows the offset.
     AllocShared(Value),
+
+    /// Free a heap allocation created by [Instruction::AllocShared]. Its argument points at the
+    /// value; the backing block starts one refcount header before it, so the free subtracts the
+    /// header offset (a backend-specific, ABI-sized constant). Null-safe (capture-less method
+    /// environments are null). Distinct from a plain `free` on a `Ptr` block-start pointer, which
+    /// stays an ordinary extern call. Returns unit.
+    FreeShared(Value),
 
     /// Store a value into a pointer location. Returns unit.
     Store {
@@ -588,6 +599,7 @@ impl Instruction {
             Instruction::StackAlloc(value) => f(value),
             Instruction::StackAllocUninit(_) => (),
             Instruction::AllocShared(value) => f(value),
+            Instruction::FreeShared(value) => f(value),
             Instruction::Store { pointer, value } => two(pointer, value),
             Instruction::Transmute(value) => f(value),
             Instruction::Instantiate(_, _) => (),
