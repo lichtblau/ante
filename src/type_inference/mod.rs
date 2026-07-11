@@ -225,6 +225,10 @@ struct TypeChecker<'local, 'inner> {
     /// dropping the referent would dangle it. Skipping only leaks for now.
     captured_names: FxHashSet<NameId>,
 
+    /// Recursion guard for structural drop expansion (`--auto-drop`): recursive types
+    /// cannot be expanded inline, so expansion stops at a fixed depth (skips leak).
+    drop_expansion_depth: u32,
+
     /// Names defined with `var` or as mutable parameters. Used by closure capture analysis
     /// to wrap mutable captures in a reference type so the closure shares the outer scope's storage.
     mutable_definitions: FxHashSet<NameId>,
@@ -281,6 +285,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_method_name: None,
             drop_type_name: None,
             captured_names: Default::default(),
+            drop_expansion_depth: 0,
             mutable_definitions: Default::default(),
             integer_literal_vars: Default::default(),
             float_literal_vars: Default::default(),
@@ -422,6 +427,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.drop_scopes.clear();
         self.synthesizing_drops = false;
         self.captured_names.clear();
+        self.drop_expansion_depth = 0;
 
         // Iterating over every item type here should be fine for performance.
         // The expected length of `self.item_types` is 1 in the vast majority of cases,

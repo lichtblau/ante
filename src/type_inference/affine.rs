@@ -286,7 +286,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
     }
 
-    fn is_shared_user_defined(&self, typ: &Type) -> bool {
+    pub(super) fn is_shared_user_defined(&self, typ: &Type) -> bool {
         matches!(self.shared_type_flags(typ), Some((true, _)))
     }
 

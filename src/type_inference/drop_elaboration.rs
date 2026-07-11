@@ -207,11 +207,54 @@ impl TypeChecker<'_, '_> {
         if self.type_is_copy(&typ) {
             return None;
         }
-        // No visible Drop impl: skip (leak).
+        // No direct impl: derive a structural drop -- for concrete product types, drop
+        // each field that needs one, in declaration order. `None` when no component needs a
+        // drop, so `needs_drop` pruning falls out naturally. Sums are handled by the
+        // residual-drop increment; anything else is skipped (leak).
         if !self.type_has_drop_impl(&typ) {
-            return None;
+            return self.synthesize_structural_drop(place, &typ, location);
         }
         Some(self.synthesize_drop_call(place, &typ, location))
+    }
+
+    /// Derive the structural drop for a product type as an inline `Sequence` of per-field
+    /// drops (declaration order), recursing through [`Self::try_synthesize_drop_for_place`]
+    /// so nested fields with real impls call them and no-op components prune away. A depth
+    /// cap guards recursive types (e.g. through `Maybe`), which cannot expand inline --
+    /// capped components are skipped (leak, never double-free).
+    fn synthesize_structural_drop(&mut self, place: &MovePath, typ: &Type, location: &Location) -> Option<ExprId> {
+        if self.drop_expansion_depth >= 16 {
+            return None;
+        }
+        self.drop_expansion_depth += 1;
+        let result = self.synthesize_structural_drop_inner(place, typ, location);
+        self.drop_expansion_depth -= 1;
+        result
+    }
+
+    fn synthesize_structural_drop_inner(
+        &mut self, place: &MovePath, typ: &Type, location: &Location,
+    ) -> Option<ExprId> {
+        let fields = self.get_field_types(typ, None);
+        if fields.is_empty() {
+            return None;
+        }
+        let mut ordered: Vec<(String, Type, u32)> =
+            fields.into_iter().map(|(name, (typ, index))| (name.to_string(), typ, index)).collect();
+        ordered.sort_unstable_by_key(|(_, _, index)| *index);
+
+        let mut drops = Vec::new();
+        for (field_name, field_type, _) in ordered {
+            let field_place = MovePath::field(place.clone(), field_name);
+            if let Some(drop) = self.try_synthesize_drop_for_place(&field_place, &field_type, location) {
+                drops.push(drop);
+            }
+        }
+        if drops.is_empty() {
+            return None;
+        }
+        let items = drops.into_iter().map(|expr| cst::SequenceItem { comments: Vec::new(), expr }).collect();
+        Some(self.push_expr(Expr::Sequence(items), Type::UNIT, location.clone()))
     }
 
     /// For each `if`/`match` merge edge, drop the whole locals that a *sibling* branch moved
@@ -430,6 +473,33 @@ impl TypeChecker<'_, '_> {
                 let access = cst::MemberAccess { object, member: field.clone() };
                 self.push_expr(Expr::MemberAccess(access), typ.clone(), location.clone())
             },
+        }
+    }
+
+    /// Reject a user `Drop` impl whose target is a `shared` type: shared handles are
+    /// Copy and never tracked, so there is no coherent point to run the impl. Only checked
+    /// under `--auto-drop` (the whole Drop-semantics package).
+    pub(super) fn reject_shared_drop_impl(&mut self, impl_type: &Type, pattern: PatternId) {
+        if !self.auto_drop {
+            return;
+        }
+        let mut typ = self.follow_type(impl_type).clone();
+        // Impls with implicit constraints are functions returning the ability type.
+        if let Type::Function(function) = &typ {
+            typ = self.follow_type(&function.return_type).clone();
+        }
+        let Type::Application(constructor, args) = &typ else { return };
+        let drop_type_name = self.get_drop_type_name();
+        let is_drop = matches!(
+            self.follow_type(constructor),
+            Type::UserDefined(Origin::TopLevelDefinition(name)) if *name == drop_type_name
+        );
+        if is_drop
+            && let Some(arg) = args.first()
+            && self.is_shared_user_defined(arg)
+        {
+            let location = self.current_context().pattern_location(pattern).clone();
+            self.compiler.accumulate(crate::diagnostics::Diagnostic::DropImplForSharedType { location });
         }
     }
 

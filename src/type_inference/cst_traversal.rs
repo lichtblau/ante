@@ -80,6 +80,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         if definition.implicit {
+            // Auto-drop: custom Drop impls on `shared` types have no coherent run point.
+            if is_top_level {
+                self.reject_shared_drop_impl(&expected_type, definition.pattern);
+            }
+
             // Local definitions without types are fine, they won't cause globally cascading
             // errors on every implicit search site if their type is too general.
             let has_type = !is_top_level

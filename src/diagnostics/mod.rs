@@ -221,6 +221,9 @@ pub enum Diagnostic {
     TopLevelImplicitTypeAnnotationRequired {
         location: Location,
     },
+    DropImplForSharedType {
+        location: Location,
+    },
     ReturnNotInFunction {
         location: Location,
     },
@@ -602,6 +605,9 @@ impl Diagnostic {
             Diagnostic::TopLevelImplicitTypeAnnotationRequired { location: _ } => {
                 "Type annotations are required on top-level implicits".to_string()
             },
+            Diagnostic::DropImplForSharedType { location: _ } => {
+                "Cannot implement Drop for a shared type: shared handles are Copy, so there is no coherent point to run it".to_string()
+            },
             Diagnostic::ExpectedTypeKind { actual, location: _ } => {
                 let n = actual.required_argument_count();
                 let s = if n == 1 { "" } else { "s" };
@@ -721,6 +727,7 @@ impl Diagnostic {
             | Diagnostic::MultipleImplicitsFound { location, .. }
             | Diagnostic::AmbiguousImplicit { location, .. }
             | Diagnostic::TopLevelImplicitTypeAnnotationRequired { location }
+            | Diagnostic::DropImplForSharedType { location }
             | Diagnostic::ExpectedTypeKind { location, .. }
             | Diagnostic::ExpectedKind { location, .. }
             | Diagnostic::ReturnNotInFunction { location }
