@@ -1,0 +1,17 @@
+shared mut type Node =
+    value: I32
+    next: Maybe Node
+
+main () =
+    leaf: Node = Node 10 None
+    n: Node = Node 1 (Some leaf)
+    n.value := 2
+    println n.value              // 2
+    match n.next
+    | Some m -> println m.value  // 10
+    | None -> println 0
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 2
+// 10

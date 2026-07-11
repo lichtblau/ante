@@ -59,6 +59,12 @@ impl Definition {
                 *instruction = Instruction::Id(Value::Integer(IntConstant::Usz(*n as usize)));
             } else if let Instruction::StackAllocUninit(typ) = instruction {
                 typ.select_largest_variants(ptr_size);
+            } else if let Instruction::GetFieldPtr { struct_type, .. } = instruction {
+                // The struct_type is embedded (not an instruction result), so it is not covered
+                // by the instruction_result_types loop above. Without this, a union reachable
+                // through a `shared mut` field's inner layout survives to codegen and ICEs
+                // (`Union types should be removed by the select_largest_variant mir pass`).
+                struct_type.select_largest_variants(ptr_size);
             }
         }
     }
