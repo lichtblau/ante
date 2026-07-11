@@ -59,6 +59,11 @@ substr (var s: String) (begin: Usz) (end: Usz): String =
     if end > Usz s.length or begin >= Usz s.length then
         return ""
 
+    // The result shares s's buffer, so it takes its own reference count (as documented
+    // above). Without this, dropping `s` frees the buffer out from under the result.
+    if s.refcount != null () then
+        ptr_store s.refcount (deref_ptr s.refcount + 1u32)
+
     buf = offset_bytes s.data begin
     len = U32 end - U32 begin
     String buf s.refcount len (s.offset + U32 begin)
@@ -67,8 +72,12 @@ substr (var s: String) (begin: Usz) (end: Usz): String =
 string_of (s: s) {Stream s Char}: String =
     var chars = Vec.of s
     result = String.from_parts (chars.data) (U32 chars.len)
-    // Leak the Vec, it has been transferred to the String
+    // The buffer has been transferred to the String: empty the Vec completely so
+    // dropping it (manually or via --auto-drop) is a no-op rather than walking
+    // transferred elements or freeing the transferred buffer.
     chars.data := null ()
+    chars.len := 0
+    chars.cap := 0
     result
 
 /// Join each string from the stream into one string.

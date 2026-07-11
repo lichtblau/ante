@@ -284,6 +284,20 @@ where
     }
 
     fn expression(&mut self, expr: ExprId) -> Value {
+        let value = self.expression_inner(expr);
+
+        // Auto-drop: lower any synthesized scope-exit drop calls recorded against this
+        // expression (block-fallthrough and function-exit edges), after its value is computed.
+        if let Some(drops) = self.context().post_expr_drops(expr) {
+            for drop_call in drops.clone() {
+                self.expression(drop_call);
+            }
+        }
+
+        value
+    }
+
+    fn expression_inner(&mut self, expr: ExprId) -> Value {
         match &self.context()[expr] {
             cst::Expr::Error => unreachable!("Error expression encountered while generating boxed mir"),
             cst::Expr::Literal(literal) => self.literal(literal, expr),
@@ -1515,6 +1529,13 @@ where
 
     fn return_(&mut self, returned_expression: ExprId) -> Value {
         let value = self.expression(returned_expression);
+        // Auto-drop: scope-exit drops for this return edge run after the returned value is
+        // computed and before the Return terminator.
+        if let Some(drops) = self.context().pre_exit_drops(returned_expression) {
+            for drop_call in drops.clone() {
+                self.expression(drop_call);
+            }
+        }
         self.terminate_block(TerminatorInstruction::Return(value));
         // TODO: We'll need to try to filter these return blocks from
         // matches & ifs, and potentially check for instructions after returns.

@@ -121,6 +121,25 @@ impl MoveTracker {
         self.moved.iter().find(|(moved_path, _)| moved_path.is_descendant_of(path))
     }
 
+    /// Merge into `self` the moves from `other` whose root variable is in `roots`.
+    /// Used (under `--auto-drop`) to surface a lambda body's moves of *captured outer*
+    /// variables to the enclosing scope: closures capture by reference, so a moved capture
+    /// is gone from the outer scope's perspective and must not be dropped there again.
+    /// Over-reporting is safe (a never-run closure's "move" just skips a drop -- a leak),
+    /// under-reporting is a double-free.
+    pub(super) fn merge_moves_rooted_in(&mut self, other: &MoveTracker, roots: &FxHashSet<NameId>) {
+        for (path, location) in &other.moved {
+            if roots.contains(&path.root_variable()) && !self.moved.contains_key(path) {
+                self.moved.insert(path.clone(), location.clone());
+            }
+        }
+        for path in &other.errored {
+            if roots.contains(&path.root_variable()) {
+                self.errored.insert(path.clone());
+            }
+        }
+    }
+
     /// Merge move trackers from multiple branches.
     /// A path is considered moved after the branch if it was moved in the base
     /// OR in ANY branch (since one of the branches will execute).

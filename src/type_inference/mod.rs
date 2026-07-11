@@ -31,6 +31,7 @@ use crate::{
 mod affine;
 mod cst_traversal;
 pub mod dependency_graph;
+mod drop_elaboration;
 pub mod errors;
 mod free_variables;
 pub mod fresh_expr;
@@ -205,6 +206,25 @@ struct TypeChecker<'local, 'inner> {
     /// payload bindings to the scrutinee's place.
     auto_drop: bool,
 
+    /// Innermost-last stack of drop scopes (`--auto-drop`). Each records the owned-root
+    /// locals declared in that scope, in declaration order. See `drop_elaboration.rs`.
+    drop_scopes: Vec<drop_elaboration::DropScope>,
+
+    /// True while a synthesized drop call is being inferred, so drop-elaboration hooks
+    /// (and the explicit-drop-as-move rule) do not observe their own output.
+    synthesizing_drops: bool,
+
+    /// Cached TopLevelName for the Prelude's `Drop.drop` method, lazily resolved on first use.
+    drop_method_name: Option<TopLevelName>,
+
+    /// Cached TopLevelName for the Prelude's `Drop` ability type, lazily resolved on first use.
+    drop_type_name: Option<TopLevelName>,
+
+    /// Names captured (by reference) by any lambda in the current item (`--auto-drop` only).
+    /// Captured names are never auto-dropped: the closure may outlive the owning scope, so
+    /// dropping the referent would dangle it. Skipping only leaks. Narrowed by 1f later.
+    captured_names: FxHashSet<NameId>,
+
     /// Names defined with `var` or as mutable parameters. Used by closure capture analysis
     /// to wrap mutable captures in a reference type so the closure shares the outer scope's storage.
     mutable_definitions: FxHashSet<NameId>,
@@ -256,6 +276,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             binding_places: Default::default(),
             copy_type_name: None,
             auto_drop: crate::incremental::AutoDrop.get(compiler),
+            drop_scopes: Vec::new(),
+            synthesizing_drops: false,
+            drop_method_name: None,
+            drop_type_name: None,
+            captured_names: Default::default(),
             mutable_definitions: Default::default(),
             integer_literal_vars: Default::default(),
             float_literal_vars: Default::default(),
@@ -394,6 +419,9 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.current_item = Some(item_id);
         self.move_tracker = Default::default();
         self.binding_places = Default::default();
+        self.drop_scopes.clear();
+        self.synthesizing_drops = false;
+        self.captured_names.clear();
 
         // Iterating over every item type here should be fine for performance.
         // The expected length of `self.item_types` is 1 in the vast majority of cases,

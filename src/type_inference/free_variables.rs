@@ -55,6 +55,16 @@ impl TypeChecker<'_, '_> {
         }
     }
 
+    /// Auto-drop: record every free variable of the lambda at `id` as captured. Captured
+    /// names are never auto-dropped by their owning scope (see `drop_elaboration.rs`):
+    /// closures capture by reference and may outlive the scope, so dropping the referent
+    /// would dangle the closure. Skipping only leaks, for now.
+    pub(super) fn record_captured_names(&mut self, id: ExprId) {
+        let mut context = FreeVars::default();
+        context.find_free_variables(id, self);
+        self.captured_names.extend(context.free_vars.iter().copied());
+    }
+
     pub(super) fn record_move_captures(&mut self, id: ExprId, self_name: Option<NameId>) {
         let mut context = FreeVars::default();
         if let Some(name) = self_name {

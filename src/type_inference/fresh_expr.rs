@@ -84,6 +84,18 @@ pub struct ExtendedTopLevelContext {
     /// Closures declared with the `move` keyword. These capture by value/move instead of
     /// by reference. Used by the MIR builder to determine capture semantics.
     move_closures: FxHashSet<ExprId>,
+
+    /// Drop calls synthesized by drop elaboration (`--auto-drop`), keyed by the expression
+    /// whose value immediately precedes the scope-exit edge. The MIR builder lowers them
+    /// right after that expression's value is computed. Keys today: a `Sequence` (block
+    /// fallthrough drops for its locals) and a lambda body (function-exit drops for the
+    /// parameters, appended after the body's own block drops when the ids coincide).
+    post_expr_drops: BTreeMap<ExprId, Vec<ExprId>>,
+
+    /// Drop calls synthesized by drop elaboration (`--auto-drop`), lowered between the keyed
+    /// expression's value computation and the control-flow effect that follows it. Keys
+    /// today: the returned expression of a `return` (drops run before the Return terminator).
+    pre_exit_drops: BTreeMap<ExprId, Vec<ExprId>>,
 }
 
 impl<'local, 'innter> TypeChecker<'local, 'innter> {
@@ -128,6 +140,8 @@ impl ExtendedTopLevelContext {
             instantiations: Default::default(),
             closure_environments: Default::default(),
             move_closures: Default::default(),
+            post_expr_drops: Default::default(),
+            pre_exit_drops: Default::default(),
         }
     }
 
@@ -333,10 +347,35 @@ impl ExtendedTopLevelContext {
         if self.move_closures.contains(&from) {
             self.move_closures.insert(to);
         }
+        if let Some(drops) = self.post_expr_drops.get(&from).cloned() {
+            self.post_expr_drops.insert(to, drops);
+        }
+        if let Some(drops) = self.pre_exit_drops.get(&from).cloned() {
+            self.pre_exit_drops.insert(to, drops);
+        }
     }
 
     pub fn is_move_closure(&self, expr: ExprId) -> bool {
         self.move_closures.contains(&expr)
+    }
+
+    /// Append synthesized drop calls to run after `expr`'s value is computed.
+    pub(crate) fn push_post_expr_drops(&mut self, expr: ExprId, drops: Vec<ExprId>) {
+        self.post_expr_drops.entry(expr).or_default().extend(drops);
+    }
+
+    pub fn post_expr_drops(&self, expr: ExprId) -> Option<&Vec<ExprId>> {
+        self.post_expr_drops.get(&expr)
+    }
+
+    /// Append synthesized drop calls to run after `expr`'s value is computed but before the
+    /// exit edge it feeds (e.g. a `return`'s terminator).
+    pub(crate) fn push_pre_exit_drops(&mut self, expr: ExprId, drops: Vec<ExprId>) {
+        self.pre_exit_drops.entry(expr).or_default().extend(drops);
+    }
+
+    pub fn pre_exit_drops(&self, expr: ExprId) -> Option<&Vec<ExprId>> {
+        self.pre_exit_drops.get(&expr)
     }
 }
 
