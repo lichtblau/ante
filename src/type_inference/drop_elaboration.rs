@@ -263,7 +263,15 @@ impl TypeChecker<'_, '_> {
             let free_vars = typ.free_vars(&self.bindings);
             let all_vars_bounded = free_vars.iter().all(|generic| {
                 let target = match generic {
-                    super::generics::Generic::Inferred(id) => Type::Variable(*id),
+                    super::generics::Generic::Inferred(id) => {
+                        // A numeric-literal var (`var v = Vec.empty (); v.push 1`) defaults
+                        // to I32/F64 by item end: synthesize the drop and let its implicit
+                        // Drop search resolve against the defaulted element type.
+                        if self.integer_literal_vars.contains(id) || self.float_literal_vars.contains(id) {
+                            return true;
+                        }
+                        Type::Variable(*id)
+                    },
                     named => Type::Generic(named.clone()),
                 };
                 self.constraint_in_scope_for_generic(&target, drop_ability)
@@ -1176,6 +1184,9 @@ impl TypeChecker<'_, '_> {
             let Some(arg) = args.first() else { continue };
             let arg = arg.follow_all(&merged);
             let satisfiable = match &arg {
+                // A numeric-literal var defaults to I32/F64 by item end; the prelude's
+                // Drop impls cover the defaults, so the constraint will resolve.
+                Type::Variable(id) if self.is_literal_variable(*id) => true,
                 Type::Variable(_) | Type::Generic(_) => self.constraint_in_scope_for_generic(&arg, drop_name),
                 _ => self.type_has_drop_impl(&arg),
             };

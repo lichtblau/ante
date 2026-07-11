@@ -1,4 +1,4 @@
-import Std.HashMap.HashMap, empty, of, clear, insert, print_hashmap, remove, get,
+import Std.HashMap.HashMap, empty, of, clear, insert, print_hashmap, drop_hashmap, remove, get,
     get_entry, stream_map
 import Std.Stream.iter, iota, map, stream_fn, stream_array
 import Std.Hash.Hash, hash_u8
