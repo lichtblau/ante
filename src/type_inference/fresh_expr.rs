@@ -389,6 +389,16 @@ impl ExtendedTopLevelContext {
         self.pre_exit_drops.get(&expr)
     }
 
+    /// Remove the drop-table entries for `expr`. Used when a statement is rewritten in
+    /// place after inference (`tmp = <stmt>; drop (mut tmp)`): its metadata, including any
+    /// drop entries, was copied onto the relocated inner copy, and the builder's generic
+    /// post-expression hook must not fire the stale entries at the outer id a second time.
+    pub(crate) fn clear_expr_drops(&mut self, expr: ExprId) {
+        self.post_expr_drops.remove(&expr);
+        self.pre_exit_drops.remove(&expr);
+        self.implicit_else_drops.remove(&expr);
+    }
+
     /// Record the drops for the implicit else edge of the else-less `if` at `expr`.
     pub(crate) fn push_implicit_else_drops(&mut self, expr: ExprId, drops: Vec<ExprId>) {
         self.implicit_else_drops.entry(expr).or_default().extend(drops);

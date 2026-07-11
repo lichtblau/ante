@@ -121,8 +121,16 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 self.push_drop_scope(super::drop_elaboration::DropScopeKind::Block);
                 let mut result = Type::UNIT;
                 for (i, item) in items.iter().enumerate() {
-                    let expected_type = if i == items.len() - 1 { expected } else { &self.next_type_variable() };
+                    let last = i == items.len() - 1;
+                    let expected_type = if last { expected } else { &self.next_type_variable() };
                     result = self.infer_expr(item.expr, expected_type);
+                    // Auto-drop: a discarded owned statement value drops at statement end.
+                    // (The block's own value belongs to the parent, which sees this block
+                    // as one of its statements -- the rewrite composes.)
+                    if !last {
+                        let statement_type = result.clone();
+                        self.drop_discarded_statement_value(item.expr, &statement_type);
+                    }
                 }
                 // Block-fallthrough drops for this scope's locals. Synthesized before
                 // pop_implicits_scope so delayed `Drop` implicits resolve in this scope.

@@ -324,6 +324,48 @@ impl TypeChecker<'_, '_> {
         }
     }
 
+    /// If the just-inferred, non-final statement `item` produced a discarded owned value,
+    /// rewrite it in place to `tmp = <item>; drop (mut tmp)` so the temporary drops at
+    /// statement end (Rust parity). The statement was already inferred -- its content is
+    /// copied to a fresh id (metadata included) rather than re-inferred, so no moves are
+    /// double-recorded.
+    pub(super) fn drop_discarded_statement_value(&mut self, item: ExprId, typ: &Type) {
+        if !self.drop_elaboration_active() || self.diverges(typ) {
+            return;
+        }
+        let typ = self.follow_type(typ).clone();
+        if typ == Type::ERROR || !typ.free_vars(&self.bindings).is_empty() {
+            return;
+        }
+        if self.type_is_copy(&typ) || !self.type_has_drop_impl(&typ) {
+            return;
+        }
+
+        let location = self.current_extended_context().expr_location(item);
+
+        // Copy the statement's content to a fresh id (we are about to replace its own id),
+        // keeping per-expr metadata (decision trees, member indices, drop tables) -- then
+        // clear the drop tables at the outer id so they cannot fire twice.
+        let content = match self.current_extended_context().extended_expr(item) {
+            Some(expr) => expr.clone(),
+            None => self.current_context()[item].clone(),
+        };
+        let copied = self.push_expr(content, typ.clone(), location.clone());
+        self.current_extended_context_mut().copy_expr_metadata(item, copied);
+        self.current_extended_context_mut().clear_expr_drops(item);
+
+        // `tmp = <copied>; drop (mut tmp)`
+        let (_tmp_path, tmp_name) = self.fresh_variable("drop_tmp", typ.clone(), location.clone());
+        self.name_types.insert(tmp_name, typ.clone());
+        let definition = self.let_binding(tmp_name, copied);
+        let drop_call = self.synthesize_drop_call(&MovePath::Variable(tmp_name), &typ, &location);
+
+        let seq_item = |expr| cst::SequenceItem { comments: Vec::new(), expr };
+        let block = Expr::Sequence(vec![seq_item(definition), seq_item(drop_call)]);
+        self.current_extended_context_mut().insert_expr(item, block);
+        self.expr_types.insert(item, Type::UNIT);
+    }
+
     /// Build and type-check `drop (mut <place>)` in the extended context, returning the call's
     /// `ExprId`. Checking it runs the full pipeline, so the `Drop` impl is resolved and
     /// materialized by implicit search (possibly delayed to the enclosing scope's pop) and the
