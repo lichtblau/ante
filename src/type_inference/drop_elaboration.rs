@@ -511,6 +511,38 @@ impl TypeChecker<'_, '_> {
         self.expr_types.insert(item, Type::UNIT);
     }
 
+    /// Auto-ref of an *rvalue* in call-argument position (`println ("a" ++ "b")`): the callee
+    /// only borrows through the reference, so the caller owns the temporary -- but no scope
+    /// ever dropped it (the string-interpolation leak class). Bind the rvalue to a fresh
+    /// local inside the reference (`ref (tmp = <rvalue>; tmp)`) and queue `drop (mut tmp)`
+    /// for [`infer_call`] to attach as a post-expr drop on the enclosing call, so the
+    /// temporary dies right after the call returns. Places are untouched (their owner drops
+    /// at scope exit -- the auto-ref move-restore already handles them); Copy or otherwise
+    /// undroppable types synthesize no drop and stay unwrapped.
+    pub(super) fn bind_autoref_temp_for_drop(&mut self, rhs: ExprId, element_type: &Type, location: &Location) -> ExprId {
+        if self.call_argument_depth == 0 || !self.drop_elaboration_active() {
+            return rhs;
+        }
+        // Only rvalues: a place already has an owner.
+        if self.try_build_move_path(rhs).is_some() {
+            return rhs;
+        }
+        let typ = self.follow_type(element_type).clone();
+        if typ == Type::ERROR || !typ.free_vars(&self.bindings).is_empty() {
+            return rhs;
+        }
+        let (_tmp_path, tmp_name) = self.fresh_variable("autoref_tmp", typ.clone(), location.clone());
+        self.name_types.insert(tmp_name, typ.clone());
+        let Some(drop_call) = self.try_synthesize_drop_for_place(&MovePath::Variable(tmp_name), &typ, location)
+        else {
+            return rhs;
+        };
+        let tmp_var = self.synthesize_place_expr(&MovePath::Variable(tmp_name), &typ, location);
+        let block = self.let_binding_and_body(tmp_name, rhs, tmp_var);
+        self.pending_autoref_temp_drops.push(drop_call);
+        block
+    }
+
     /// Build and type-check `drop (mut <place>)` in the extended context, returning the call's
     /// `ExprId`. Checking it runs the full pipeline, so the `Drop` impl is resolved and
     /// materialized by implicit search (possibly delayed to the enclosing scope's pop) and the

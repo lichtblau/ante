@@ -1,0 +1,41 @@
+// Auto-ref'd rvalue temporaries in argument position.
+// `println (x: ref t)` borrows its argument: a bound argument is dropped by its
+// owner's scope exit, but an rvalue argument (`"a" ++ "b"`, an interpolation
+// result) is a caller-owned temporary nobody dropped. The coercion now binds
+// such temporaries (`ref (tmp = <rvalue>; tmp)`) and drops them right after
+// the enclosing call returns.
+
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+mk (tag: I32): R = R tag
+
+peek (r: ref R): I32 = r.tag
+
+main () =
+    // ref-param call with an rvalue temporary: drop fires after the call
+    print "peeked "
+    println (peek (mk 7))
+
+    // heap temporaries: interpolation and bare concatenation results
+    n: I32 = 42
+    println "n=${n}"
+    println ("a" ++ "b")
+
+    // nested: the inner call's result is the outer call's temp
+    print "twice "
+    println (peek (mk (peek (mk 9))))
+
+// args: --delete-binary --no-color
+// expected stdout:
+// peeked drop 7
+// 7
+// n=42
+// ab
+// twice drop 9
+// drop 9
+// 9

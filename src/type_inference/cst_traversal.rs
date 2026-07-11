@@ -47,11 +47,20 @@ struct LambdaOptions {
 
 impl<'local, 'inner> TypeChecker<'local, 'inner> {
     pub(super) fn check_definition(&mut self, definition: &Definition, is_top_level: bool) {
-        let next_id = &mut self.next_type_variable_id.get();
-        let expected_type =
-            get_partial_type(definition, self.current_context(), self.current_resolve(), self.compiler, next_id);
-
-        self.next_type_variable_id.set(*next_id);
+        // A synthesized definition (e.g. an auto-ref temporary binding hit by a coercion
+        // re-check) has its pattern/rhs in the extended context, which get_partial_type's
+        // base-context reads cannot see (and would panic indexing). Synthesized bindings
+        // are always plain un-annotated variables, so their partial type is a fresh
+        // variable -- exactly what get_partial_type returns for that shape.
+        let expected_type = if self.current_extended_context().extended_pattern(definition.pattern).is_some() {
+            self.next_type_variable()
+        } else {
+            let next_id = &mut self.next_type_variable_id.get();
+            let typ =
+                get_partial_type(definition, self.current_context(), self.current_resolve(), self.compiler, next_id);
+            self.next_type_variable_id.set(*next_id);
+            typ
+        };
 
         self.check_pattern(definition.pattern, &expected_type);
 
@@ -651,11 +660,17 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         // Infer the arguments. For `+ - * / %`, allow auto-deref of operands.
+        // Auto-drop: track that we're in argument position so an auto-ref'd rvalue argument
+        // gets bound to a droppable temporary (bind_autoref_temp_for_drop); the queued drops
+        // are drained below once the call's return type is known.
+        let pending_temp_drops_before = self.pending_autoref_temp_drops.len();
         let deref_operands = self.is_arithmetic_operator(call.function);
+        self.call_argument_depth += 1;
         for (index, (arg, expected_arg_type)) in call.arguments.iter().zip(expected_parameter_types).enumerate() {
             let kind = TypeErrorKind::CallArgument { index };
             self.infer_and_coerce(arg.expr, &expected_arg_type.typ, kind, deref_operands);
         }
+        self.call_argument_depth -= 1;
 
         // FIXME: Another related hack. Try to bind the return type now, this time if it has no unbound
         // type variables. Doing so results in some better results when resolving implicits early below.
@@ -672,6 +687,24 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
 
         // A lot of Extract implicits (.[]) break without this
         self.resolve_new_delayed_implicits(implicit_count_before_call);
+
+        // Auto-drop: attach the auto-ref temporary drops queued by this call's *argument*
+        // coercions, so they run right after the call returns. This must happen BEFORE the
+        // return coercion below: when the expected type is a reference pushed down from an
+        // enclosing call's parameter, that coercion auto-refs THIS call's own result. That
+        // temporary belongs to the enclosing call and must bubble to its drain (draining it
+        // here would drop it before the enclosing call runs). Skipped (leaking, never UB)
+        // when the call could hand back a pointer into the temporary (a reference-typed or
+        // still-unresolved return) or when the call diverges (its block is terminated).
+        if self.pending_autoref_temp_drops.len() > pending_temp_drops_before {
+            let drops = self.pending_autoref_temp_drops.split_off(pending_temp_drops_before);
+            let returned = self.follow_type(&actual_return_type).clone();
+            let may_alias_temp = returned.reference_element(&self.bindings).is_some()
+                || matches!(returned, Type::Variable(_));
+            if !may_alias_temp && !self.diverges(&returned) {
+                self.current_extended_context_mut().push_post_expr_drops(call_expr, drops);
+            }
+        }
 
         // Ideally we only coerce on call arguments, but this is currently needed.
         // TODO: Take another stab at cleaning up these call rules, but this took much iteration.

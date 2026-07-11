@@ -225,11 +225,22 @@ struct TypeChecker<'local, 'inner> {
     /// dropping the referent would dangle it. Skipping only leaks for now.
     captured_names: FxHashSet<NameId>,
 
+    /// Nonzero while inferring a call's argument list (`--auto-drop` only). Auto-ref of an
+    /// *rvalue* argument (`println ("a" ++ "b")`) creates a caller-owned temporary that no
+    /// scope would otherwise drop; the coercion binds it to a fresh local and queues its
+    /// drop here, and `infer_call` drains the queue into post-expr drops on the call -- the
+    /// temporary dies right after the call returns (the string-interpolation leak class).
+    call_argument_depth: u32,
+
+    /// Drop calls (one per auto-ref'd rvalue temporary) queued during the current call's
+    /// argument inference; see [Self::call_argument_depth].
+    pending_autoref_temp_drops: Vec<ExprId>,
+
     /// Effect-continuation binding names -- a handler branch's `resume` (`--auto-drop` only).  A
     /// `resume` continuation is a bare-`Pointer`-env closure would otherwise match it), but its
     /// environment is supplied by the coroutine lowering -- a pointer to live coroutine/handler
     /// state, **not** an `AllocShared` refcount block. Retaining or releasing it would read a bogus
-    /// header off the stack.
+    /// header off the stack. Excluded from closure-env RC for now.
     effect_continuation_names: FxHashSet<NameId>,
 
     /// Recursion guard for structural drop expansion (`--auto-drop`): recursive types
@@ -317,6 +328,8 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_method_name: None,
             drop_type_name: None,
             captured_names: Default::default(),
+            call_argument_depth: 0,
+            pending_autoref_temp_drops: Vec::new(),
             effect_continuation_names: Default::default(),
             drop_expansion_depth: 0,
             copy_check_depth: 0,
@@ -465,6 +478,8 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.drop_scopes.clear();
         self.synthesizing_drops = false;
         self.captured_names.clear();
+        self.call_argument_depth = 0;
+        self.pending_autoref_temp_drops.clear();
         self.effect_continuation_names.clear();
         self.drop_expansion_depth = 0;
         self.function_local_names.clear();
@@ -854,8 +869,15 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     fn auto_ref_coercion(&mut self, expr: ExprId, kind: ReferenceKind, element_type: Type) -> cst::Expr {
         let location = expr.locate(self);
         let original_expr = self.current_extended_context()[expr].clone();
-        let rhs = self.push_expr(original_expr, element_type, location);
+        let rhs = self.push_expr(original_expr, element_type.clone(), location.clone());
         self.current_extended_context_mut().copy_expr_metadata(expr, rhs);
+        // The metadata copy above includes any drop tables keyed on `expr` (e.g. an inner
+        // call's auto-ref temporary drops). They now live on `rhs` -- clear them at the
+        // outer id or the builder lowers them twice (a double-drop).
+        self.current_extended_context_mut().clear_expr_drops(expr);
+        // Auto-drop: an auto-ref'd rvalue in argument position is a caller-owned temporary;
+        // bind it so its drop can run after the enclosing call (see bind_autoref_temp_for_drop).
+        let rhs = self.bind_autoref_temp_for_drop(rhs, &element_type, &location);
         cst::Expr::Reference(cst::Reference { kind, rhs })
     }
 
@@ -1234,9 +1256,10 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             return;
         }
 
-        let context = self.current_context();
-        let cst::Pattern::Variable(name) = context[pattern] else { return };
-        if context[name].as_str() != "main" {
+        // Extended-context-aware reads: synthesized definitions (auto-ref temporaries) have
+        // patterns/names the base context cannot index.
+        let cst::Pattern::Variable(name) = *self.pattern_of(pattern) else { return };
+        if self.current_extended_context()[name].as_str() != "main" {
             return;
         }
 
