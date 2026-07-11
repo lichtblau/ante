@@ -641,7 +641,17 @@ where
                 if is_drop_call && argument.is_implicit {
                     self.lower_drop_capability(argument.expr, &mut cap_env_frees)
                 } else {
-                    self.expression(argument.expr)
+                    let value = self.expression(argument.expr);
+                    // Callee-owns retain, same as the plain-call path below: an effect-op or
+                    // ability-method argument lands in an owned parameter (the handler arm or
+                    // impl method releases it), so a shared handle passed here needs its
+                    // refcount bumped or the arm's release double-frees the caller's handle.
+                    // Implicit capability tuples are excluded: they are not shared handles,
+                    // and their ownership is audited separately.
+                    if !argument.is_implicit {
+                        self.retain_if_shared_place(argument.expr, value);
+                    }
+                    value
                 }
             });
 

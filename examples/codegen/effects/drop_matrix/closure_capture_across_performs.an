@@ -1,0 +1,45 @@
+// A closure capturing an owned String is called on both sides of a suspension.
+//
+// The calls work correctly across the resume; the captured String leaks 21 bytes.
+// Effects do not cause leaks beyond that.
+
+ability Ask =
+    ask: resume fn Unit -> I32
+
+compute {Ask} : I32 =
+    part = "closure payload" ++ "!"
+    shout = fn () ->
+        print "shout "
+        println part
+    shout ()
+    x = ask ()
+    shout ()
+    x
+
+run (f: fn Ask => I32): I32 =
+    handler h for ask () ->
+        println "arm"
+        res = resume 1
+        res
+    f h
+
+control () =
+    part = "control payload" ++ "!"
+    shout = fn () ->
+        print "control "
+        println part
+    shout ()
+    shout ()
+
+main () =
+    println (run compute)
+    control ()
+
+// args: --delete-binary --no-color
+// expected stdout:
+// shout closure payload!
+// arm
+// shout closure payload!
+// 1
+// control control payload!
+// control control payload!
