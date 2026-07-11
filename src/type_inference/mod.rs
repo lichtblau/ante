@@ -229,6 +229,10 @@ struct TypeChecker<'local, 'inner> {
     /// cannot be expanded inline, so expansion stops at a fixed depth (skips leak).
     drop_expansion_depth: u32,
 
+    /// Recursion guard for Copy-impl constraint checking (`--auto-drop`); at the cap a
+    /// type is assumed non-Copy (tracked and dropped -- the safe direction).
+    copy_check_depth: u32,
+
     /// Names defined with `var` or as mutable parameters. Used by closure capture analysis
     /// to wrap mutable captures in a reference type so the closure shares the outer scope's storage.
     mutable_definitions: FxHashSet<NameId>,
@@ -286,6 +290,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_type_name: None,
             captured_names: Default::default(),
             drop_expansion_depth: 0,
+            copy_check_depth: 0,
             mutable_definitions: Default::default(),
             integer_literal_vars: Default::default(),
             float_literal_vars: Default::default(),

@@ -238,12 +238,19 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                     found = true;
                     return true;
                 }
-                // Also check if it's a function whose return type matches
+                // Also check if it's a function whose return type matches. Under --auto-drop
+                // the candidate's own implicit constraints must hold too: `copy_maybe
+                // {Copy a}: Copy (Maybe a)` must not make `Maybe NonCopy` Copy, or its
+                // payload would never be tracked or dropped. (Without the flag the historic
+                // constraint-blind behavior is kept so default checking is unchanged.)
                 if let Type::Function(f) = &name_type
-                    && self.try_unify(&f.return_type, &copy_of_t).is_ok()
+                    && let Ok(bindings) = self.try_unify(&f.return_type, &copy_of_t)
                 {
-                    found = true;
-                    return true;
+                    let f = f.clone();
+                    if !self.auto_drop || self.copy_impl_constraints_hold(&f, bindings) {
+                        found = true;
+                        return true;
+                    }
                 }
                 false
             });
@@ -253,6 +260,43 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         false
+    }
+
+    /// Check that a candidate Copy impl's implicit `{Copy x}` constraints are satisfiable
+    /// under the unification `bindings` produced by matching its return type. Non-Copy
+    /// constraints are assumed satisfiable (over-approximation, matching the search proper).
+    /// A depth guard bounds constraint-driven recursion; running out means "not Copy" --
+    /// the safe direction for drops (the value gets tracked and dropped, not duplicated).
+    fn copy_impl_constraints_hold(
+        &mut self, function: &crate::type_inference::types::FunctionType, bindings: super::types::TypeBindings,
+    ) -> bool {
+        if self.copy_check_depth >= 8 {
+            return false;
+        }
+        self.copy_check_depth += 1;
+        let mut merged = self.bindings.clone();
+        merged.extend(bindings);
+        let copy_name = self.get_copy_type_name();
+        let mut holds = true;
+        for parameter in function.parameters.iter().filter(|parameter| parameter.is_implicit) {
+            let constraint = parameter.typ.follow_all(&merged);
+            let Type::Application(constructor, args) = &constraint else { continue };
+            let is_copy_constraint = matches!(
+                constructor.follow(&merged),
+                Type::UserDefined(Origin::TopLevelDefinition(name)) if *name == copy_name
+            );
+            if !is_copy_constraint {
+                continue;
+            }
+            let Some(arg) = args.first() else { continue };
+            let arg = arg.follow_all(&merged);
+            if !self.type_is_copy(&arg) {
+                holds = false;
+                break;
+            }
+        }
+        self.copy_check_depth -= 1;
+        holds
     }
 
     fn is_ability(&self, typ: &Type) -> bool {

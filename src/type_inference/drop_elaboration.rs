@@ -131,7 +131,7 @@ impl TypeChecker<'_, '_> {
         }
     }
 
-    fn collect_pattern_binding_names(&self, id: PatternId, out: &mut Vec<NameId>) {
+    pub(super) fn collect_pattern_binding_names(&self, id: PatternId, out: &mut Vec<NameId>) {
         match self.pattern_of(id).as_ref() {
             cst::Pattern::Variable(name) | cst::Pattern::MethodName { item_name: name, .. } => {
                 if !out.contains(name) {
@@ -170,16 +170,9 @@ impl TypeChecker<'_, '_> {
                 continue;
             }
             let place = MovePath::Variable(name);
-            if self.move_tracker.is_moved(&place).is_some() {
-                continue;
-            }
-            // Partially-moved: residual drops are a later increment. Skipping leaks the
-            // remaining fields but never double-frees the moved ones.
-            if self.move_tracker.has_child_moved(&place).is_some() {
-                continue;
-            }
             let Some(typ) = self.name_types.get(&name).cloned() else { continue };
-            if let Some(drop) = self.try_synthesize_drop_for_place(&place, &typ, location) {
+            let tracker = self.move_tracker.clone();
+            if let Some(drop) = self.synthesize_partial_drop(&place, &typ, &tracker, location) {
                 drops.push(drop);
             }
         }
@@ -237,7 +230,9 @@ impl TypeChecker<'_, '_> {
     ) -> Option<ExprId> {
         let fields = self.get_field_types(typ, None);
         if fields.is_empty() {
-            return None;
+            // Not a product: derive a sum drop (an exhaustive match dropping each variant's
+            // payloads) if it is an enum; anything else is skipped (leak).
+            return self.synthesize_sum_drop(place, typ, None, location);
         }
         let mut ordered: Vec<(String, Type, u32)> =
             fields.into_iter().map(|(name, (typ, index))| (name.to_string(), typ, index)).collect();
@@ -275,11 +270,9 @@ impl TypeChecker<'_, '_> {
             let mut drops = Vec::new();
             for name in &candidates {
                 let place = MovePath::Variable(*name);
-                if tracker.is_moved(&place).is_none() && tracker.has_child_moved(&place).is_none() {
-                    let Some(typ) = self.name_types.get(name).cloned() else { continue };
-                    if let Some(drop) = self.try_synthesize_drop_for_place(&place, &typ, &location) {
-                        drops.push(drop);
-                    }
+                let Some(typ) = self.name_types.get(name).cloned() else { continue };
+                if let Some(drop) = self.synthesize_partial_drop(&place, &typ, tracker, &location) {
+                    drops.push(drop);
                 }
             }
             if !drops.is_empty() {
@@ -303,7 +296,7 @@ impl TypeChecker<'_, '_> {
             // The implicit edge's state is `pre_branch`, which owns every candidate.
             let Some(typ) = self.name_types.get(&name).cloned() else { continue };
             let place = MovePath::Variable(name);
-            if let Some(drop) = self.try_synthesize_drop_for_place(&place, &typ, location) {
+            if let Some(drop) = self.synthesize_partial_drop(&place, &typ, pre_branch, location) {
                 drops.push(drop);
             }
         }
@@ -355,14 +348,10 @@ impl TypeChecker<'_, '_> {
         {
             return;
         }
-        // Overwriting a moved-out hole (or a partially-moved value: residuals are a later
-        // increment): nothing to drop.
-        if self.move_tracker.is_moved(&place).is_some() || self.move_tracker.has_child_moved(&place).is_some() {
-            return;
-        }
         let Some(lhs_type) = self.expr_types.get(&assignment.lhs).cloned() else { return };
         let location = self.current_extended_context().expr_location(assignment.lhs);
-        if let Some(drop) = self.try_synthesize_drop_for_place(&place, &lhs_type, &location) {
+        let tracker = self.move_tracker.clone();
+        if let Some(drop) = self.synthesize_partial_drop(&place, &lhs_type, &tracker, &location) {
             self.current_extended_context_mut().push_pre_exit_drops(id, vec![drop]);
         }
     }
@@ -380,11 +369,20 @@ impl TypeChecker<'_, '_> {
         if typ == Type::ERROR || !typ.free_vars(&self.bindings).is_empty() {
             return;
         }
-        if self.type_is_copy(&typ) || !self.type_has_drop_impl(&typ) {
+        if self.type_is_copy(&typ) {
             return;
         }
 
         let location = self.current_extended_context().expr_location(item);
+
+        // The temporary's drop goes through the unified synthesis (real impl or derived
+        // structural/sum drop). If nothing needs dropping, leave the statement alone.
+        let (_tmp_path, tmp_name) = self.fresh_variable("drop_tmp", typ.clone(), location.clone());
+        self.name_types.insert(tmp_name, typ.clone());
+        let Some(drop_call) = self.try_synthesize_drop_for_place(&MovePath::Variable(tmp_name), &typ, &location)
+        else {
+            return;
+        };
 
         // Copy the statement's content to a fresh id (we are about to replace its own id),
         // keeping per-expr metadata (decision trees, member indices, drop tables) -- then
@@ -398,10 +396,7 @@ impl TypeChecker<'_, '_> {
         self.current_extended_context_mut().clear_expr_drops(item);
 
         // `tmp = <copied>; drop (mut tmp)`
-        let (_tmp_path, tmp_name) = self.fresh_variable("drop_tmp", typ.clone(), location.clone());
-        self.name_types.insert(tmp_name, typ.clone());
         let definition = self.let_binding(tmp_name, copied);
-        let drop_call = self.synthesize_drop_call(&MovePath::Variable(tmp_name), &typ, &location);
 
         let seq_item = |expr| cst::SequenceItem { comments: Vec::new(), expr };
         let block = Expr::Sequence(vec![seq_item(definition), seq_item(drop_call)]);
@@ -474,6 +469,158 @@ impl TypeChecker<'_, '_> {
                 self.push_expr(Expr::MemberAccess(access), typ.clone(), location.clone())
             },
         }
+    }
+
+    /// Derive the drop for a (possibly partially-moved) sum-typed place: an exhaustive
+    /// synthesized `match` binding each variant's payloads to fresh names and dropping the
+    /// ones still owned. When `tracker` is given (residual drops), payloads whose
+    /// variant-qualified path is moved are left alone -- sound because `place.Some#0` can only be
+    /// moved on executions where the tag was `Some`. Returns `None` when no variant payload needs
+    /// dropping (pruning).
+    fn synthesize_sum_drop(
+        &mut self, place: &MovePath, typ: &Type, tracker: Option<&MoveTracker>, location: &Location,
+    ) -> Option<ExprId> {
+        let typ = self.follow_type(typ).clone();
+        let (type_name, args) = match &typ {
+            Type::UserDefined(Origin::TopLevelDefinition(name)) => (*name, None),
+            Type::Application(constructor, args) => match self.follow_type(constructor) {
+                Type::UserDefined(Origin::TopLevelDefinition(name)) => (*name, Some(args.clone())),
+                _ => return None,
+            },
+            _ => return None,
+        };
+
+        // Variant NameIds come from the raw item (for constructor path origins); payload
+        // types come from `type_body` (generics substituted). Same declaration order.
+        let (raw_item, _) = crate::incremental::GetItemRaw(type_name.top_level_item).get(self.compiler);
+        let cst::TopLevelItemKind::TypeDefinition(type_definition) = &raw_item.kind else { return None };
+        let cst::TypeDefinitionBody::Enum(raw_variants) = &type_definition.body else { return None };
+        let raw_variant_names: Vec<NameId> = raw_variants.iter().map(|(name, _)| *name).collect();
+
+        let body = type_name.top_level_item.type_body(args.as_deref().map(|a| &a[..]), self.compiler);
+        let super::type_body::TypeBody::Sum(variants) = body else { return None };
+        if raw_variant_names.len() != variants.len() {
+            return None;
+        }
+
+        let mut any_drops = false;
+        let mut cases = Vec::new();
+        for (variant_name_id, (variant_name, payload_types)) in raw_variant_names.iter().zip(&variants) {
+            let mut argument_patterns = Vec::new();
+            let mut drops = Vec::new();
+            for (index, payload_type) in payload_types.iter().enumerate() {
+                let (_, payload_binding) = self.fresh_variable("drop_payload", payload_type.clone(), location.clone());
+                self.name_types.insert(payload_binding, payload_type.clone());
+                let pattern = self.push_pattern(cst::Pattern::Variable(payload_binding), location.clone());
+                argument_patterns.push(pattern);
+
+                // Residual filter: this payload's qualified place may already be moved.
+                let qualified = MovePath::field(place.clone(), format!("{variant_name}#{index}"));
+                if let Some(tracker) = tracker
+                    && tracker.is_moved(&qualified).is_some()
+                {
+                    continue;
+                }
+                let payload_place = MovePath::Variable(payload_binding);
+                if let Some(drop) = self.try_synthesize_drop_for_place(&payload_place, payload_type, location) {
+                    drops.push(drop);
+                }
+            }
+
+            let constructor_path = self.push_path(
+                cst::Path { components: vec![(variant_name.as_ref().clone(), location.clone())] },
+                self.next_type_variable(),
+                location.clone(),
+            );
+            let variant_top_level_name = TopLevelName::new(type_name.top_level_item, *variant_name_id);
+            self.current_extended_context_mut()
+                .insert_path_origin(constructor_path, Origin::TopLevelDefinition(variant_top_level_name));
+            let pattern = self.push_pattern(cst::Pattern::Constructor(constructor_path, argument_patterns), location.clone());
+
+            let body = if drops.is_empty() {
+                self.push_expr(Expr::Literal(cst::Literal::Unit), Type::UNIT, location.clone())
+            } else {
+                any_drops = true;
+                let items = drops.into_iter().map(|expr| cst::SequenceItem { comments: Vec::new(), expr }).collect();
+                self.push_expr(Expr::Sequence(items), Type::UNIT, location.clone())
+            };
+            cases.push((pattern, body));
+        }
+
+        if !any_drops {
+            return None;
+        }
+
+        let scrutinee = self.synthesize_place_expr(place, &typ, location);
+        let match_expr =
+            self.push_expr(Expr::Match(cst::Match { expression: scrutinee, cases }), Type::UNIT, location.clone());
+
+        let old_synthesizing = std::mem::replace(&mut self.synthesizing_drops, true);
+        let old_check = std::mem::replace(&mut self.suppress_move_check, true);
+        let old_record = std::mem::replace(&mut self.suppress_move_record, true);
+        self.check_expr(match_expr, &Type::UNIT, TypeErrorKind::General);
+        self.suppress_move_record = old_record;
+        self.suppress_move_check = old_check;
+        self.synthesizing_drops = old_synthesizing;
+
+        Some(match_expr)
+    }
+
+    /// Tracker-aware drop synthesis for one place: whole drop if fully owned, residual drop
+    /// (unmoved components only) if partially moved, nothing if moved. Every skip leaks,
+    /// never double-frees.
+    pub(super) fn synthesize_partial_drop(
+        &mut self, place: &MovePath, typ: &Type, tracker: &MoveTracker, location: &Location,
+    ) -> Option<ExprId> {
+        if tracker.is_moved(place).is_some() {
+            return None;
+        }
+        if tracker.has_child_moved(place).is_none() {
+            return self.try_synthesize_drop_for_place(place, typ, location);
+        }
+
+        // Partially moved: drop the unmoved remainder.
+        if self.captured_names.contains(&place.root_variable()) {
+            return None;
+        }
+        let typ = self.follow_type(typ).clone();
+        if typ == Type::ERROR || !typ.free_vars(&self.bindings).is_empty() || self.type_is_copy(&typ) {
+            return None;
+        }
+        // A type with its own Drop impl cannot run it on a partially-moved value (Rust
+        // forbids partial moves out of such types; a matching checker rule is future work).
+        if self.type_has_drop_impl(&typ) {
+            return None;
+        }
+        if self.drop_expansion_depth >= 16 {
+            return None;
+        }
+        self.drop_expansion_depth += 1;
+
+        let fields = self.get_field_types(&typ, None);
+        let result = if fields.is_empty() {
+            self.synthesize_sum_drop(place, &typ, Some(tracker), location)
+        } else {
+            let mut ordered: Vec<(String, Type, u32)> =
+                fields.into_iter().map(|(name, (typ, index))| (name.to_string(), typ, index)).collect();
+            ordered.sort_unstable_by_key(|(_, _, index)| *index);
+            let mut drops = Vec::new();
+            for (field_name, field_type, _) in ordered {
+                let field_place = MovePath::field(place.clone(), field_name);
+                if let Some(drop) = self.synthesize_partial_drop(&field_place, &field_type, tracker, location) {
+                    drops.push(drop);
+                }
+            }
+            if drops.is_empty() {
+                None
+            } else {
+                let items = drops.into_iter().map(|expr| cst::SequenceItem { comments: Vec::new(), expr }).collect();
+                Some(self.push_expr(Expr::Sequence(items), Type::UNIT, location.clone()))
+            }
+        };
+
+        self.drop_expansion_depth -= 1;
+        result
     }
 
     /// Reject a user `Drop` impl whose target is a `shared` type: shared handles are

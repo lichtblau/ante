@@ -326,8 +326,22 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             },
             Pattern::TypeAnnotation(inner, _) => self.assign_binding_places(*inner, place),
             Pattern::Or(alts) => {
-                for alt in alts {
-                    self.assign_binding_places(*alt, place.clone());
+                if self.auto_drop {
+                    // Or-alternatives may bind the same name under different variant
+                    // qualifications; the runtime tag decides which one actually moved.
+                    // Conservatively alias every binding to the whole or-place so residual
+                    // drop glue never re-drops a maybe-moved payload (a leak instead).
+                    let mut names = Vec::new();
+                    for alt in alts {
+                        self.collect_pattern_binding_names(*alt, &mut names);
+                    }
+                    for name in names {
+                        self.binding_places.insert(name, place.clone());
+                    }
+                } else {
+                    for alt in alts {
+                        self.assign_binding_places(*alt, place.clone());
+                    }
                 }
             },
             Pattern::Constructor(path, args) => {
@@ -347,6 +361,24 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 }
             },
             Pattern::Literal(_) | Pattern::Error => (),
+        }
+    }
+
+    /// True if the pattern contains an or-pattern that binds any name. Such patterns make
+    /// variant-qualified sub-place tracking unreliable (the same binding may alias different
+    /// variants' payloads), so match-binding linking is disabled for the whole match.
+    fn pattern_contains_or_bindings(&self, id: PatternId) -> bool {
+        match self.pattern_of(id).as_ref() {
+            Pattern::Or(alts) => {
+                let mut names = Vec::new();
+                for alt in alts {
+                    self.collect_pattern_binding_names(*alt, &mut names);
+                }
+                !names.is_empty()
+            },
+            Pattern::Constructor(_, args) => args.iter().any(|arg| self.pattern_contains_or_bindings(*arg)),
+            Pattern::Alias(_, inner) | Pattern::TypeAnnotation(inner, _) => self.pattern_contains_or_bindings(*inner),
+            Pattern::Variable(_) | Pattern::MethodName { .. } | Pattern::Literal(_) | Pattern::Error => false,
         }
     }
 
@@ -1102,7 +1134,17 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // under a `ref`/`mut`/`imm`/`uniq` (or pointer) scrutinee are not owned sub-places, and
         // matching through a borrow must stay move-free (e.g. `Hash.hash` matches on `ref t`).
         // The root must be owned too: `match s.field` where `s` is a reference borrows, not owns.
+        //
+        // Arms with or-patterns that bind payloads disable linking for the whole match: the
+        // alternatives may qualify one binding under different variants, so sub-place tracking
+        // is unreliable -- the match stays a consuming use instead (the scrutinee's whole-value
+        // move is not rolled back; bindings are independent owners).
+        let linking_disabled = scrutinee_place.is_some()
+            && match_.cases.iter().any(|(pattern, _)| self.pattern_contains_or_bindings(*pattern));
         let scrutinee_place = scrutinee_place.filter(|place| {
+            if linking_disabled {
+                return false;
+            }
             let root_type = self.name_types.get(&place.root_variable()).cloned();
             let root_is_indirect = root_type.is_some_and(|typ| {
                 typ.reference_element(&self.bindings).is_some() || typ.pointer_element(&self.bindings).is_some()
@@ -1155,7 +1197,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
 
         // Now compile the match into a decision tree. The `match expr | ...` expression will be
         // replaced with `<fresh> = expr; <decision tree>`
-        let location = self.current_context().expr_location(match_.expression).clone();
+        let location = self.current_extended_context().expr_location(match_.expression);
         let (match_var, match_var_name) = self.fresh_variable("match_var", expr_type.clone(), location.clone());
 
         // `<match_var> = <expression being matched>`

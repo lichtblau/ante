@@ -242,6 +242,14 @@ impl ExtendedTopLevelContext {
         }
     }
 
+    /// Retrieve the location of the corresponding [Pattern] of the given [PatternId]
+    pub(crate) fn pattern_location(&self, pattern: PatternId) -> Location {
+        match self.more_pattern_locations.get(&pattern) {
+            Some(location) => location.clone(),
+            None => self.original.pattern_location(pattern).clone(),
+        }
+    }
+
     /// Retrieve the location of the corresponding [Name] of the given [NameId]
     pub(crate) fn name_location(&self, name: NameId) -> Location {
         match self.more_name_locations.get(&name) {
