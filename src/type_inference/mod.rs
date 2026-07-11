@@ -242,6 +242,12 @@ struct TypeChecker<'local, 'inner> {
     /// value dying on several edges is reported once.
     diagnosed_missing_drops: FxHashSet<affine::MovePath>,
 
+    /// When true, an undroppable unbounded generic is silently skipped instead of raising
+    /// `MissingDropConstraint`. Set for assignment-overwrite drops: overwritten generic
+    /// places frequently hold bit-copies of values another structure owns (`out :=
+    /// blob_nth ...` loops), where demanding a bound would demand a double-free.
+    suppress_missing_drop_diagnostic: bool,
+
     /// The free type variables of the current item's own signature (`--auto-drop`): its
     /// rigid generics. Honest Copy/Drop treatment applies to these; other bare variables
     /// are in-flight unification variables (lambda params before their call site unifies
@@ -308,6 +314,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             copy_check_depth: 0,
             function_local_names: Vec::new(),
             diagnosed_missing_drops: Default::default(),
+            suppress_missing_drop_diagnostic: false,
             signature_type_vars: Default::default(),
             mutable_definitions: Default::default(),
             integer_literal_vars: Default::default(),

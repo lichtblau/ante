@@ -268,6 +268,9 @@ impl TypeChecker<'_, '_> {
     /// The strict `{Drop t}` rule: a value of bare generic type dies here with no way to
     /// drop it. Reported once per place, pointing at the value's binding.
     fn report_missing_drop_constraint(&mut self, place: &MovePath, typ: &Type, fallback: &Location) {
+        if self.suppress_missing_drop_diagnostic {
+            return;
+        }
         if !self.diagnosed_missing_drops.insert(place.clone()) {
             return;
         }
@@ -433,7 +436,12 @@ impl TypeChecker<'_, '_> {
         let Some(lhs_type) = self.expr_types.get(&assignment.lhs).cloned() else { return };
         let location = self.current_extended_context().expr_location(assignment.lhs);
         let tracker = self.move_tracker.clone();
-        if let Some(drop) = self.synthesize_partial_drop(&place, &lhs_type, &tracker, &location) {
+        // Overwritten generic places often hold bit-copies of values another structure
+        // owns; skip silently rather than demand a bound that would double-free.
+        let old_suppress = std::mem::replace(&mut self.suppress_missing_drop_diagnostic, true);
+        let drop = self.synthesize_partial_drop(&place, &lhs_type, &tracker, &location);
+        self.suppress_missing_drop_diagnostic = old_suppress;
+        if let Some(drop) = drop {
             self.current_extended_context_mut().push_pre_exit_drops(id, vec![drop]);
         }
     }
