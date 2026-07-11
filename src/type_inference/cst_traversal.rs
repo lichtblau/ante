@@ -1020,6 +1020,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 // builder).
                 if !super::free_variables::is_pointer_env(&function_type.environment, &self.bindings) {
                     self.record_shared_captures(expr, self_name);
+                    // Restore this lambda's `var` captures -- its env holds `MUT` refs into their
+                    // slots, so the owner still owns them. Eager: A deferred `check_for_closure`
+                    // would run after this scope's drops are already synthesized. See
+                    // `restore_mut_ref_captures`.
+                    self.restore_mut_ref_captures(expr, lambda.is_move);
                 }
             }
         }

@@ -70,6 +70,9 @@ impl TypeChecker<'_, '_> {
             // this is the only point where `borrowed` is known. Both paths run after
             // `record_captured_names`, so the removal sticks. Handler-scoped lambdas never entered
             // `captured_names`, making the removal a no-op for them.
+            //
+            // The `var` half of the restore is not here: it must run eagerly, before deferral -- see
+            // [Self::restore_mut_ref_captures].
             for name in &borrowed {
                 self.captured_names.remove(name);
             }
@@ -78,7 +81,46 @@ impl TypeChecker<'_, '_> {
         }
     }
 
-    /// hich captures this closure holds **by reference** (`IMM` in the env) instead of by
+    /// Restore the `var` captures of a non-`move` closure to their owner.
+    /// `make_env_type_with_names` already gives each of these a `MUT` ref env slot and
+    /// `pack_closure_environment` already packs the owner's `StackAlloc` pointer.
+    /// The owner is the sole owner: it drops the value at scope exit, and overwrite-drops it on
+    /// `x := …`
+    ///
+    /// The closure is defined after the `var` and dies before it (scope exit drops in
+    /// reverse-definition order), and a non-`move` closure escaping while it borrows a non-`Copy`
+    /// local is a compile error -- `lambda_origin`'s borrow arm covers `var` captures too, since
+    /// they are not reference-typed.
+    ///
+    /// A `move` closure is excluded, and the reason is sharper than "both sides own the same heap":
+    /// it snapshots a `var` **by value** (`pack_closure_environment` derefs the slot). For an owned
+    /// capture that is actually fine now -- the snapshot is the env's, `record_move_captures` marks
+    /// the owner moved, `assignment_overwrite_drop` skips a moved place, and the destructor
+    /// frees the env slot. But for a **`shared`** `var` the snapshot is an *unretained* handle copy:
+    /// `pack_closure_environment` skips its `RcRetain` for `mutable_locals`, and
+    /// `record_shared_captures` skips `var`s too, so nothing funds a second reference. Restoring the
+    /// owner's release then frees the handle out from under an escaped closure -- a heap-use-after-free.
+    ///
+    /// Unlike before, set this runs **eagerly**, right after `record_captured_names`,
+    /// rather than inside `check_for_closure`. That check may be deferred until the enclosing scope
+    /// resolves its implicits (`push_deferred_closure_check`), which for a `for`-loop body lands
+    /// *after* the enclosing scope's drops are synthesized -- so a removal made there is too late and
+    /// the blanket wins (`Vec.remove_all`'s `idxs`, `map.an`'s `map`). Deciding "is this a `var`"
+    /// needs only `mutable_definitions`: no types, no implicits, nothing to wait for.
+    pub(super) fn restore_mut_ref_captures(&mut self, id: ExprId, is_move: bool) {
+        if is_move {
+            return;
+        }
+        let mut context = FreeVars::default();
+        context.find_free_variables(id, self);
+        for name in &context.free_vars {
+            if self.mutable_definitions.contains(name) {
+                self.captured_names.remove(name);
+            }
+        }
+    }
+
+    /// Which captures this closure holds **by reference** (`IMM` in the env) instead of by
     /// value. Exactly the captures the escape check treats as `capture_borrow`
     /// (`origins.rs::lambda_origin` + the `Copy` filter in `reject_escaping_origins`) -- keeping the
     /// two in step is the invariant that makes borrow-in-env sound: every borrow that could escape

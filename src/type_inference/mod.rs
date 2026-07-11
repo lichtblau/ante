@@ -250,9 +250,8 @@ struct TypeChecker<'local, 'inner> {
     /// Cached TopLevelName for the Prelude's `Drop` ability type, lazily resolved on first use.
     drop_type_name: Option<TopLevelName>,
 
-    /// Names captured (by reference) by any lambda in the current item (`--auto-drop` only).
-    /// Captured names are never auto-dropped: the closure may outlive the owning scope, so
-    /// dropping the referent would dangle it. Skipping only leaks for now.
+    /// Names captured by a lambda in the current item whose owning scope must *not* auto-drop them
+    /// (`--auto-drop` only): dropping the referent could dangle the closure. Skipping only leaks.
     captured_names: FxHashSet<NameId>,
 
     /// True while inferring the body of a **handler-scoped** lambda (a handle body
