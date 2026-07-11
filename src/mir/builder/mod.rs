@@ -1095,10 +1095,14 @@ where
                     let environment = Value::Parameter(this.current_block, lambda.parameters.len() as u32);
                     this.unpack_closure_environment(free_vars.iter().copied(), environment);
 
-                    // For regular closures, mutable captures are pointers (by reference).
+                    // Regular closures hold captures by reference: `var` captures are `Mut` refs
+                    // and borrowed captures are `IMM` refs. Both arrive as pointers, so mark them
+                    // deref-backed -- the read path (`variable`) then auto-derefs. The frontend
+                    // forbids assigning to an immutable binding, so reusing `mutable_locals` for
+                    // the read-only deref cannot grant mutation.
                     if !is_move {
                         for var in free_vars.iter() {
-                            if mutable_captures.contains(var) {
+                            if mutable_captures.contains(var) || this.context().capture_is_borrowed(expr, *var) {
                                 this.mutable_locals.insert(*var);
                             }
                         }
@@ -1155,7 +1159,7 @@ where
         if free_vars.is_some() || env_is_pointer {
             let environment = if let Some(free_vars) = &free_vars {
                 let retain_shared = !env_is_pointer && handle_body_handler_name.is_none();
-                self.pack_closure_environment(free_vars, is_move, &env_type, retain_shared)
+                self.pack_closure_environment(expr, free_vars, is_move, &env_type, retain_shared)
             } else {
                 // Pointer-env slot with no captures (e.g. an ability impl assigning a plain function):
                 // use a null pointer for the env. Transmute from Unit so constant-folding works
@@ -1171,7 +1175,7 @@ where
     /// When `env_type` is a pointer, the capture tuple is heap-allocated (via [Instruction::AllocShared])
     /// and the returned value is the resulting pointer. Otherwise returns the tuple directly.
     fn pack_closure_environment(
-        &mut self, free_vars: &BTreeSet<NameId>, is_move: bool, env_type: &Type, retain_shared: bool,
+        &mut self, lambda: ExprId, free_vars: &BTreeSet<NameId>, is_move: bool, env_type: &Type, retain_shared: bool,
     ) -> Value {
         assert!(!free_vars.is_empty());
 
@@ -1184,6 +1188,17 @@ where
                 let tc_type = &self.types.result.maps.name_types[var];
                 let val_type = self.convert_type(tc_type, None);
                 self.push_instruction(Instruction::Deref(value), val_type)
+            } else if self.context().capture_is_borrowed(lambda, *var) {
+                // The frontend gave this capture an `IMM` ref env slot, so pack an address rather
+                // than the value. A deref-backed local (a `var` slot, or an outer closure's borrow
+                // we are re-borrowing) is *already* an address -- pass it through.  An immutable
+                // local is an SSA value with no address, so materialize a stack slot.  No `shared`
+                // retain: borrowed captures are non-`Copy`, and `shared` handles are Copy.
+                if self.mutable_locals.contains(var) {
+                    value
+                } else {
+                    self.push_instruction(Instruction::StackAlloc(value), Type::POINTER)
+                }
             } else {
                 // A `shared` handle captured by value is a new owning location -- retain it so the
                 // env carries its own count. `var` captures are Mut-refs into the owner's slot (no

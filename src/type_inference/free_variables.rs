@@ -42,8 +42,14 @@ impl TypeChecker<'_, '_> {
         }
         context.find_free_variables(id, self);
 
+        // A bare-`Pointer` env (capability / ability-method dictionary) has no capture tuple to
+        // give `IMM` slots to -- `make_env_type_with_names` is never called for it -- so nothing is
+        // borrowed there and the MIR builder must not materialize. (Those envs carry only borrowed
+        // dictionaries anyway, which are `Copy`.)
+        let mut borrowed = FxHashSet::default();
         if !is_pointer_env(expected_environment_type, &self.bindings) {
-            let env_type = make_env_type_with_names(&context.free_vars, self, is_move);
+            borrowed = self.borrowed_capture_set(&context.free_vars, is_move);
+            let env_type = make_env_type_with_names(&context.free_vars, self, is_move, &borrowed);
             self.unify(&env_type, expected_environment_type, TypeErrorKind::ClosureEnv, id);
         }
 
@@ -51,8 +57,57 @@ impl TypeChecker<'_, '_> {
             if is_move {
                 self.current_extended_context_mut().mark_move_closure(id);
             }
+            // A borrowed capture is an `IMM` ref into the owner's storage: the env does not alias
+            // the value, so the owner is its sole owner and must drop it normally. Restore it to
+            // its scope by removing it from `captured_names`.
+            //
+            // Sound because a closure capturing `name` is necessarily defined *after* it, and scope
+            // exit drops in reverse-definition order -- so the borrowing closure always dies before
+            // its owner. A closure that escapes by return while borrowing is a compile error.
+            //
+            // Done here, not at the `record_captured_names` call site: this check may be **deferred**
+            // (`push_deferred_closure_check`) until the enclosing scope resolves its implicits, so
+            // this is the only point where `borrowed` is known. Both paths run after
+            // `record_captured_names`, so the removal sticks. Handler-scoped lambdas never entered
+            // `captured_names`, making the removal a no-op for them.
+            for name in &borrowed {
+                self.captured_names.remove(name);
+            }
+            self.current_extended_context_mut().insert_borrowed_captures(id, borrowed);
             self.current_extended_context_mut().insert_closure_environment(id, context.free_vars);
         }
+    }
+
+    /// hich captures this closure holds **by reference** (`IMM` in the env) instead of by
+    /// value. Exactly the captures the escape check treats as `capture_borrow`
+    /// (`origins.rs::lambda_origin` + the `Copy` filter in `reject_escaping_origins`) -- keeping the
+    /// two in step is the invariant that makes borrow-in-env sound: every borrow that could escape
+    /// is a borrow the escape check rejects.
+    ///
+    /// - `move` captures are owned by the env, never borrowed.
+    /// - `var` captures are already `MUT` refs into the owner's slot.
+    /// - reference-typed captures point elsewhere; re-wrapping would double-indirect.
+    /// - **`Copy`** captures are bit-copies that cannot dangle and need no owner: primitives,
+    ///   function values, ability dictionaries, and `shared` handles.
+    ///
+    /// `type_is_copy` fails *safe* here: an in-flight unification variable answers "Copy", so an
+    /// unresolved capture stays by-value (the pre-existing leak) rather than becoming a wrong
+    /// borrow. Only confidently-non-`Copy` captures are borrowed.
+    fn borrowed_capture_set(&mut self, free_vars: &BTreeSet<NameId>, is_move: bool) -> FxHashSet<NameId> {
+        let mut borrowed = FxHashSet::default();
+        if is_move || !self.drop_elaboration_active() {
+            return borrowed;
+        }
+        for name in free_vars {
+            if self.mutable_definitions.contains(name) || self.name_is_reference_typed(*name) {
+                continue;
+            }
+            let typ = self.name_types[name].clone();
+            if !self.type_is_copy(&typ) {
+                borrowed.insert(*name);
+            }
+        }
+        borrowed
     }
 
     /// Auto-drop: record every free variable of the lambda at `id` as captured. Captured
@@ -344,17 +399,25 @@ impl FreeVars {
     }
 }
 
-fn make_env_type_with_names(free_vars: &BTreeSet<NameId>, checker: &TypeChecker, is_move: bool) -> Type {
+fn make_env_type_with_names(
+    free_vars: &BTreeSet<NameId>, checker: &TypeChecker, is_move: bool, borrowed: &FxHashSet<NameId>,
+) -> Type {
     let free_vars = free_vars.iter().map(|name| {
         let typ = checker.name_types[name].clone();
 
         // Closures:
-        // - Capture mutable variables by reference (so we wrap in a Mut ref here)
-        // - Capture immutable variables by value (FIXME)
+        // - Capture mutable variables by reference (a `Mut` ref)
+        // - Capture owned (non-`Copy`) immutable variables by reference too, so the owner keeps
+        //   ownership and drops them. `borrowed` is the frontend's authoritative set (see
+        //   `borrowed_capture_set`).
+        // - Capture everything else (`Copy` values, `shared` handles) by value
         // - Capture everything by move if it is a `move` closure
         if !is_move && checker.mutable_definitions.contains(name) {
             let lifetime = checker.next_type_variable();
             Type::Application(Arc::new(Type::MUT), Arc::new(vec![lifetime, typ]))
+        } else if borrowed.contains(name) {
+            let lifetime = checker.next_type_variable();
+            Type::Application(Arc::new(Type::IMM), Arc::new(vec![lifetime, typ]))
         } else {
             typ
         }

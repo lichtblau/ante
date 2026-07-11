@@ -399,7 +399,7 @@ impl TypeChecker<'_, '_> {
         }
     }
 
-    fn name_is_reference_typed(&self, name: NameId) -> bool {
+    pub(super) fn name_is_reference_typed(&self, name: NameId) -> bool {
         self.name_types.get(&name).is_some_and(|typ| {
             typ.reference_element(&self.bindings).is_some() || typ.pointer_element(&self.bindings).is_some()
         })

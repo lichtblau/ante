@@ -85,6 +85,13 @@ pub struct ExtendedTopLevelContext {
     /// by reference. Used by the MIR builder to determine capture semantics.
     move_closures: FxHashSet<ExprId>,
 
+    /// Per closure, the captures held **by reference** (an `IMM` ref in the env) rather than by
+    /// value -- the non-`move`, non-`var`, non-reference-typed, non-`Copy` captures. Their owner
+    /// keeps ownership and drops them; the env only borrows. The MIR builder must not guess this
+    /// set from types (a `shared` handle and a borrow both lower to `Pointer`), so the frontend
+    /// records it here.
+    borrowed_captures: FxHashMap<ExprId, FxHashSet<NameId>>,
+
     /// RHS expressions of *real* (user-written, drop-registered) local bindings, keyed by the
     /// binding's rhs [ExprId]. The MIR builder emits an `RcRetain` when such an rhs is a shared
     /// handle place -- the binding is a new owning location whose scope-exit release balances the
@@ -170,6 +177,7 @@ impl ExtendedTopLevelContext {
             instantiations: Default::default(),
             closure_environments: Default::default(),
             move_closures: Default::default(),
+            borrowed_captures: Default::default(),
             retain_bindings: Default::default(),
             escape_retains: Default::default(),
             closure_env_releases: Default::default(),
@@ -372,6 +380,20 @@ impl ExtendedTopLevelContext {
         self.move_closures.insert(expr);
     }
 
+    /// Record which of this closure's captures are held by reference. See
+    /// [`Self::borrowed_captures`].
+    pub(crate) fn insert_borrowed_captures(&mut self, expr: ExprId, names: FxHashSet<NameId>) {
+        if !names.is_empty() {
+            self.borrowed_captures.insert(expr, names);
+        }
+    }
+
+    /// True when this closure holds `name` by reference rather than by value.
+    #[allow(dead_code, reason = "read by the MIR builder, which the lib target does not compile")]
+    pub(crate) fn capture_is_borrowed(&self, expr: ExprId, name: NameId) -> bool {
+        self.borrowed_captures.get(&expr).is_some_and(|names| names.contains(&name))
+    }
+
     /// Copy all per-`ExprId` codegen metadata recorded for `from` onto `to`.
     pub(crate) fn copy_expr_metadata(&mut self, from: ExprId, to: ExprId) {
         if let Some(&index) = self.member_access_indices.get(&from) {
@@ -388,6 +410,9 @@ impl ExtendedTopLevelContext {
         }
         if self.move_closures.contains(&from) {
             self.move_closures.insert(to);
+        }
+        if let Some(borrowed) = self.borrowed_captures.get(&from).cloned() {
+            self.borrowed_captures.insert(to, borrowed);
         }
         if self.retain_bindings.contains(&from) {
             self.retain_bindings.insert(to);
