@@ -910,6 +910,29 @@ impl Builder {
                 self.write_value(value, mir);
                 let _ = write!(self.current_item, " - ANTE_RC_HEADER_SIZE); Unit {id} = (Unit){{0}};");
             },
+            mir::Instruction::RcRetain(value) => {
+                // Increment the refcount at `value - ANTE_RC_HEADER_SIZE`. A count of 0 marks an
+                // immortal static (0-arg constructor), left untouched. Only emitted for non-null
+                // user shared handles, so no null guard (unlike FreeShared).
+                let _ = write!(self.current_item, "AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
+                self.write_value(value, mir);
+                let _ = write!(
+                    self.current_item,
+                    " - ANTE_RC_HEADER_SIZE); if ({id}_h->count) {id}_h->count += 1; Unit {id} = (Unit){{0}};"
+                );
+            },
+            mir::Instruction::RcDecrement(value) => {
+                // Decrement and report whether the count reached zero (was exactly 1), so the
+                // caller runs the pointee glue + FreeShared. A count of 0 is an immortal static:
+                // left untouched, returns false.
+                let _ = write!(self.current_item, "AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
+                self.write_value(value, mir);
+                let _ = write!(
+                    self.current_item,
+                    " - ANTE_RC_HEADER_SIZE); size_t {id}_c = {id}_h->count; bool {id} = false; \
+                     if ({id}_c) {{ {id}_h->count = {id}_c - 1; {id} = ({id}_c == 1); }}"
+                );
+            },
             mir::Instruction::Store { pointer, value } => {
                 let typ = mir.type_of_value(value, definition);
                 self.write("*(");

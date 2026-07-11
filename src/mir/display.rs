@@ -381,6 +381,8 @@ fn fmt_instruction(
         mir::Instruction::StackAllocUninit(x) => write!(f, "stack_alloc_uninit {x}")?,
         mir::Instruction::AllocShared(value) => write!(f, "alloc_shared {}", v(value))?,
         mir::Instruction::FreeShared(value) => write!(f, "free_shared {}", v(value))?,
+        mir::Instruction::RcRetain(value) => write!(f, "rc_retain {}", v(value))?,
+        mir::Instruction::RcDecrement(value) => write!(f, "rc_decrement {}", v(value))?,
         mir::Instruction::Extern(name) => write!(f, "extern \"{name}\"")?,
     }
 

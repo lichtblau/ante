@@ -487,6 +487,18 @@ pub enum Instruction {
     /// stays an ordinary extern call. Returns unit.
     FreeShared(Value),
 
+    /// Increment the refcount of a shared allocation. The argument points at the value; the count
+    /// sits one header before it. A `count == 0` allocation is an immortal static (0-arg
+    /// constructor backing store) and is left unchanged. Only emitted for genuine (non-null) user
+    /// shared handles -- unlike [Instruction::FreeShared], no null guard. Returns unit.
+    RcRetain(Value),
+
+    /// Decrement the refcount of a shared allocation and return whether it reached zero, i.e. the
+    /// count was exactly 1 (so the caller -- a synthesized `release_T` -- runs the pointee's drop
+    /// glue then [Instruction::FreeShared]). A `count == 0` allocation is an immortal static: left
+    /// unchanged, returns false. Only emitted for non-null user handles.
+    RcDecrement(Value),
+
     /// Store a value into a pointer location. Returns unit.
     Store {
         pointer: Value,
@@ -600,6 +612,8 @@ impl Instruction {
             Instruction::StackAllocUninit(_) => (),
             Instruction::AllocShared(value) => f(value),
             Instruction::FreeShared(value) => f(value),
+            Instruction::RcRetain(value) => f(value),
+            Instruction::RcDecrement(value) => f(value),
             Instruction::Store { pointer, value } => two(pointer, value),
             Instruction::Transmute(value) => f(value),
             Instruction::Instantiate(_, _) => (),

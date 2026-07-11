@@ -401,6 +401,16 @@ impl Definition {
                     instr_assert_subtype!(pointer_type, Type::POINTER, self, id, mir, "FreeShared argument must be a pointer, got `{pointer_type}`");
                     instr_assert_subtype!(*result_type, Type::UNIT, self, id, mir, "FreeShared result must be unit");
                 },
+                Instruction::RcRetain(pointer) => {
+                    let pointer_type = mir.type_of_value(pointer, self);
+                    instr_assert_subtype!(pointer_type, Type::POINTER, self, id, mir, "RcRetain argument must be a pointer, got `{pointer_type}`");
+                    instr_assert_subtype!(*result_type, Type::UNIT, self, id, mir, "RcRetain result must be unit");
+                },
+                Instruction::RcDecrement(pointer) => {
+                    let pointer_type = mir.type_of_value(pointer, self);
+                    instr_assert_subtype!(pointer_type, Type::POINTER, self, id, mir, "RcDecrement argument must be a pointer, got `{pointer_type}`");
+                    instr_assert_subtype!(*result_type, Type::BOOL, self, id, mir, "RcDecrement result must be a bool");
+                },
                 Instruction::GetFieldPtr { struct_ptr, .. } => {
                     let ptr_type = mir.type_of_value(struct_ptr, self);
                     instr_assert!(matches!(ptr_type, Type::POINTER), self, id, mir, "GetFieldPtr struct_ptr must be a pointer");
