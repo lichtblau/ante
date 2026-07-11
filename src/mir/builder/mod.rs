@@ -319,8 +319,8 @@ where
             cst::Expr::Loop(_) => unreachable!("Loops should be desugared before MIR generation"),
             cst::Expr::While(while_) => self.while_(while_),
             cst::Expr::For(for_) => self.for_(for_),
-            cst::Expr::Break => self.break_(),
-            cst::Expr::Continue => self.continue_(),
+            cst::Expr::Break => self.break_(expr),
+            cst::Expr::Continue => self.continue_(expr),
             cst::Expr::Return(return_) => self.return_(return_.expression),
             cst::Expr::Assignment(assignment) => self.assignment(assignment, expr),
             cst::Expr::Extern(extern_) => self.extern_(extern_, expr),
@@ -1039,16 +1039,27 @@ where
         Value::Unit
     }
 
-    fn break_(&mut self) -> Value {
+    fn break_(&mut self, expr: ExprId) -> Value {
+        self.lower_pre_exit_drops(expr);
         let exit = self.loop_targets.last().expect("`break` outside of a loop").1;
         self.terminate_block(TerminatorInstruction::jmp_no_args(exit));
         Value::Error
     }
 
-    fn continue_(&mut self) -> Value {
+    fn continue_(&mut self, expr: ExprId) -> Value {
+        self.lower_pre_exit_drops(expr);
         let cont = self.loop_targets.last().expect("`continue` outside of a loop").0;
         self.terminate_block(TerminatorInstruction::jmp_no_args(cont));
         Value::Error
+    }
+
+    /// Auto-drop: lower the synthesized drops recorded for this exit edge (break/continue).
+    fn lower_pre_exit_drops(&mut self, expr: ExprId) {
+        if let Some(drops) = self.context().pre_exit_drops(expr) {
+            for drop_call in drops.clone() {
+                self.expression(drop_call);
+            }
+        }
     }
 
     fn if_(&mut self, if_: &cst::If, expr: ExprId) -> Value {

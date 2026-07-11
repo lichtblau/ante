@@ -41,6 +41,10 @@ pub(super) enum DropScopeKind {
     Block,
     /// A function body. Owns the parameters, and is the boundary `return` unwinds to.
     Function,
+    /// A loop body (`while`/`for`); the boundary `break`/`continue` unwind to. Holds no
+    /// droppable names of its own (the loop variable is an integer); body locals live in
+    /// the body's own Block scope.
+    LoopBody,
 }
 
 /// One entry of the drop-scope stack: the owned-root locals a scope declares,
@@ -85,13 +89,24 @@ impl TypeChecker<'_, '_> {
     /// Drop calls for a `return` edge: everything owned from the innermost scope up to and
     /// including the enclosing function-body scope (`return` exits the current lambda only).
     pub(super) fn drops_for_return(&mut self, location: &Location) -> Vec<ExprId> {
+        self.drops_up_to(DropScopeKind::Function, location)
+    }
+
+    /// Drop calls for a `break`/`continue` edge: everything owned from the innermost scope
+    /// up to and including the innermost loop-body scope. `continue` needs the same set --
+    /// it skips the rest of the body, including the body block's own fallthrough drops.
+    pub(super) fn drops_for_loop_exit(&mut self, location: &Location) -> Vec<ExprId> {
+        self.drops_up_to(DropScopeKind::LoopBody, location)
+    }
+
+    fn drops_up_to(&mut self, boundary: DropScopeKind, location: &Location) -> Vec<ExprId> {
         if !self.drop_elaboration_active() {
             return Vec::new();
         }
         let mut names = Vec::new();
         for scope in self.drop_scopes.iter().rev() {
             names.extend(scope.names.iter().rev().copied());
-            if scope.kind == DropScopeKind::Function {
+            if scope.kind == boundary {
                 break;
             }
         }

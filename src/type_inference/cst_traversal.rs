@@ -163,7 +163,18 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Expr::For(for_) => self.infer_for(for_, id),
             // Allow break/continue to return any type
             // TODO: Add bottom type
-            Expr::Break | Expr::Continue => Type::NEVER,
+            Expr::Break | Expr::Continue => {
+                // Auto-drop: break/continue exit every scope up to the innermost loop body;
+                // both skip the body block's own fallthrough drops, so they carry the full set.
+                if self.drop_elaboration_active() {
+                    let location = id.locate(self);
+                    let drops = self.drops_for_loop_exit(&location);
+                    if !drops.is_empty() {
+                        self.current_extended_context_mut().push_pre_exit_drops(id, drops);
+                    }
+                }
+                Type::NEVER
+            },
             Expr::Return(return_) => {
                 self.check_return(return_.expression, id);
                 Type::NEVER
@@ -1531,8 +1542,13 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         let outer_names = self.name_types.keys().copied().collect::<FxHashSet<_>>();
         let old_tracker = std::mem::take(&mut self.move_tracker);
 
+        // Auto-drop: mark the loop-body boundary that break/continue unwind to. The marker
+        // scope itself owns nothing; each iteration's locals drop at the body block's end.
+        self.push_drop_scope(super::drop_elaboration::DropScopeKind::LoopBody);
         self.check_expr(while_.condition, &Type::BOOL, TypeErrorKind::Condition);
         self.check_expr(while_.body, &Type::UNIT, TypeErrorKind::LoopBody);
+        let location = self.current_extended_context().expr_location(while_.body);
+        let _ = self.pop_drop_scope(true, &location);
 
         self.check_moves_in_repeated_context(&outer_names, RepeatedContext::WhileLoop);
         self.move_tracker = old_tracker;
@@ -1558,7 +1574,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.name_types.insert(for_.variable, int_ty);
 
         let old_tracker = std::mem::take(&mut self.move_tracker);
+        // Auto-drop: mark the loop-body boundary that break/continue unwind to.
+        self.push_drop_scope(super::drop_elaboration::DropScopeKind::LoopBody);
         self.check_expr(for_.body, &Type::UNIT, TypeErrorKind::LoopBody);
+        let location = self.current_extended_context().expr_location(for_.body);
+        let _ = self.pop_drop_scope(true, &location);
         self.check_moves_in_repeated_context(&outer_names, RepeatedContext::ForLoop);
         self.move_tracker = old_tracker;
 
