@@ -39,3 +39,20 @@ jobs:
       with:
         name: ante
         path: target/release/ante
+
+  build-static-musl:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'true'
+    - name: Build static musl binary
+      run: .github/build.sh
+    - name: Upload artifact
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ante-static-musl-linux-x86_64
+        path: target/x86_64-unknown-linux-musl/release/ante
