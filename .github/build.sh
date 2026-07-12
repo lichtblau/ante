@@ -9,7 +9,7 @@
 # `cc` to compile/link Ante programs (including aminicoro/minicoro.c), so a
 # C toolchain must still be present on any machine that *runs* it.
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 TARGET=x86_64-unknown-linux-musl
 
