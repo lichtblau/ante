@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    branches: [ fork ]
+  pull_request:
+    branches: [ fork ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'true'
+    - name: Install Rust
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cargo rustc
+        rustc --version
+        cargo --version
+    - name: Install LLVM 21
+      run: |
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 21 all
+    - name: Build release binary
+      run: cargo build --release
+    - name: Upload artifact
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ante
+        path: target/release/ante
