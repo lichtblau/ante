@@ -11,6 +11,31 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# GCC < 14 doesn't special-case `__has_feature` as a reserved feature-check
+# form (only clang and GCC 14+ do), so on it
+# `defined(__has_feature) && __has_feature(x)` substitutes the plain,
+# undefined identifier down to `0(0)`, a hard syntax error. ubuntu-latest's
+# `cc` is still GCC 13. Patch it out at build time instead of touching the
+# aminicoro submodule/fork.
+if ! grep -q '__has_feature(x) 0' aminicoro/minicoro.c; then
+    patch -p0 aminicoro/minicoro.c <<'EOF'
+--- minicoro.c
++++ minicoro.c
+@@ -189,7 +189,10 @@
+     longjmp(ctx->jb, val);
+ }
+
+-#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
++#ifndef __has_feature
++# define __has_feature(x) 0
++#endif
++#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+ void __asan_unpoison_memory_region(void const volatile* addr, size_t size);
+ #endif
+
+EOF
+fi
+
 TARGET=x86_64-unknown-linux-musl
 
 rustup target add "$TARGET"
