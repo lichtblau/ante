@@ -95,6 +95,7 @@ where
             acc.extend(monomorphized)
         })
         //.reduce(Mir::default, Mir::extend)
+        .elide_pure_borrow_pairs()
         .lower_closures();
 
     #[cfg(debug_assertions)]

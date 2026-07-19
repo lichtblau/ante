@@ -919,11 +919,59 @@ where
         // callee's parameter release, or the constructed value's later release, balances it).
         let is_release_call = matches!(&self.context()[call.function], cst::Expr::Variable(path)
             if matches!(self.context().path_origin(*path), Some(Origin::TopLevelDefinition(name)) if name.local_name_id == NameId::RELEASE_FUNCTION));
+        // A statically-known callee may have borrowing parameters (it never releases them). For a
+        // shared place argument in such a position, the callee-owns retain is elided outright
+        // when every implicit argument of this call is an unconstrained static impl (the callee
+        // then provably cannot suspend); otherwise the retain stays and is balanced by a post-call
+        // release -- the caller's frame holds the handle across any suspension. A shared rvalue
+        // argument (fresh, count 1) is caller-owned either way and released after the call.
+        let callee_mask = if is_release_call { None } else { self.borrowed_param_mask_of_callee(call.function) };
+        let implicits_pure = callee_mask.is_some()
+            && call.arguments.iter().filter(|arg| arg.is_implicit).all(|arg| self.implicit_is_pure_static(arg.expr));
+
+        // (value, expr, retain id when this is an elidable pair)
+        let mut post_call_releases: Vec<(Value, ExprId, Option<crate::mir::InstructionId>)> = Vec::new();
+        let mut implicit_positions: Vec<u32> = Vec::new();
+        let mut explicit_index = 0usize;
+        let mut arg_index = 0u32;
         let arguments = mapvec(&call.arguments, |arg| {
-            let value = self.expression(arg.expr);
-            if !is_release_call {
-                self.retain_if_shared_place(arg.expr, value);
-            }
+            let value = if arg.is_implicit && !is_release_call {
+                implicit_positions.push(arg_index);
+                self.expression(arg.expr)
+            } else {
+                let value = self.expression(arg.expr);
+                if !is_release_call {
+                    let borrowed = callee_mask
+                        .as_ref()
+                        .is_some_and(|mask| mask.get(explicit_index).copied().unwrap_or(false))
+                        && self.expr_tc_is_shared(arg.expr);
+                    if borrowed {
+                        let is_place =
+                            matches!(&self.context()[arg.expr], cst::Expr::Variable(_) | cst::Expr::MemberAccess(_));
+                        if is_place && implicits_pure {
+                            // Pair elided: no retain here, no release in the callee.
+                        } else if is_place {
+                            // Impure implicits: retain + post-call release, recorded as a
+                            // borrow pair so the post-mono pass can elide it when the
+                            // specialized capability values turn out pure.
+                            let retain = self.push_instruction(Instruction::RcRetain(value), Type::UNIT);
+                            let retain_id = match retain {
+                                Value::InstructionResult(id) => Some(id),
+                                _ => None,
+                            };
+                            post_call_releases.push((value, arg.expr, retain_id));
+                        } else {
+                            // Rvalue: caller-owned regardless of purity; never elidable.
+                            post_call_releases.push((value, arg.expr, None));
+                        }
+                    } else {
+                        self.retain_if_shared_place(arg.expr, value);
+                    }
+                }
+                explicit_index += 1;
+                value
+            };
+            arg_index += 1;
             value
         });
 
@@ -934,10 +982,63 @@ where
         };
 
         let value = self.push_instruction(instruction, result_type);
+        let call_id = match value {
+            Value::InstructionResult(id) => Some(id),
+            _ => None,
+        };
         if diverges {
             self.terminate_block(TerminatorInstruction::Unreachable);
+        } else {
+            for (arg_value, arg_expr, retain_id) in post_call_releases {
+                let release = self.emit_shared_release_for_expr(arg_value, arg_expr);
+                if let (Some(retain), Some(call), Some(Value::InstructionResult(release_call))) =
+                    (retain_id, call_id, release)
+                {
+                    let pair = crate::mir::BorrowPair {
+                        retain,
+                        release_call,
+                        call,
+                        implicit_args: implicit_positions.clone(),
+                    };
+                    self.current_function().borrow_pairs.push(pair);
+                }
+            }
         }
         value
+    }
+
+    /// The borrowing-parameter mask of a call's statically-known top-level callee, from its item's
+    /// inference result. `None` for indirect calls, effect ops, and callees without borrowing
+    /// parameters.
+    fn borrowed_param_mask_of_callee(&mut self, function: ExprId) -> Option<Vec<bool>> {
+        let cst::Expr::Variable(path) = &self.context()[function] else { return None };
+        let Some(Origin::TopLevelDefinition(name)) = self.context().path_origin(*path) else { return None };
+        let check = crate::incremental::TypeCheck(name.top_level_item).get(self.compiler);
+        let mask = check.result.borrowed_params.get(&name.local_name_id)?;
+        (!mask.is_empty()).then(|| mask.clone())
+    }
+
+    /// True when an implicit argument is an unconstrained static impl -- a plain reference to a
+    /// top-level definition whose value is not function-typed. Such a capability carries no hidden
+    /// effect constraints, so the callee cannot suspend through it. Locals (handler capabilities!),
+    /// applications, and constrained impls all fail this.
+    fn implicit_is_pure_static(&mut self, expr: ExprId) -> bool {
+        let cst::Expr::Variable(path) = &self.context()[expr] else { return false };
+        if !matches!(self.context().path_origin(*path), Some(Origin::TopLevelDefinition(_))) {
+            return false;
+        }
+        let typ = self.types.result.maps.expr_types[&expr].follow(&self.types.bindings);
+        !matches!(typ, TCType::Function(_))
+    }
+
+    /// Release a shared handle the caller owns past the call (`release_T` derived from the argument
+    /// expression's TC type). No-op for non-shared types.
+    fn emit_shared_release_for_expr(&mut self, value: Value, expr: ExprId) -> Option<Value> {
+        let tc_type = self.types.result.maps.expr_types[&expr].follow(&self.types.bindings);
+        if let Some((type_id, type_args)) = self.shared_release_target(&tc_type) {
+            return Some(self.emit_release_call(value, type_id, &type_args));
+        }
+        None
     }
 
     /// Emit the `IndexTuple cap op_index + CallClosure` sequence for an ability-method call.
@@ -2372,7 +2473,7 @@ where
 
     /// Emit `release_T(handle)` for shared type `type_id` applied to `type_args` (instantiating the
     /// generic release function when the type is generic).
-    fn emit_release_call(&mut self, handle: Value, type_id: TopLevelId, type_args: &[TCType]) {
+    fn emit_release_call(&mut self, handle: Value, type_id: TopLevelId, type_args: &[TCType]) -> Value {
         let release_name = TopLevelName::new(type_id, NameId::RELEASE_FUNCTION);
         let release_id = self.get_definition_id(&release_name);
         let fn_type = Type::Function(Arc::new(crate::mir::FunctionType {
@@ -2386,7 +2487,7 @@ where
             let mir_args = mapvec(type_args, |a| self.convert_type(a, None));
             self.push_instruction(Instruction::Instantiate(release_id, Arc::new(mir_args)), fn_type)
         };
-        self.push_instruction(Instruction::Call { function: callee, arguments: vec![handle] }, Type::UNIT);
+        self.push_instruction(Instruction::Call { function: callee, arguments: vec![handle] }, Type::UNIT)
     }
 
     /// If `typ` resolves to a non-shared user-defined type (a product/sum whose inline layout may

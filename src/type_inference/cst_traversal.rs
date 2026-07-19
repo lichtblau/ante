@@ -65,13 +65,34 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             let binds_droppable =
                 names.iter().any(|name| self.current_extended_context()[*name].as_ref() != "_");
             if binds_droppable {
-                self.current_extended_context_mut().mark_retain_binding(definition.rhs);
+                // A whole-place alias of an immutable local (`a = t`) elides its retain+release
+                // pair -- the alias's scope is lexically inside the source's, and an immutable
+                // source is only released at its own scope exit, so the handle outlives every use
+                // of the alias. Field reads and `var` sources keep the pair (`:=` through them
+                // releases the old value while the alias still points at it).
+                if let Some(borrowed) = self.try_borrowed_alias_binding(definition) {
+                    self.borrowed_bindings.insert(borrowed, definition.rhs);
+                } else {
+                    self.current_extended_context_mut().mark_retain_binding(definition.rhs);
+                }
             }
         }
 
         // Track mutable definitions so closure capture analysis can wrap them in reference types
         if definition.mutable {
             self.record_mutable_pattern(definition.pattern);
+        }
+
+        // Decide the borrowing-parameter mask for a top-level function _before_ its body is
+        // inferred (the escape walk is purely syntactic), so parameter releases are already skipped
+        // when the function scope pops.
+        if is_top_level
+            && let Expr::Lambda(lambda) = self.expr_of(definition.rhs).as_ref()
+        {
+            let lambda = lambda.clone();
+            if let Some(fn_name) = self.single_variable_pattern(definition.pattern) {
+                self.compute_borrowed_param_mask(fn_name, &lambda, &expected_type);
+            }
         }
 
         // If the RHS is a lambda, call check_lambda directly so we can pass the definition's
@@ -145,7 +166,10 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
 
         let typ = match expr.as_ref() {
             Expr::Literal(literal) => self.infer_literal(literal, id),
-            Expr::Variable(path) => self.infer_path(*path, expected),
+            Expr::Variable(path) => {
+                let typ = self.infer_path(*path, expected);
+                self.eta_expand_borrowing_value(id, typ, expected)
+            },
             Expr::Call(call) => self.infer_call(call, expected, id),
             Expr::Lambda(lambda) => self.infer_lambda(lambda, expected, id, None),
             Expr::Sequence(items) => {
@@ -489,6 +513,67 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         actual
     }
 
+    /// A borrowing-parameter function used as a value rather than called directly must be
+    /// eta-expanded so it obeys the owned convention every indirect call site assumes of a function
+    /// value (see [`Self::function_reference_has_borrowing_param`] for why, and
+    /// [`Self::create_eta_wrapper`] for what). `borrow_callee` is set only while a call's own callee
+    /// is being inferred, so its being false is exactly what marks this reference a value: an
+    /// argument, a `let`-binding's right-hand side, a returned function.
+    ///
+    /// This is the sole trigger: `infer_expr` runs on every expression before any coercion of it, so
+    /// a reference in callee position (`borrow_callee` true, always coerced as a direct call) is left
+    /// alone, and every value use is caught here regardless of its expected type -- including a
+    /// reference bound to a local before use (`f = peek; apply f t`), whose binding pushes down only
+    /// an unresolved type variable and so never reaches a `fn`-typed coercion.
+    fn eta_expand_borrowing_value(&mut self, id: ExprId, typ: Type, expected: &Type) -> Type {
+        if self.borrow_callee {
+            return typ;
+        }
+        let Type::Function(function_type) = self.follow_type(&typ).clone() else {
+            return typ;
+        };
+        if !self.function_reference_has_borrowing_param(id) {
+            return typ;
+        }
+        // The wrapper forwards to the function directly, where the borrow-eliding convention still
+        // applies, and owns its own parameters (released at scope exit -- it is a
+        // `coercion_wrapper_exprs` member, so re-inference keeps drop elaboration on).
+        let wrapper = if function_type.parameters.iter().all(|param| !param.is_implicit) {
+            // No implicit parameters: a plain eta-expansion `fn p -> f p`.
+            self.create_eta_wrapper(id, &function_type.parameters)
+        } else if !matches!(self.follow_type(expected), Type::Function(_)) {
+            // Implicit parameters, and no concrete `fn` expected type to drive the implicit-coercion
+            // arm in `coerce` -- a `let`-binding's right-hand side sees only a fresh variable. Left
+            // to that arm (which fires only at a concrete coercion) the wrapper would be built at the
+            // eventual use, capturing this local and calling it indirectly, where the borrow is
+            // invisible again and the retain is orphaned. Build it here instead, against the
+            // function's own type minus its implicits, so it references the function directly -- a
+            // call the elision reaches -- and its inserted `{Drop t}` is a delayed implicit resolved
+            // once a later use settles `t`.
+            let bare = Arc::new(FunctionType {
+                parameters: function_type.parameters.iter().filter(|p| !p.is_implicit).cloned().collect(),
+                environment: function_type.environment.clone(),
+                return_type: function_type.return_type.clone(),
+            });
+            match self.implicit_parameter_coercion(function_type.clone(), bare, id, None) {
+                Some(super::implicits::CoercionKind::Wrapper(wrapper)) => Some(wrapper),
+                _ => None,
+            }
+        } else {
+            // Implicit parameters with a concrete `fn` expected: the coercion arm handles it, there
+            // referencing the function directly for the same reason.
+            None
+        };
+        match wrapper {
+            Some(wrapper) => {
+                self.current_extended_context_mut().insert_expr(id, wrapper);
+                self.coercion_wrapper_exprs.insert(id);
+                self.infer_expr(id, expected)
+            },
+            None => typ,
+        }
+    }
+
     /// Returns the instantiated type of the given TopLevelName.
     ///
     /// Stores the result of the instantiation (if any) to the given [PathId].
@@ -630,7 +715,10 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             environment: self.next_type_variable(),
             return_type: expected.clone(),
         });
+        let callee_is_variable = matches!(self.expr_of(call.function).as_ref(), Expr::Variable(_));
+        let old_borrow_callee = std::mem::replace(&mut self.borrow_callee, callee_is_variable);
         let actual_function_type = self.infer_expr(call.function, &Type::Function(expected_function_type.clone()));
+        self.borrow_callee = old_borrow_callee;
 
         let actual_return_type = self.next_type_variable();
         Arc::make_mut(&mut expected_function_type).return_type = actual_return_type.clone();
@@ -740,6 +828,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             _ => return,
         };
         if let Some(place) = self.try_build_move_path(rhs) {
+            // An explicit drop of a borrowed alias binding releases a count its elided bind-retain
+            // never added -- restore the retain so the pair balances (the scope-exit release stays
+            // skipped: the drop marks the place moved below).
+            if let Some(bind_rhs) = self.borrowed_bindings.remove(&place.root_variable()) {
+                self.current_extended_context_mut().mark_retain_binding(bind_rhs);
+            }
             let location = arg.expr.locate(self);
             self.move_tracker.record_move(place, location);
         }

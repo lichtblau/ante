@@ -211,6 +211,16 @@ impl TypeChecker<'_, '_> {
         if self.captured_names.contains(&place.root_variable()) {
             return None;
         }
+        // A borrowed alias binding elided its bind-retain; its scope-exit release is elided with it
+        // (the pair must stay balanced).
+        if self.borrowed_bindings.contains_key(&place.root_variable()) {
+            return None;
+        }
+        // A borrowing parameter is caller-owned -- the call site either elided the retain or
+        // balances it with a post-call release; never release here.
+        if self.borrowed_local_params.contains(&place.root_variable()) {
+            return None;
+        }
         let typ = self.follow_type(typ).clone();
         if typ == Type::ERROR {
             return None;
@@ -545,6 +555,62 @@ impl TypeChecker<'_, '_> {
         self.expr_types.insert(item, Type::UNIT);
     }
 
+    /// Decide which explicit parameters of a top-level function are borrowing -- the callee never
+    /// releases them; statically-known call sites either elide the argument retain (pure implicits:
+    /// the callee provably cannot suspend) or balance it with a post-call release (the caller's
+    /// frame then holds the handle across any suspension). Runs BEFORE the body is inferred -- the
+    /// analysis is purely syntactic over resolved names -- so the release skip is in place when the
+    /// function scope pops.
+    ///
+    /// A parameter is borrowing iff it is by-value (immutable), its annotated type is
+    /// concretely `shared`, and the body never captures it in a nested lambda (tail/return
+    /// references are fine -- see [`Self::param_escapes_in_body`]). The whole function is
+    /// disqualified when any explicit parameter is function- or ability-typed: calling
+    /// those is a suspension avenue the call site cannot vet (implicit capabilities are
+    /// vetted per call site instead).
+    pub(super) fn compute_borrowed_param_mask(&mut self, fn_name: NameId, lambda: &cst::Lambda, expected: &Type) {
+        if !self.drop_elaboration_active() {
+            return;
+        }
+        let expected = self.follow_type(expected).clone();
+        let Type::Function(function_type) = &expected else { return };
+        if function_type.parameters.len() != lambda.parameters.len() {
+            return;
+        }
+        for (param, param_type) in lambda.parameters.iter().zip(&function_type.parameters) {
+            if param.is_implicit {
+                continue;
+            }
+            let typ = self.follow_type(&param_type.typ).clone();
+            if matches!(typ, Type::Function(_)) || self.is_ability(&typ) {
+                return;
+            }
+        }
+
+        let mut mask = Vec::new();
+        for (param, param_type) in lambda.parameters.iter().zip(&function_type.parameters) {
+            if param.is_implicit {
+                continue;
+            }
+            let typ = self.follow_type(&param_type.typ).clone();
+            let mut borrowing = false;
+            if !param.is_mutable && self.is_shared_user_defined(&typ) {
+                if let Some(name) = self.single_variable_pattern(param.pattern) {
+                    if !self.param_escapes_in_body(lambda.body, name) {
+                        borrowing = true;
+                        self.borrowed_local_params.insert(name);
+                    }
+                }
+            }
+            mask.push(borrowing);
+        }
+        if mask.iter().any(|b| *b)
+            && let Some(item) = self.current_item
+        {
+            self.borrowed_param_masks.entry(item).or_default().insert(fn_name, mask);
+        }
+    }
+
     /// The single variable a pattern binds (through type annotations), if it is that simple.
     pub(super) fn single_variable_pattern(&self, pattern: PatternId) -> Option<NameId> {
         match self.pattern_of(pattern).as_ref() {
@@ -563,6 +629,80 @@ impl TypeChecker<'_, '_> {
             cst::Pattern::TypeAnnotation(inner, _) => self.definition_binding_name(*inner),
             _ => None,
         }
+    }
+
+    /// True when `name` (a parameter) escapes the function through `expr` by being CAPTURED
+    /// by a nested lambda (the closure's bit-copy has no count of its own and may outlive
+    /// the call). Tail/return references are NOT escapes: a returned shared place gets an
+    /// escape retain (`mark_tail_escape_retains`, applied to lambda-body tails and explicit
+    /// `return`s alike), so the returned copy carries its own count -- the exact invariant
+    /// callee-owns parameters already rely on when they are returned. Call arguments, field
+    /// reads, and stores each carry their own balanced retain.
+    fn param_escapes_in_body(&self, expr: ExprId, name: NameId) -> bool {
+        let walk = |this: &Self, e: ExprId| this.param_escapes_in_body(e, name);
+        match self.expr_of(expr).as_ref() {
+            Expr::Lambda(_) => self.lambda_captures_name(expr, name),
+            Expr::Error
+            | Expr::Variable(_)
+            | Expr::Literal(_)
+            | Expr::Extern(_)
+            | Expr::Break
+            | Expr::Continue
+            | Expr::Quoted(_) => false,
+            Expr::Sequence(items) => items.iter().any(|item| walk(self, item.expr)),
+            Expr::Definition(definition) => walk(self, definition.rhs),
+            Expr::MemberAccess(access) => walk(self, access.object),
+            Expr::Call(call) => {
+                walk(self, call.function) || call.arguments.iter().any(|arg| walk(self, arg.expr))
+            },
+            Expr::If(if_) => {
+                walk(self, if_.condition) || walk(self, if_.then) || if_.else_.is_some_and(|e| walk(self, e))
+            },
+            Expr::Match(match_) => {
+                walk(self, match_.expression) || match_.cases.iter().any(|(_, branch)| walk(self, *branch))
+            },
+            // A handle's body and branches are lambdas; the Lambda arm above applies to them.
+            Expr::Handle(handle) => {
+                walk(self, handle.expression) || handle.cases.iter().any(|(_, branch)| walk(self, *branch))
+            },
+            Expr::Reference(reference) => walk(self, reference.rhs),
+            Expr::TypeAnnotation(annotation) => walk(self, annotation.lhs),
+            Expr::Constructor(constructor) => constructor.fields.iter().any(|(_, e)| walk(self, *e)),
+            Expr::While(w) => walk(self, w.condition) || walk(self, w.body),
+            Expr::For(f) => walk(self, f.start) || walk(self, f.end) || walk(self, f.body),
+            Expr::Return(return_) => walk(self, return_.expression),
+            Expr::Assignment(assignment) => {
+                walk(self, assignment.lhs)
+                    || walk(self, assignment.rhs)
+                    || assignment.op.as_ref().is_some_and(|(_, op)| walk(self, *op))
+            },
+            Expr::ArrayLiteral(elements) => elements.iter().any(|e| walk(self, *e)),
+            // Not yet desugared here (or unexpected): be conservative.
+            Expr::Is(_) | Expr::Do(_) | Expr::Loop(_) | Expr::InterpolatedString(_) => true,
+        }
+    }
+
+    /// `definition` is a borrowed alias binding -- a single un-annotated, immutable variable bound
+    /// to a whole-place read of another immutable local -- when its retain+release pair can be
+    /// elided. The alias's scope is lexically inside the source's and an immutable source is only
+    /// released at its own scope exit, so the handle outlives every use. `var` sources or field
+    /// reads keep the pair: `:=` through them releases the old value while the alias still points
+    /// at it.
+    pub(super) fn try_borrowed_alias_binding(&mut self, definition: &cst::Definition) -> Option<NameId> {
+        if definition.mutable || !self.drop_elaboration_active() {
+            return None;
+        }
+        let bound = match self.pattern_of(definition.pattern).as_ref() {
+            cst::Pattern::Variable(name) => *name,
+            _ => return None,
+        };
+        let rhs = self.current_extended_context()[definition.rhs].clone();
+        let Expr::Variable(path) = rhs else { return None };
+        let Some(Origin::Local(source)) = self.path_origin(path) else { return None };
+        if self.mutable_definitions.contains(&source) {
+            return None;
+        }
+        Some(bound)
     }
 
     /// Auto-ref of an rvalue in call-argument position (`println ("a" ++ "b")`): the callee

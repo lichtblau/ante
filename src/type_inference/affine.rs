@@ -451,7 +451,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         holds
     }
 
-    fn is_ability(&self, typ: &Type) -> bool {
+    pub(super) fn is_ability(&self, typ: &Type) -> bool {
         match typ.follow(&self.bindings) {
             // Type aliases are expanded away during `from_cst_type`, so no `UserDefined`
             // here can refer to an alias
