@@ -23,7 +23,7 @@ jobs:
     - name: Install Rust
       run: |
         sudo apt-get update
-        sudo apt-get install -y cargo rustc
+        sudo apt-get install -y cargo rustc musl-dev
         rustc --version
         cargo --version
     - name: Install LLVM 21
@@ -48,6 +48,9 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
+    - name: Install Rust
+      run: |
+        sudo apt-get install musl-dev
     - name: Build static musl binary
       run: .github/build.sh
     - name: Upload artifact
@@ -69,6 +72,9 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
+    - name: Install Rust
+      run: |
+        sudo apt-get install musl-dev
     - name: Build static musl binary
       # minicoro is linked in as a precompiled object rather than the .c
       # source, so ante is built to look for it at /minicoro.o - the path
