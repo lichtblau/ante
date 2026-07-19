@@ -1,0 +1,66 @@
+// A `shared` type's generic payload is torn down at refcount zero. `release_Box` cannot know what
+// a `t` needs -- that is the instantiation's business -- so it takes the answer as a parameter:
+// every generic the pointee owns adds a `{Drop g}` to the release function's signature, and the
+// synthesized teardown drops the payload through that capability. `Box String` reclaims the
+// character buffer; `Box I32` drops nothing at all.
+//
+// The witness is discharged like any other implicit, which means a function that destroys one of
+// these values needs it in scope. `consume` below is the shape that requires it: passing a freshly
+// built handle to a function that only borrows it leaves the caller holding the last reference.
+import Std.Vec.Vec, empty, push, drop_vec
+
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+// A product with a bare generic payload, and a concrete field alongside it: the release drops the
+// `R` through its own impl and the `t` through the capability.
+shared type Box t =
+    value: t
+    label: R
+
+// A sum whose generic payload sits in only one variant. `release_Tagged` still takes `{Drop t}`:
+// which variant is live is a runtime question, and the signature is not.
+shared type Tagged t =
+    | Plain R
+    | Marked t R
+
+// A container at a still-generic element type -- the case the leak warning used to name. `Vec`'s
+// own `{Drop t}` is discharged through this release's, so the buffer and its elements go.
+shared type Crate t = items: Vec t
+
+// A borrowing parameter: the callee never releases, so the caller tears the handle down once the
+// call returns. That release needs the same witness the callee's signature does not mention.
+size (_c: Crate t): U32 = 1
+
+consume (a: t) (b: t) {Drop t}: Unit =
+    var items = Vec.empty ()
+    push (mut items) a
+    push (mut items) b
+    // The handle is built here and only borrowed by `size`, so it dies at count zero on return.
+    println (size (Crate items))
+
+main () =
+    _boxed: Box String = Box "buffer" (R 3)
+    _primitive: Box I32 = Box 7 (R 4)
+    _marked: Tagged R = Marked (R 5) (R 6)
+    _plain: Tagged String = Plain (R 7)
+    println "built"
+    consume (R 1) (R 2)
+    println "done"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// built
+// drop 1
+// drop 2
+// 1
+// done
+// drop 7
+// drop 5
+// drop 6
+// drop 4
+// drop 3

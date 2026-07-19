@@ -1,0 +1,98 @@
+// A shared handle stored inside a generic container now releases when the container is torn
+// down. A shared type's teardown is its `release_T` -- decrement, and at zero tear the pointee down
+// and free the block -- but nothing expressed that as a `Drop` impl, so a handle satisfied no
+// `{Drop t}` constraint. `Vec`'s own impl needs `Drop t` to drop each element, so a `Vec Node` field
+// freed its buffer and released nothing: one release at the root freed exactly one node and
+// stranded the entire subtree.
+//
+// The compiler now supplies the impl (`impl Drop T with drop self = release_T self`) for every
+// shared type. A user-written one stays rejected -- it would have to skip the refcount -- so the
+// synthesized witness is the only `Drop` a shared type exposes.
+import Std.Vec.Vec, empty, push, drop_vec
+
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+// The motivating shape: a shared tree whose branches own a growable array of children.
+shared type Node =
+    | Leaf String R
+    | Branch (Vec Node)
+
+// One release at the root reclaims the whole subtree. `a` and `b` are still live locals here, so
+// each is retained by its `push` and released twice -- once by the Vec's teardown, once at its own
+// scope exit. The payload drops exactly once, at the release that reaches zero.
+tree () =
+    a: Node = Leaf "a" (R 1)
+    b: Node = Leaf "b" (R 2)
+    var kids = Vec.empty ()
+    push (mut kids) a
+    push (mut kids) b
+    _root: Node = Branch kids
+    println "tree built"
+
+// Scope exit of a plain local `Vec` of handles decrements every element -- no shared type's own
+// teardown involved, just the container's.
+vec_of_handles () =
+    x: Node = Leaf "x" (R 3)
+    y: Node = Leaf "y" (R 4)
+    var v = Vec.empty ()
+    push (mut v) x
+    push (mut v) y
+    println "vec built"
+
+// The same handle pushed twice and still held by name: three retains, three releases, one teardown.
+aliased () =
+    c: Node = Leaf "c" (R 5)
+    var v = Vec.empty ()
+    push (mut v) c
+    push (mut v) c
+    println "aliased"
+
+// A generic shared type's witness is generic too, and monomorphization specializes it alongside the
+// `release_T` it calls.
+shared type Box t =
+    | Full R t
+    | Empty
+
+generic () =
+    p: Box I32 = Full (R 6) 60
+    var v = Vec.empty ()
+    push (mut v) p
+    println "generic"
+
+// Churn: a leak or a double-release here is one per iteration, not a one-off.
+churn (n: I32) =
+    var i = 0
+    while i < n do
+        leaf: Node = Leaf "churn" (R 9)
+        var v = Vec.empty ()
+        push (mut v) leaf
+        i := i + 1
+
+main () =
+    tree ()
+    vec_of_handles ()
+    aliased ()
+    generic ()
+    churn 2
+    println "done"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// tree built
+// drop 2
+// drop 1
+// vec built
+// drop 4
+// drop 3
+// aliased
+// drop 5
+// generic
+// drop 6
+// drop 9
+// drop 9
+// done

@@ -935,25 +935,30 @@ impl Builder {
             },
             mir::Instruction::RcRetain(value) => {
                 // Increment the refcount at `value - ANTE_RC_HEADER_SIZE`. A count of 0 marks an
-                // immortal static (0-arg constructor), left untouched. Only emitted for non-null
-                // user shared handles, so no null guard (unlike FreeShared).
+                // immortal static (0-arg constructor), left untouched. `ANTE_RC_DYING` marks a block
+                // whose teardown is already running -- retaining it is resurrection, and fatal.
+                // Only emitted for non-null user shared handles, so no null guard (unlike FreeShared).
                 let _ = write!(self.current_item, "AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
                 self.write_value(value, mir);
                 let _ = write!(
                     self.current_item,
-                    " - ANTE_RC_HEADER_SIZE); if ({id}_h->count) {id}_h->count += 1; Unit {id} = (Unit){{0}};"
+                    " - ANTE_RC_HEADER_SIZE); size_t {id}_c = {id}_h->count; \
+                     if ({id}_c == ANTE_RC_DYING) ante_rc_resurrected(); \
+                     if ({id}_c) {id}_h->count = {id}_c + 1; Unit {id} = (Unit){{0}};"
                 );
             },
             mir::Instruction::RcDecrement(value) => {
                 // Decrement and report whether the count reached zero (was exactly 1), so the
                 // caller runs the pointee glue + FreeShared. A count of 0 is an immortal static:
-                // left untouched, returns false.
+                // left untouched, returns false. Reaching zero stores `ANTE_RC_DYING` rather than 0
+                // so that a retain from inside the teardown that follows is distinguishable from a
+                // retain of an immortal static -- see [`CFile::add_starter_items`].
                 let _ = write!(self.current_item, "AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
                 self.write_value(value, mir);
                 let _ = write!(
                     self.current_item,
                     " - ANTE_RC_HEADER_SIZE); size_t {id}_c = {id}_h->count; bool {id} = false; \
-                     if ({id}_c) {{ {id}_h->count = {id}_c - 1; {id} = ({id}_c == 1); }}"
+                     if ({id}_c) {{ {id} = ({id}_c == 1); {id}_h->count = {id} ? ANTE_RC_DYING : {id}_c - 1; }}"
                 );
             },
             mir::Instruction::RetainClosureEnv(value) => {

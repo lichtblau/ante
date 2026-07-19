@@ -60,9 +60,38 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // fields that mention `n` agree on `n`'s kind.
         let mut local_kinds = Self::local_kinds_from_generics(&definition.generics);
 
+        // The pointee's fields: every constructor's parameters, in declaration order, each with
+        // the location of its type. Only collected for `shared` types -- the release-glue check
+        // below is their only consumer.
+        let mut pointee_fields = Vec::new();
+
         for (constructor_name, args) in constructors.iter() {
             let actual = self.build_constructor_type(type_name, definition, &generics, args, &mut local_kinds);
+            if definition.shared {
+                let field_types = Self::constructor_field_types(&actual);
+                assert_eq!(args.len(), field_types.len());
+                pointee_fields.extend(args.iter().map(|arg| arg.location.clone()).zip(field_types));
+            }
             self.check_name(*constructor_name, &actual);
+        }
+
+        if definition.shared {
+            // The handle type, as `release_T` receives it: the type applied to its own generics.
+            let (self_type, substitutions) = self.type_definition_type(type_name, definition, false);
+            assert!(substitutions.is_empty());
+            let location = definition.name.locate(self);
+            self.check_shared_release_glue(&self_type, &location, &pointee_fields);
+        }
+    }
+
+    /// The field types of a constructor type built by [`Self::build_constructor_type`]:
+    /// `forall <generics>. fn <fields> -> T` for a constructor with arguments, and the bare data
+    /// type for a nullary one (`Nil`), which has no fields.
+    fn constructor_field_types(typ: &Type) -> Vec<Type> {
+        match typ {
+            Type::Forall(_, body) => Self::constructor_field_types(body),
+            Type::Function(function) => mapvec(&function.parameters, |parameter| parameter.typ.clone()),
+            _ => Vec::new(),
         }
     }
 

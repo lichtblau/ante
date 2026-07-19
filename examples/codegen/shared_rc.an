@@ -30,7 +30,7 @@ make_black (tree: RbTree t): RbTree t =
     | Empty -> Empty
     | Tree _ l x r -> Tree B l x r
 
-ins (tree: RbTree t) (x: t) {Cmp t} {Copy t}: RbTree t =
+ins (tree: RbTree t) (x: t) {Cmp t} {Copy t} {Drop t}: RbTree t =
     match tree
     | Empty -> Tree R Empty x Empty
     | Tree color l y r ->
@@ -38,7 +38,7 @@ ins (tree: RbTree t) (x: t) {Cmp t} {Copy t}: RbTree t =
         else if y < x then balance (Tree color l y (ins r x))
         else tree
 
-insert (tree: RbTree t) (x: t) {Cmp t} {Copy t}: RbTree t =
+insert (tree: RbTree t) (x: t) {Cmp t} {Copy t} {Drop t}: RbTree t =
     make_black (ins tree x)
 
 contains (tree: RbTree t) (x: t) {Cmp t} {Copy t}: Bool =

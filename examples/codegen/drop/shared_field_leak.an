@@ -1,0 +1,58 @@
+// What a `shared` type's pointee still leaks at refcount zero. The answer is now: nothing that can
+// be written here. Teardown is synthesized at the definition (`shared_drop_fields.an` is the test
+// that it runs) and a release function carries `{Drop g}` for the generics its pointee owns
+// (`shared_generic_payload.an`), so every shape below is reached. This file is the standing check
+// that the warning stays silent for all of them -- it names a field whose `Drop` impl the glue
+// cannot call, and there is no longer one to name.
+//
+// Note the `drop_vec` import: teardown can only resolve impls visible where the shared type is
+// defined, which is also the only resolution point that cannot depend on which file releases first.
+import Std.Vec.Vec, empty, drop_vec
+
+// String's `Drop` impl is called at count zero, so the character buffer is reclaimed.
+shared type Leaf = name: String
+
+// A non-shared aggregate field expands structurally, reaching the `String` inside it.
+type Boxed = label: String
+shared type Wrapper = boxed: Boxed
+
+// Vec's `Drop` impl frees the growable buffer (`{Drop I32}` resolves here).
+shared type Bag = items: Vec I32
+
+// A sum lowers to an exhaustive match, one arm per variant.
+shared type Doc =
+    | Empty
+    | Text String
+    | Section String (Vec I32)
+
+// A container held at a still-generic element type. `Vec`'s `{Drop t}` cannot be discharged at a
+// type definition, which has no implicit scope -- so `release_Crate` takes the constraint itself
+// (`fn Crate {Drop t} -> Unit`) and the glue discharges `drop_vec` through it. Its buffer used to
+// leak for every instantiation; this is the field the warning last named.
+shared type Crate t = items: Vec t
+
+// Primitives own nothing.
+shared type Point = x: I32, y: I32
+
+// A directly-held shared handle is a recursive `release_Point` call, as it always was.
+shared type Holder = origin: Point
+
+// The non-shared `Maybe` is walked and the handle inside it released.
+shared type Linked = next: Maybe Linked
+
+// A bare `Ptr` is opaque by design -- it carries no length and no ownership claim, so its Prelude
+// `Drop` impl is empty, and the generic behind it is not owned: `release_Raw` asks for no witness.
+// Buffer knowledge belongs to the type that owns the pointer.
+shared type Raw t = data: Ptr t
+
+// A bare generic payload: `release_Box` takes `{Drop t}` and drops it through that.
+shared type Box t = value: t
+
+main () =
+    p = Point 1 2
+    h = Holder p
+    println h.origin.x
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// 1

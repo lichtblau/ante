@@ -141,11 +141,6 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         if definition.implicit {
-            // Auto-drop: custom Drop impls on `shared` types have no coherent run point.
-            if is_top_level {
-                self.reject_shared_drop_impl(&expected_type, definition.pattern);
-            }
-
             // Local definitions without types are fine, they won't cause globally cascading
             // errors on every implicit search site if their type is too general.
             let has_type = !is_top_level
@@ -608,8 +603,22 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             }
             return typ;
         }
+        if Self::is_drop_impl_name(*name) {
+            let typ = self.drop_impl_generalized_type(name.top_level_item);
+            let (typ, bindings) = self.instantiate(typ);
+            if let Some(bindings) = bindings {
+                self.current_extended_context_mut().insert_instantiation(path, bindings);
+            }
+            return typ;
+        }
         if let Some(typ) = self.item_types.get(name) {
-            typ.clone()
+            let typ = typ.clone();
+            let Some(polytype) = self.in_scc_polytype(&typ) else { return typ };
+            let (typ, bindings) = self.instantiate(polytype);
+            if let Some(bindings) = bindings {
+                self.current_extended_context_mut().insert_instantiation(path, bindings);
+            }
+            typ
         } else {
             let typ = GetType(*name).get(self.compiler);
             let (typ, bindings) = self.instantiate(typ);
@@ -618,6 +627,21 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             }
             typ
         }
+    }
+
+    /// A name in the SCC being checked normally has a monotype here -- inference is still
+    /// running, and a recursive call must see the same type variables the definition is being
+    /// inferred with (that is what keeps recursion monomorphic). A type constructor is the
+    /// exception: `build_constructor_type` produces its whole `forall <generics>. ...` up front, so
+    /// it is a finished polytype and referencing it must instantiate, exactly as `GetType` would
+    /// for a constructor from any other item.
+    ///
+    /// A type definition is never in an SCC with anything else (`item_lacks_known_type` gives it no
+    /// dependency edges), so the only reference reaching this is the shared-drop glue synthesized
+    /// into the type's own item -- which needs its own constructors to build the pointee's match.
+    fn in_scc_polytype(&self, typ: &Type) -> Option<Type> {
+        let typ = self.follow_type(typ);
+        matches!(typ, Type::Forall(..)).then(|| typ.clone())
     }
 
     /// Returns the type of a [TopLevelName], possibly instantiating it and returning the bindings,
@@ -629,8 +653,16 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             let typ = self.release_function_generalized_type(name.top_level_item);
             return self.instantiate(typ);
         }
+        if Self::is_drop_impl_name(*name) {
+            let typ = self.drop_impl_generalized_type(name.top_level_item);
+            return self.instantiate(typ);
+        }
         if let Some(typ) = self.item_types.get(name) {
-            (typ.clone(), None)
+            let typ = typ.clone();
+            match self.in_scc_polytype(&typ) {
+                Some(polytype) => self.instantiate(polytype),
+                None => (typ, None),
+            }
         } else {
             let typ = GetType(*name).get(self.compiler);
             self.instantiate(typ)
@@ -796,6 +828,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
 
         // A lot of Extract implicits (.[]) break without this
         self.resolve_new_delayed_implicits(implicit_count_before_call);
+
+        // Auto-drop: a shared rvalue argument at a borrowing parameter is released by the caller
+        // once the call returns, and the MIR builder emits that release with no access to implicit
+        // search -- so resolve any witnesses it will need now, while this scope's implicits are live.
+        self.record_release_witnesses(call);
 
         // Auto-drop: attach the auto-ref temporary drops queued by this call's argument
         // coercions, so they run right after the call returns. This must happen BEFORE the

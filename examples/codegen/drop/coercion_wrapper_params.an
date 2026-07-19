@@ -1,0 +1,45 @@
+// Passing a function to a higher-order function by name is not the same as passing a lambda. When
+// the named function carries implicit parameters, the checker rewrites the reference into a wrapper
+// lambda that supplies them (`fn p q -> step p {Drop t} q`). That wrapper is the only form the
+// function takes at the indirect call, so it is what owns -- and must release -- every argument the
+// caller hands it.
+//
+// It released nothing. The wrapper is re-checked with move recording suppressed (the moves were
+// already recorded for the reference it replaced), and `drop_elaboration_active` reads that same
+// flag, so drop elaboration was off for the wrapper's entire body: no drop scope, no parameter
+// drops, no glue at all. Every accumulator `foldl` handed it was orphaned -- the 767 KB leak in
+// `examples/codegen/shared.an`, whose `foldl (iota size) RbTree.Empty insert` passes `insert`
+// (three implicit capabilities) by name.
+//
+// Nothing here is about closure captures: the wrapper captures nothing. It is about the wrapper's
+// own parameters.
+import Std.Stream.foldl, iota, stream_fn
+
+shared type Acc = n: I32
+
+impl drop_acc: Drop Acc with
+    drop (a: mut Acc) =
+        print "  drop "
+        println a.n
+
+// `_x: t` is an owned generic the body drops, so `step` needs `{Drop t}` -- an implicit parameter,
+// which is exactly what makes `foldl (iota 3) (Acc 0) step` build the coercion wrapper. `old` is a
+// concretely-`shared` by-value parameter, so `step` itself borrows it and never releases it: the
+// wrapper is the only thing that can.
+step (old: Acc) (_x: t) {Drop t}: Acc = Acc (old.n + 1)
+
+main () =
+    // Each step supersedes the accumulator, so every intermediate must die here, in order, as the
+    // wrapper releases what `foldl` moved into it. The last one survives to be returned.
+    total = foldl (iota 3) (Acc 0) step
+    println total.n
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+//   drop 0
+//   drop 1
+//   drop 2
+// 3
+// end
+//   drop 3

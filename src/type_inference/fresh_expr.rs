@@ -159,6 +159,15 @@ pub struct ExtendedTopLevelContext {
     /// edge, which otherwise has no block: the MIR builder materializes a real else block
     /// running these drops.
     implicit_else_drops: BTreeMap<ExprId, Vec<ExprId>>,
+
+    /// The `{Drop g}` capability arguments a shared rvalue call argument's post-call release
+    /// needs, keyed by that argument's expression. A rvalue handed to a borrowing parameter stays
+    /// the caller's to tear down, and the MIR builder emits that release from the argument's type
+    /// alone -- it cannot run implicit search, so when the type's `release_T` wants witnesses they
+    /// are resolved here instead. Resolved for every non-place shared argument, since whether the
+    /// callee's parameter borrows is only settled once the callee's inference has finished; an
+    /// entry the builder never reads emits no code.
+    release_witnesses: FxHashMap<ExprId, Vec<ExprId>>,
 }
 
 impl<'local, 'innter> TypeChecker<'local, 'innter> {
@@ -213,6 +222,7 @@ impl ExtendedTopLevelContext {
             post_expr_drops: Default::default(),
             pre_exit_drops: Default::default(),
             implicit_else_drops: Default::default(),
+            release_witnesses: Default::default(),
         }
     }
 
@@ -467,6 +477,9 @@ impl ExtendedTopLevelContext {
         if let Some(drops) = self.implicit_else_drops.get(&from).cloned() {
             self.implicit_else_drops.insert(to, drops);
         }
+        if let Some(witnesses) = self.release_witnesses.get(&from).cloned() {
+            self.release_witnesses.insert(to, witnesses);
+        }
     }
 
     pub fn is_move_closure(&self, expr: ExprId) -> bool {
@@ -568,6 +581,16 @@ impl ExtendedTopLevelContext {
 
     pub fn implicit_else_drops(&self, expr: ExprId) -> Option<&Vec<ExprId>> {
         self.implicit_else_drops.get(&expr)
+    }
+
+    /// Record the `{Drop g}` witnesses a post-call release of the rvalue argument `expr` would
+    /// need; see [Self::release_witnesses].
+    pub(crate) fn push_release_witnesses(&mut self, expr: ExprId, witnesses: Vec<ExprId>) {
+        self.release_witnesses.insert(expr, witnesses);
+    }
+
+    pub fn release_witnesses(&self, expr: ExprId) -> Option<&Vec<ExprId>> {
+        self.release_witnesses.get(&expr)
     }
 }
 

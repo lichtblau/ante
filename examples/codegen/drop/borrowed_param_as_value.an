@@ -1,0 +1,57 @@
+// A borrowing parameter is a promise struck between a function and its direct callers: `peek`
+// never releases `b`, and every direct call elides the matching argument retain to keep the count
+// balanced (`compute_borrowed_param_mask` / `borrowed_param_mask_of_callee`). Handed to a
+// higher-order function by name, `peek` becomes a plain function value, and the indirect call
+// inside `apply` cannot see that promise: it retains for a callee it assumes will release, and the
+// reference is orphaned -- one leak per call.
+//
+// `peek` has no implicit parameters, so no wrapper was ever built for it (contrast `insert` in
+// `shared.an`, saved only because its `{Cmp}{Copy}{Drop}` forced one into being). Passing it as a
+// value now eta-expands it -- `fn p -> peek p` -- which owns its parameter and releases it, while
+// its body calls `peek` directly where the elision still holds. The Drop impl makes the release
+// observable: without the wrapper, none of these `drop` lines print.
+shared type Box = v: I32
+
+impl drop_box: Drop Box with
+    drop (b: mut Box) =
+        print "  drop "
+        println b.v
+
+peek (b: Box): I32 = b.v
+
+apply (g: fn Box -> I32) (x: Box): I32 = g x
+
+// Two borrowing parameters, exercising a multi-argument wrapper (`fn p q -> pick p q`).
+pick (a: Box) (b: Box): I32 = a.v + b.v
+
+apply2 (g: fn Box Box -> I32) (a: Box) (b: Box): I32 = g a b
+
+// The reference bound to a local first, then used. The binding pushes down only an unresolved type
+// variable, so a coercion against a `fn` type never fires here -- the eta-expansion is triggered
+// when the reference is inferred in value position (`borrow_callee` is false), not at a coercion, so
+// `g` becomes the wrapper and the two boxes below still drop.
+bound_first () =
+    g = peek
+    println (apply g (Box 4))
+    println (apply g (Box 5))
+
+main () =
+    // Each rvalue is owned by `apply`/`apply2` and released once the call returns -- the release now
+    // routed through the eta-wrapper's parameter rather than orphaned.
+    println (apply peek (Box 1))
+    println (apply2 pick (Box 2) (Box 3))
+    bound_first ()
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+//   drop 1
+// 1
+//   drop 3
+//   drop 2
+// 5
+//   drop 4
+// 4
+//   drop 5
+// 5
+// end

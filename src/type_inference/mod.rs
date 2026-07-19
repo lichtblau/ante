@@ -134,6 +134,32 @@ pub struct IndividualTypeCheckResult {
     /// reference, but not one derived from a parameter" (a local/immortal, or lost through a
     /// nominal wrapper the may-alias test can't see -- 10 keeps the fallback floor for the latter).
     pub return_origins: FxHashMap<NameId, Vec<bool>>,
+
+    /// For a `shared type` definition item whose pointee needs teardown the MIR release glue
+    /// cannot perform: the teardown, synthesized here ([`TypeChecker::check_shared_release_glue`]).
+    /// `None` for every other item, and for a shared type whose pointee the hand-built glue
+    /// already covers -- those keep it, including its tail-chase loop.
+    pub shared_drop_glue: Option<SharedDropGlue>,
+}
+
+/// A `shared type`'s pointee teardown, synthesized at its definition site because only the
+/// checker can resolve `Drop` impls (see [`TypeChecker::check_shared_release_glue`]). The MIR
+/// builder inlines it into `release_T`'s at-zero block, ahead of the `FreeShared`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedDropGlue {
+    /// The handle the teardown projects the pointee's fields through. The MIR builder binds it
+    /// to `release_T`'s first parameter.
+    pub handle: NameId,
+
+    /// One `{Drop g}` capability per generic the pointee owns, in declaration order -- the
+    /// implicit parameters `release_function_generalized_type` gives `release_T`. The MIR builder
+    /// binds each to the matching parameter; the teardown drops owned generic payloads through
+    /// them.
+    pub drop_caps: Vec<NameId>,
+
+    /// The teardown itself: a `Sequence` of per-field drops for a product, an exhaustive
+    /// `Match` for a sum. Drops user `Drop` impls, releases shared fields, expands aggregates.
+    pub body: ExprId,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -256,6 +282,10 @@ struct TypeChecker<'local, 'inner> {
     /// of this type is provably a no-op, so drop synthesis is skipped entirely.
     no_drop_cache: FxHashMap<Type, bool>,
 
+    /// Memoized `field_release_glue_gap` verdicts for concrete types: `Some` = a shared type
+    /// holding a field of this type leaks it when its refcount reaches zero.
+    shared_glue_cache: FxHashMap<Type, Option<SharedLeak>>,
+
     /// Caches the `(shared, mutable)` flags of user-defined types so `shared_type_flags`
     /// does not re-run the `GetItemRaw` query (and its dependency registration) per call.
     shared_flags_cache: RefCell<FxHashMap<TopLevelId, Option<(bool, bool)>>>,
@@ -304,6 +334,11 @@ struct TypeChecker<'local, 'inner> {
     /// Masks computed by [`Self::compute_borrowed_param_mask`], keyed by
     /// item then function name, moved into each [`IndividualTypeCheckResult`] at `finish`.
     borrowed_param_masks: FxHashMap<TopLevelId, FxHashMap<NameId, Vec<bool>>>,
+
+    /// The pointee teardown synthesized for each `shared type` definition in this group that
+    /// needs one ([`Self::check_shared_release_glue`]), moved into that item's
+    /// [`IndividualTypeCheckResult::shared_drop_glue`] at `finish`.
+    shared_glue_types: FxHashMap<TopLevelId, SharedDropGlue>,
 
     /// Return-origin summaries computed by [`Self::compute_return_origin_summary`], keyed by item
     /// then function name, moved into each [`IndividualTypeCheckResult`] at `finish` (same
@@ -399,6 +434,11 @@ struct TypeChecker<'local, 'inner> {
 /// Map from each TopLevelId to a tuple of (the item, parse context, resolution context)
 type ItemContexts = FxHashMap<TopLevelId, (Arc<TopLevelItem>, Arc<DesugarContext>, Arc<ResolutionResult>)>;
 
+/// A field of a `shared` type's pointee that its release glue cannot tear down: the type that
+/// owns the un-reclaimed data (the field's own type, or one nested inside it), and why the glue
+/// cannot reach it.
+type SharedLeak = (Type, crate::diagnostics::SharedLeakReason);
+
 impl<'local, 'inner> TypeChecker<'local, 'inner> {
     fn new(item_contexts: &'local ItemContexts, compiler: &'local DbHandle<'inner>) -> Self {
         let id_contexts = item_contexts
@@ -433,6 +473,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             copy_search_cache: Default::default(),
             drop_search_cache: Default::default(),
             no_drop_cache: Default::default(),
+            shared_glue_cache: Default::default(),
             shared_flags_cache: Default::default(),
             ability_cache: Default::default(),
             auto_drop: crate::incremental::AutoDrop.get(compiler),
@@ -444,6 +485,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             in_handler_scoped_lambda: false,
             summary_binding_name: None,
             borrowed_param_masks: Default::default(),
+            shared_glue_types: Default::default(),
             return_origin_summaries: Default::default(),
             borrowed_local_params: Default::default(),
             borrowed_bindings: Default::default(),
@@ -604,10 +646,21 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 let generalized = generalized.remove(&id).unwrap_or_default();
                 let borrowed_params = self.borrowed_param_masks.remove(&id).unwrap_or_default();
                 let return_origins = self.return_origin_summaries.remove(&id).unwrap_or_default();
+                let shared_drop_glue = self.shared_glue_types.remove(&id);
                 let mut context = self.id_contexts.remove(&id).unwrap();
                 let item_context = self.item_contexts.get(&id).unwrap();
                 context.extend_from_resolution_result(item_context.2.as_ref());
-                (id, IndividualTypeCheckResult { maps, generalized, context, borrowed_params, return_origins })
+                (
+                    id,
+                    IndividualTypeCheckResult {
+                        maps,
+                        generalized,
+                        context,
+                        borrowed_params,
+                        return_origins,
+                        shared_drop_glue,
+                    },
+                )
             })
             .collect();
 
@@ -1317,6 +1370,26 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
     }
 
+    /// [`TopLevelId::type_body`], but safe to call for a type definition in the SCC being checked
+    /// right now.
+    ///
+    /// `type_body` reads a type's constructor types out of its finished `TypeCheck` result, so
+    /// asking it about an item this checker is currently checking would re-enter that very query
+    /// -- an incremental cycle. Those constructor types are already here, though (the definition
+    /// check unified each one into `item_types`), so build the body from them directly. Every
+    /// consumer inside inference goes through this, which is what lets the shared-drop glue
+    /// mention the type it is being synthesized for.
+    pub(super) fn type_body_of(&self, id: TopLevelId, arguments: Option<&[Type]>) -> TypeBody {
+        let Some((item, item_context, _)) = self.item_contexts.get(&id) else {
+            return id.type_body(arguments, self.compiler);
+        };
+        let constructor_type = |name| match self.item_types.get(&TopLevelName::new(id, name)) {
+            Some(typ) => typ.follow(&self.bindings).clone(),
+            None => Type::ERROR,
+        };
+        type_body::build_type_body(&item.kind, item_context, arguments, &self.bindings, constructor_type)
+    }
+
     /// Convert a [cst::Type] into a [Type]. If `allow_implicit_type_vars` is true, we'll
     /// insert type variables to make functions automatically polymorphic over effects or
     /// their closure environment. If false, we'll assume these to be pure or empty.
@@ -1434,7 +1507,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             },
             Type::UserDefined(origin) => {
                 if let Origin::TopLevelDefinition(id) = origin {
-                    let body = id.top_level_item.type_body(generic_args, self.compiler);
+                    let body = self.type_body_of(id.top_level_item, generic_args);
                     if let TypeBody::Product { fields, .. } = body {
                         let fields = fields.into_iter().enumerate();
                         return fields.map(|(i, (name, typ))| (name, (typ, i as u32))).collect();

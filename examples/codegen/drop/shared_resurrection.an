@@ -1,0 +1,46 @@
+// The hazard a user `Drop` impl on a `shared` type opens: the impl's receiver is the handle, and
+// nothing stops it from copying that handle somewhere that outlives the block. The refcount already
+// reached zero -- that is why the impl is running -- and `FreeShared` runs the moment it returns, so
+// the copy dangles.
+//
+// The retain that makes the copy is where the mistake is, so that is where it is caught. A block
+// being torn down carries a distinct refcount (`ANTE_RC_DYING`), and retaining one aborts. A plain
+// zero could not carry the news: that is the immortal static count, which retain must ignore.
+//
+// Without the check this program prints `7` out of freed memory, and only a sanitizer notices.
+shared mut type Cell = held: Maybe Node
+
+shared type Node =
+    id: I32
+    cell: Cell
+
+impl copy_cell: Copy Cell with
+    (.*) = deref
+
+impl copy_node: Copy Node with
+    (.*) = deref
+
+impl drop_node: Drop Node with
+    drop (n: mut Node) =
+        print "dying "
+        println n.id
+        // Resurrection: the handle escapes into a cell that outlives this block.
+        n.cell.held := Some n.*
+
+// The node is built and dropped here, so the cell outlives it.
+make (c: Cell): Unit =
+    _n = Node 7 c
+    ()
+
+main () =
+    c = Cell None
+    make c
+    // Never reached: the retain inside `drop_node` aborts.
+    println "resurrected"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// dying 7
+
+// expected stderr:
+// ante: a shared value was resurrected: its refcount reached zero and its Drop impl copied the handle back out. The block is freed when the impl returns, so the copy would dangle.

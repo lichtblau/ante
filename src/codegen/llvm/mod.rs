@@ -8,7 +8,7 @@ use inkwell::{
     passes::PassBuilderOptions,
     targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine},
     types::{BasicType, BasicTypeEnum, IntType},
-    values::{AggregateValue, BasicValue, BasicValueEnum, FunctionValue, PhiValue},
+    values::{AggregateValue, BasicValue, BasicValueEnum, FunctionValue, IntValue, PhiValue},
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,12 @@ pub struct CodegenLlvmResult {
 /// [mir::Instruction::FreeShared] -- which only sees a type-erased pointer -- can subtract it
 /// blindly.
 const RC_HEADER_BYTES: u64 = 16;
+
+/// The count a shared block wears between "the last reference went away" and `FreeShared`. During
+/// that window a user `Drop` impl is running and can still see the handle, so it can copy it
+/// somewhere that outlives the free. A plain 0 could not say so: that is the immortal static
+/// sentinel, which retain deliberately ignores. Mirrors the C backend's `ANTE_RC_DYING`.
+const RC_DYING: u64 = u64::MAX;
 
 pub fn initialize_native_target() {
     let config = InitializationConfig::default();
@@ -593,6 +599,65 @@ impl<'ctx> ModuleContext<'ctx> {
         self.llvm.const_struct(&[], false).into()
     }
 
+    /// Abort if `count` is [`RC_DYING`] -- a retain of a block whose teardown is already running.
+    ///
+    /// The handle the user's `Drop` impl receives is a live pointer, so nothing stops the impl from
+    /// copying it into somewhere that outlives the block. It would dangle: `FreeShared` runs a few
+    /// instructions later regardless. Trapping here names the mistake at the retain that makes it,
+    /// rather than leaving a use-after-free to be found later (or not).
+    ///
+    /// Splits the current block. Safe for the phi nodes built later, because a terminator records
+    /// its predecessor as `builder.get_insert_block()` -- the continuation -- rather than the block
+    /// the MIR started in.
+    fn trap_on_resurrection(&mut self, count: IntValue<'ctx>) {
+        let i64_ty = self.llvm.i64_type();
+        let is_dying = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(RC_DYING, false), "")
+            .unwrap();
+
+        let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let trap = self.llvm.append_basic_block(parent, "rc_resurrected");
+        let cont = self.llvm.append_basic_block(parent, "rc_retain");
+        self.builder.build_conditional_branch(is_dying, trap, cont).unwrap();
+
+        self.builder.position_at_end(trap);
+        let message = "ante: a shared value was resurrected: its refcount reached zero and its Drop impl \
+                       copied the handle back out. The block is freed when the impl returns, so the copy \
+                       would dangle.\n";
+        let message_length = message.len();
+        let message = self.builder.build_global_string_ptr(message, "").unwrap();
+        let ptr_ty = self.llvm.ptr_type(AddressSpace::default());
+        let i32_ty = self.llvm.i32_type();
+        let i64_ty = self.llvm.i64_type();
+
+        // `abort` discards whatever the program has buffered on stdout -- including the output of
+        // the `Drop` impl that just ran, which is the context that makes the message legible -- so
+        // flush every stream (`fflush(NULL)`) before writing. The message itself goes to fd 2 rather
+        // than through `puts`/`fputs`: `Std.C` binds those under their real C names, and reusing the
+        // module's declaration of one would call it with the wrong signature.
+        let fflush = self.module.get_function("fflush").unwrap_or_else(|| {
+            self.module.add_function("fflush", i32_ty.fn_type(&[ptr_ty.into()], false), None)
+        });
+        self.builder.build_call(fflush, &[ptr_ty.const_null().into()], "").unwrap();
+
+        let write = self.module.get_function("write").unwrap_or_else(|| {
+            let signature = i64_ty.fn_type(&[i32_ty.into(), ptr_ty.into(), i64_ty.into()], false);
+            self.module.add_function("write", signature, None)
+        });
+        let length = i64_ty.const_int(message_length as u64, false);
+        let arguments = [i32_ty.const_int(2, false).into(), message.as_pointer_value().into(), length.into()];
+        self.builder.build_call(write, &arguments, "").unwrap();
+
+        let abort = self.module.get_function("abort").unwrap_or_else(|| {
+            self.module.add_function("abort", self.llvm.void_type().fn_type(&[], false), None)
+        });
+        self.builder.build_call(abort, &[], "").unwrap();
+        self.builder.build_unreachable().unwrap();
+
+        self.builder.position_at_end(cont);
+    }
+
     fn codegen_instruction(&mut self, function: &mir::Definition, id: mir::InstructionId) {
         let result = match &function.instructions[id] {
             mir::Instruction::Call { function: function_value, arguments } => {
@@ -681,14 +746,17 @@ impl<'ctx> ModuleContext<'ctx> {
             },
             mir::Instruction::RcRetain(value) => {
                 // Increment the count at `value - RC_HEADER_BYTES` (the first header word).  A
-                // count of 0 is an immortal static, kept unchanged via a select. Only emitted for
-                // non-null user shared handles, so no null guard (unlike FreeShared).
+                // count of 0 is an immortal static, kept unchanged via a select. `RC_DYING` marks a
+                // block whose teardown is already running -- retaining it is resurrection, and
+                // fatal. Only emitted for non-null user shared handles, so no null guard (unlike
+                // FreeShared).
                 let ptr = self.lookup_value(value).into_pointer_value();
                 let i8_ty = self.llvm.i8_type();
                 let i64_ty = self.llvm.i64_type();
                 let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
                 let count_ptr = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
                 let count = self.builder.build_load(i64_ty, count_ptr, "").unwrap().into_int_value();
+                self.trap_on_resurrection(count);
                 let is_immortal =
                     self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(0, false), "").unwrap();
                 let incremented = self.builder.build_int_add(count, i64_ty.const_int(1, false), "").unwrap();
@@ -699,7 +767,9 @@ impl<'ctx> ModuleContext<'ctx> {
             mir::Instruction::RcDecrement(value) => {
                 // Decrement the count and return whether it was exactly 1 (reached zero → caller
                 // runs the glue + FreeShared). A count of 0 is an immortal static: kept at 0 via a
-                // select, returns false.
+                // select, returns false. Reaching zero stores `RC_DYING` rather than 0, so that a
+                // retain from inside the teardown that follows is distinguishable from a retain of
+                // an immortal static -- see [`Self::trap_on_resurrection`].
                 let ptr = self.lookup_value(value).into_pointer_value();
                 let i8_ty = self.llvm.i8_type();
                 let i64_ty = self.llvm.i64_type();
@@ -708,12 +778,14 @@ impl<'ctx> ModuleContext<'ctx> {
                 let count = self.builder.build_load(i64_ty, count_ptr, "").unwrap().into_int_value();
                 let is_immortal =
                     self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(0, false), "").unwrap();
-                let decremented = self.builder.build_int_sub(count, i64_ty.const_int(1, false), "").unwrap();
-                let to_store = self.builder.build_select(is_immortal, count, decremented, "").unwrap().into_int_value();
-                self.builder.build_store(count_ptr, to_store).unwrap();
                 // Reached zero iff the count was exactly 1 (immortal 0 → false, >1 → false).
                 let reached_zero =
                     self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(1, false), "").unwrap();
+                let decremented = self.builder.build_int_sub(count, i64_ty.const_int(1, false), "").unwrap();
+                let dying = i64_ty.const_int(RC_DYING, false);
+                let next = self.builder.build_select(reached_zero, dying, decremented, "").unwrap().into_int_value();
+                let to_store = self.builder.build_select(is_immortal, count, next, "").unwrap().into_int_value();
+                self.builder.build_store(count_ptr, to_store).unwrap();
                 reached_zero.as_basic_value_enum()
             },
             mir::Instruction::RetainClosureEnv(value) => {
