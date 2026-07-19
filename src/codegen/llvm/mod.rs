@@ -311,8 +311,14 @@ impl<'ctx> ModuleContext<'ctx> {
             self.values.insert(value, llvm_value);
         }
 
+        let reachable = function.reachable_blocks();
+
         for block in function.topological_sort() {
-            self.codegen_block(block, function);
+            if reachable.contains(&block) {
+                self.codegen_block(block, function);
+            } else {
+                self.codegen_dead_block(block);
+            }
         }
 
         // Done after all blocks are processed so back-edge sources are included.
@@ -394,6 +400,18 @@ impl<'ctx> ModuleContext<'ctx> {
             let block = self.llvm.append_basic_block(function_value, "");
             self.blocks.push_existing(block_id, block);
         }
+    }
+
+    /// Lower a block [Definition::topological_sort] yields but [Definition::reachable_blocks] does
+    /// not: the `end` of a branch whose every arm diverges, and whatever only that block leads to.
+    ///
+    /// It still carries the branch's result as a parameter, so lowering it as a normal block would
+    /// build a phi for a block no predecessor branches to, leaving the phi with nowhere to take a
+    /// value from. Nothing can enter it, so give it the one terminator that says so and lower none
+    /// of its instructions.
+    fn codegen_dead_block(&mut self, block_id: BlockId) {
+        self.builder.position_at_end(self.blocks[block_id]);
+        self.builder.build_unreachable().unwrap();
     }
 
     fn codegen_block(&mut self, block_id: BlockId, function: &mir::Definition) {
