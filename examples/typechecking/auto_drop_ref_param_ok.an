@@ -1,0 +1,10 @@
+pick (a: ref I32) (b: ref I32): ref I32 =
+    if a.* > b.* then a else b
+
+main () =
+    x = 3
+    y = 9
+    r = pick (ref x) (ref y)
+    println r.*
+
+// args: --check --no-color --auto-drop

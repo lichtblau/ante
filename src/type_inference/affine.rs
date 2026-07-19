@@ -41,6 +41,25 @@ impl MovePath {
         }
     }
 
+    /// If `self` is a proper descendant of `prefix`, return a copy with the `prefix` head
+    /// replaced by `new_root` (e.g. `x.a.b` with prefix `x.a` and new root `p` becomes `p.b`).
+    /// Returns `None` when `self` is `prefix` itself or is not under it. Used to carry the
+    /// partial moves recorded under an enum payload place (`s.Ok#0`, which has no expression
+    /// form) onto the fresh binding a sum drop projects that payload into.
+    fn reroot(&self, prefix: &MovePath, new_root: &MovePath) -> Option<MovePath> {
+        match self {
+            _ if self == prefix => None,
+            MovePath::Field(parent, field) => {
+                if parent.as_ref() == prefix {
+                    Some(MovePath::field(new_root.clone(), field.clone()))
+                } else {
+                    Some(MovePath::field(parent.reroot(prefix, new_root)?, field.clone()))
+                }
+            },
+            MovePath::Variable(_) => None,
+        }
+    }
+
     /// Return the root variable name of this path.
     /// E.g. for `x.one.two`, returns the NameId of `x`.
     pub(super) fn root_variable(&self) -> NameId {
@@ -121,6 +140,50 @@ impl MoveTracker {
         self.moved.iter().find(|(moved_path, _)| moved_path.is_descendant_of(path))
     }
 
+    /// Build a fresh tracker holding this tracker's moves that lie strictly under `prefix`,
+    /// with their `prefix` head replaced by `new_root`. A residual sum drop projects an enum
+    /// payload (`s.Ok#0`) into a fresh binding to drop it, so the sub-place moves recorded under
+    /// the payload (a nested binding like `d` in `Ok (d, _root)` moved `s.Ok#0.0` out) must be
+    /// re-rooted onto that binding for its residual drop to skip the parts already moved away.
+    pub(super) fn reroot_descendants(&self, prefix: &MovePath, new_root: &MovePath) -> MoveTracker {
+        let mut result = MoveTracker::default();
+        for (path, location) in &self.moved {
+            if let Some(rerooted) = path.reroot(prefix, new_root) {
+                result.moved.insert(rerooted, location.clone());
+            }
+        }
+        result
+    }
+
+    /// The root names of whole-local moves (`MovePath::Variable` entries) recorded here.
+    /// Used by drop elaboration's branch-edge equalization; field-path (partial) moves are
+    /// handled separately by residual drops.
+    pub(super) fn whole_moved_locals(&self) -> impl Iterator<Item = NameId> + '_ {
+        self.moved.keys().filter_map(|path| match path {
+            MovePath::Variable(name) => Some(*name),
+            MovePath::Field(..) => None,
+        })
+    }
+
+    /// Merge into `self` the moves from `other` whose root variable is in `roots`.
+    /// Used (under `--auto-drop`) to surface a lambda body's moves of captured outer
+    /// variables to the enclosing scope: closures capture by reference, so a moved capture
+    /// is gone from the outer scope's perspective and must not be dropped there again.
+    /// Over-reporting is safe (a never-run closure's "move" just skips a drop -- a leak),
+    /// under-reporting is a double-free.
+    pub(super) fn merge_moves_rooted_in(&mut self, other: &MoveTracker, roots: &FxHashSet<NameId>) {
+        for (path, location) in &other.moved {
+            if roots.contains(&path.root_variable()) && !self.moved.contains_key(path) {
+                self.moved.insert(path.clone(), location.clone());
+            }
+        }
+        for path in &other.errored {
+            if roots.contains(&path.root_variable()) {
+                self.errored.insert(path.clone());
+            }
+        }
+    }
+
     /// Merge move trackers from multiple branches.
     /// A path is considered moved after the branch if it was moved in the base
     /// OR in ANY branch (since one of the branches will execute).
@@ -186,6 +249,30 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         let copy_name = self.get_copy_type_name();
+
+        // Under --auto-drop, bare type variables are handled honestly. The historic search
+        // below lets an unbound variable unify with any concrete impl's target (`Copy I8`),
+        // silently treating every generic value as Copy: moves unrecorded, drops skipped --
+        // and a monomorphization-time double-free once `t = String`. A variable is Copy iff
+        // it is an int/float literal variable (it will default to a Copy primitive) or an
+        // in-scope `{Copy t}` constraint names exactly this variable (unification is too
+        // loose even for local implicits: it would bind an unrelated `{Copy u}`'s variable).
+        if self.auto_drop && let Type::Variable(id) = &typ {
+            if self.is_literal_variable(*id) {
+                return true;
+            }
+            if self.constraint_in_scope_for_variable(*id, copy_name) {
+                return true;
+            }
+            if self.is_signature_variable(*id) {
+                return false;
+            }
+            // In-flight unification variables (a lambda parameter before its call site
+            // unifies it, an unconstrained element type) keep the legacy lenient search
+            // below -- treating them as affine mid-flight would reject loop-carried uses
+            // of values that end up Copy.
+        }
+
         let copy_constructor = Type::UserDefined(Origin::TopLevelDefinition(copy_name));
 
         let copy_of_t = Type::Application(Arc::new(copy_constructor), Arc::new(vec![typ.clone()]));
@@ -193,37 +280,175 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // Check local implicits in scope
         let local_implicits = self.collect_implicits_in_scope();
         for name in &local_implicits {
+            // Head pre-filter: most in-scope implicits are other abilities (`{Drop t}`,
+            // `{Cmp t}`); their unification against `Copy _` can only fail, so skip the
+            // `follow_all` and the attempt.
+            if !self.implicit_could_be_ability(&self.name_types[name], copy_name) {
+                continue;
+            }
             let name_type = self.name_types[name].follow_all(&self.bindings);
             if self.try_unify(&name_type, &copy_of_t).is_ok() {
                 return true;
             }
         }
 
-        // Check global implicits
-        if let Some(item) = self.current_item {
-            let visible_implicits = VisibleImplicits(item.source_file).get(self.compiler);
-            let mut found = false;
-            visible_implicits.iter_possibly_matching_impls(&copy_of_t, |_name, name_id| {
-                let (name_type, _) = self.type_and_bindings_of_top_level_name(name_id);
-                if self.try_unify(&name_type, &copy_of_t).is_ok() {
+        // Check global implicits. The search unifies against every candidate impl; for a
+        // fully-concrete type its outcome cannot change with later unification and the local
+        // implicits were already consulted above, so memoize it per (source file, type). The
+        // raw type keys the cache -- see `get_field_types`.
+        let Some(item) = self.current_item else { return false };
+        // Probe before the concreteness walk: non-concrete keys are never inserted, so
+        // their lookups just miss (see `type_needs_no_drop`).
+        let probe_key = (item.source_file, typ.clone());
+        if let Some(hit) = self.copy_search_cache.get(&probe_key) {
+            return *hit;
+        }
+
+        let visible_implicits = VisibleImplicits(item.source_file).get(self.compiler);
+        let mut found = false;
+        visible_implicits.iter_possibly_matching_impls(&copy_of_t, |_name, name_id| {
+            let (name_type, _) = self.type_and_bindings_of_top_level_name(name_id);
+            if self.try_unify(&name_type, &copy_of_t).is_ok() {
+                found = true;
+                return true;
+            }
+            // Also check if it's a function whose return type matches. Under --auto-drop
+            // the candidate's own implicit constraints must hold too: `copy_maybe
+            // {Copy a}: Copy (Maybe a)` must not make `Maybe NonCopy` Copy, or its
+            // payload would never be tracked or dropped. (Without the flag the historic
+            // constraint-blind behavior is kept so default checking is unchanged.)
+            if let Type::Function(f) = &name_type
+                && let Ok(bindings) = self.try_unify(&f.return_type, &copy_of_t)
+            {
+                let f = f.clone();
+                if !self.auto_drop || self.copy_impl_constraints_hold(&f, bindings) {
                     found = true;
                     return true;
                 }
-                // Also check if it's a function whose return type matches
-                if let Type::Function(f) = &name_type
-                    && self.try_unify(&f.return_type, &copy_of_t).is_ok()
-                {
-                    found = true;
-                    return true;
-                }
-                false
-            });
-            if found {
+            }
+            false
+        });
+        if self.type_is_concrete(&probe_key.1) {
+            self.copy_search_cache.insert(probe_key, found);
+        }
+        found
+    }
+
+    /// True if the variable will default to an int/float primitive (both Copy): either it
+    /// is itself a literal variable, or some literal variable's binding chain leads to it
+    /// (unification may bind the literal variable to another variable, making that one the
+    /// representative -- e.g. the parameters of a desugared `loop (len = 0)`).
+    pub(super) fn is_literal_variable(&self, id: super::types::TypeVariableId) -> bool {
+        if self.integer_literal_vars.contains(&id) || self.float_literal_vars.contains(&id) {
+            return true;
+        }
+        let follows_to_id = |lit: &super::types::TypeVariableId| {
+            matches!(Type::Variable(*lit).follow(&self.bindings), Type::Variable(v) if *v == id)
+        };
+        self.integer_literal_vars.iter().any(follows_to_id) || self.float_literal_vars.iter().any(follows_to_id)
+    }
+
+    /// True if the variable is (or is the binding representative of) one of the current
+    /// item's signature type variables -- a rigid generic, which gets honest Copy/Drop
+    /// treatment under `--auto-drop`.
+    pub(super) fn is_signature_variable(&self, id: super::types::TypeVariableId) -> bool {
+        if self.signature_type_vars.contains(&id) {
+            return true;
+        }
+        self.signature_type_vars
+            .iter()
+            .any(|var| matches!(Type::Variable(*var).follow(&self.bindings), Type::Variable(v) if *v == id))
+    }
+
+    /// Cheap pre-filter for the local-implicit scans: could this implicit's type possibly be
+    /// (or unify with) `<ability> _`? Only an application headed by the ability itself, or
+    /// something unification could still bind (an unbound head or a wholly-unbound type),
+    /// can. Head-only follows, no allocation -- the scans previously paid a deep
+    /// `follow_all` + unification attempt per implicit per query, which dominated profiles.
+    /// `true` is the conservative answer (the caller just attempts the match as before).
+    pub(super) fn implicit_could_be_ability(&self, typ: &Type, ability: TopLevelName) -> bool {
+        match typ.follow(&self.bindings) {
+            Type::Application(constructor, _) => match constructor.follow(&self.bindings) {
+                Type::UserDefined(Origin::TopLevelDefinition(name)) => *name == ability,
+                Type::Variable(_) | Type::Generic(_) => true,
+                _ => false,
+            },
+            Type::Variable(_) | Type::Generic(_) => true,
+            Type::Forall(_, inner) => self.implicit_could_be_ability(inner, ability),
+            _ => false,
+        }
+    }
+
+    /// True if a local implicit of shape `<ability> x` -- where `x` follows to exactly the
+    /// given rigid/unbound generic type (a named generic or a bare type variable) -- is in
+    /// scope. Used where unifying against candidates is too loose: unification would bind
+    /// the variable to whatever it is compared with instead of matching it.
+    pub(super) fn constraint_in_scope_for_generic(&mut self, target: &Type, ability: TopLevelName) -> bool {
+        let target = target.follow(&self.bindings).clone();
+        let local_implicits = self.collect_implicits_in_scope();
+        for name in &local_implicits {
+            let Some(name_type) = self.name_types.get(name) else { continue };
+            if !self.implicit_could_be_ability(name_type, ability) {
+                continue;
+            }
+            let name_type = name_type.follow_all(&self.bindings);
+            let Type::Application(constructor, args) = &name_type else { continue };
+            let matches_ability = matches!(
+                constructor.follow(&self.bindings),
+                Type::UserDefined(Origin::TopLevelDefinition(name)) if *name == ability
+            );
+            if matches_ability
+                && let Some(arg) = args.first()
+                && *arg.follow(&self.bindings) == target
+            {
                 return true;
             }
         }
-
         false
+    }
+
+    /// [`Self::constraint_in_scope_for_generic`] for a bare type-variable target.
+    pub(super) fn constraint_in_scope_for_variable(
+        &mut self, var: super::types::TypeVariableId, ability: TopLevelName,
+    ) -> bool {
+        self.constraint_in_scope_for_generic(&Type::Variable(var), ability)
+    }
+
+    /// Check that a candidate Copy impl's implicit `{Copy x}` constraints are satisfiable
+    /// under the unification `bindings` produced by matching its return type. Non-Copy
+    /// constraints are assumed satisfiable (over-approximation, matching the search proper).
+    /// A depth guard bounds constraint-driven recursion; running out means "not Copy" --
+    /// the safe direction for drops (the value gets tracked and dropped, not duplicated).
+    fn copy_impl_constraints_hold(
+        &mut self, function: &crate::type_inference::types::FunctionType, bindings: super::types::TypeBindings,
+    ) -> bool {
+        if self.copy_check_depth >= 8 {
+            return false;
+        }
+        self.copy_check_depth += 1;
+        let mut merged = self.bindings.clone();
+        merged.extend(bindings);
+        let copy_name = self.get_copy_type_name();
+        let mut holds = true;
+        for parameter in function.parameters.iter().filter(|parameter| parameter.is_implicit) {
+            let constraint = parameter.typ.follow_all(&merged);
+            let Type::Application(constructor, args) = &constraint else { continue };
+            let is_copy_constraint = matches!(
+                constructor.follow(&merged),
+                Type::UserDefined(Origin::TopLevelDefinition(name)) if *name == copy_name
+            );
+            if !is_copy_constraint {
+                continue;
+            }
+            let Some(arg) = args.first() else { continue };
+            let arg = arg.follow_all(&merged);
+            if !self.type_is_copy(&arg) {
+                holds = false;
+                break;
+            }
+        }
+        self.copy_check_depth -= 1;
+        holds
     }
 
     fn is_ability(&self, typ: &Type) -> bool {
@@ -233,8 +458,13 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Type::Application(constructor, _) => self.is_ability(constructor),
             Type::UserDefined(origin) => match origin {
                 Origin::TopLevelDefinition(name) => {
+                    if let Some(hit) = self.ability_cache.borrow().get(&name.top_level_item) {
+                        return *hit;
+                    }
                     let (item, _) = GetItemRaw(name.top_level_item).get(self.compiler);
-                    matches!(&item.kind, TopLevelItemKind::AbilityDefinition(_))
+                    let is_ability = matches!(&item.kind, TopLevelItemKind::AbilityDefinition(_));
+                    self.ability_cache.borrow_mut().insert(name.top_level_item, is_ability);
+                    is_ability
                 },
                 _ => false,
             },
@@ -247,17 +477,22 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         match typ.follow(&self.bindings) {
             Type::Application(constructor, _) => self.shared_type_flags(constructor),
             Type::UserDefined(Origin::TopLevelDefinition(name)) => {
+                if let Some(hit) = self.shared_flags_cache.borrow().get(&name.top_level_item) {
+                    return *hit;
+                }
                 let (item, _) = GetItemRaw(name.top_level_item).get(self.compiler);
-                match &item.kind {
+                let flags = match &item.kind {
                     TopLevelItemKind::TypeDefinition(td) => Some((td.shared, td.mutable)),
                     _ => None,
-                }
+                };
+                self.shared_flags_cache.borrow_mut().insert(name.top_level_item, flags);
+                flags
             },
             _ => None,
         }
     }
 
-    fn is_shared_user_defined(&self, typ: &Type) -> bool {
+    pub(super) fn is_shared_user_defined(&self, typ: &Type) -> bool {
         matches!(self.shared_type_flags(typ), Some((true, _)))
     }
 
@@ -270,6 +505,18 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     /// Only emits the first error per path to avoid noisy duplicate diagnostics.
     pub(super) fn check_use_of_move_path(&mut self, path: &MovePath, locator: impl Locateable) {
         if self.move_tracker.errored.contains(path) {
+            return;
+        }
+
+        // Auto-drop: tentative move records exist for bare generic variables whose
+        // Copy-ness is not settled yet (see `infer_path`). While the value's type still
+        // reads as Copy, a recorded "move" must not produce use-of-moved errors -- it only
+        // informs the drop planner. Once the type is provably non-Copy (a `{Drop t}`-bound
+        // signature generic, or a later-bound concrete type), errors fire as usual.
+        if self.auto_drop
+            && let Some(root_type) = self.name_types.get(&path.root_variable()).cloned()
+            && self.type_is_copy(&root_type)
+        {
             return;
         }
 

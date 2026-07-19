@@ -55,6 +55,16 @@ impl TypeChecker<'_, '_> {
         }
     }
 
+    /// Auto-drop: record every free variable of the lambda at `id` as captured. Captured
+    /// names are never auto-dropped by their owning scope (see `drop_elaboration.rs`):
+    /// closures capture by reference and may outlive the scope, so dropping the referent
+    /// would dangle the closure. Skipping only leaks, for now.
+    pub(super) fn record_captured_names(&mut self, id: ExprId) {
+        let mut context = FreeVars::default();
+        context.find_free_variables(id, self);
+        self.captured_names.extend(context.free_vars.iter().copied());
+    }
+
     pub(super) fn record_move_captures(&mut self, id: ExprId, self_name: Option<NameId>) {
         let mut context = FreeVars::default();
         if let Some(name) = self_name {
@@ -80,6 +90,13 @@ impl TypeChecker<'_, '_> {
         context.find_free_variables(lambda.body, self);
         context.free_vars.contains(&resume_name)
     }
+
+    /// True when the lambda at `id` captures `name` as a free variable.
+    pub(super) fn lambda_captures_name(&self, id: ExprId, name: NameId) -> bool {
+        let mut context = FreeVars::default();
+        context.find_free_variables(id, self);
+        context.free_vars.contains(&name)
+    }
 }
 
 #[derive(Default)]
@@ -93,6 +110,30 @@ struct FreeVars {
 
 impl FreeVars {
     fn find_free_variables(&mut self, expr: ExprId, checker: &TypeChecker) {
+        self.find_free_variables_inner(expr, checker);
+
+        // Auto-drop: synthesized drop calls live in side tables keyed by this expression,
+        // not in the expression tree itself -- but they are real code lowered at this
+        // point, and they may reference `{Drop t}` capability parameters (a capture when
+        // inside a closure). Walk them too -- after the expression itself, since e.g. a
+        // block's end-of-scope drops refer to locals the block declares.
+        let context = checker.current_extended_context();
+        let table_drops: Vec<ExprId> = [
+            context.post_expr_drops(expr),
+            context.pre_exit_drops(expr),
+            context.implicit_else_drops(expr),
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .collect();
+        for drop_call in table_drops {
+            self.find_free_variables(drop_call, checker);
+        }
+    }
+
+    fn find_free_variables_inner(&mut self, expr: ExprId, checker: &TypeChecker) {
         match &checker.current_extended_context()[expr] {
             cst::Expr::Error => (),
             cst::Expr::Literal(_) => (),

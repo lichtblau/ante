@@ -226,6 +226,16 @@ pub enum Diagnostic {
     TopLevelImplicitTypeAnnotationRequired {
         location: Location,
     },
+    DropImplForSharedType {
+        location: Location,
+    },
+    ReferenceEscapesScope {
+        location: Location,
+    },
+    MissingDropConstraint {
+        typ: String,
+        location: Location,
+    },
     ReturnNotInFunction {
         location: Location,
     },
@@ -606,6 +616,18 @@ impl Diagnostic {
             Diagnostic::TopLevelImplicitTypeAnnotationRequired { location: _ } => {
                 "Type annotations are required on top-level implicits".to_string()
             },
+            Diagnostic::DropImplForSharedType { location: _ } => {
+                "Cannot implement Drop for a shared type: shared handles are Copy, so there is no coherent point to run it".to_string()
+            },
+            Diagnostic::ReferenceEscapesScope { location: _ } => {
+                "This returns a reference to a value that is dropped when this function returns".to_string()
+            },
+            Diagnostic::MissingDropConstraint { typ, location: _ } => {
+                format!(
+                    "This value of generic type {} is dropped here; add a {{Drop {}}} (or {{Copy {}}}) constraint to the enclosing function",
+                    color_type(typ), typ, typ,
+                )
+            },
             Diagnostic::ExpectedTypeKind { actual, location: _ } => {
                 let n = actual.required_argument_count();
                 let s = if n == 1 { "" } else { "s" };
@@ -725,6 +747,9 @@ impl Diagnostic {
             | Diagnostic::MultipleImplicitsFound { location, .. }
             | Diagnostic::AmbiguousImplicit { location, .. }
             | Diagnostic::TopLevelImplicitTypeAnnotationRequired { location }
+            | Diagnostic::DropImplForSharedType { location }
+            | Diagnostic::ReferenceEscapesScope { location }
+            | Diagnostic::MissingDropConstraint { location, .. }
             | Diagnostic::ExpectedTypeKind { location, .. }
             | Diagnostic::ExpectedKind { location, .. }
             | Diagnostic::ReturnNotInFunction { location }

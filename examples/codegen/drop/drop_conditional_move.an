@@ -1,0 +1,22 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+consume (var r: R): Unit = drop (mut r)
+
+cond_move (cond: Bool) =
+    var x = R 1
+    if cond then consume x
+    else drop (mut x)
+
+main () =
+    cond_move true
+    cond_move false
+
+// args: --delete-binary --no-color
+// expected stdout:
+// drop 1
+// drop 1

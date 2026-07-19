@@ -84,6 +84,25 @@ pub struct ExtendedTopLevelContext {
     /// Closures declared with the `move` keyword. These capture by value/move instead of
     /// by reference. Used by the MIR builder to determine capture semantics.
     move_closures: FxHashSet<ExprId>,
+
+    /// Drop calls synthesized by drop elaboration (`--auto-drop`), keyed by the expression
+    /// whose value immediately precedes the scope-exit edge. The MIR builder lowers them
+    /// right after that expression's value is computed. Keys today: a `Sequence` (block
+    /// fallthrough drops for its locals) and a lambda body (function-exit drops for the
+    /// parameters, appended after the body's own block drops when the ids coincide).
+    post_expr_drops: BTreeMap<ExprId, Vec<ExprId>>,
+
+    /// Drop calls synthesized by drop elaboration (`--auto-drop`), lowered between the keyed
+    /// expression's value computation and the control-flow effect that follows it. Keys:
+    /// the returned expression of a `return` (drops run before the Return terminator) and
+    /// an Assignment expression (overwrite drops run after the RHS, before the Store).
+    pre_exit_drops: BTreeMap<ExprId, Vec<ExprId>>,
+
+    /// Drop calls for the implicit else edge of an else-less `if` (`--auto-drop`), keyed by
+    /// the If expression. A then-branch that moves a value leaves it owned on the false
+    /// edge, which otherwise has no block: the MIR builder materializes a real else block
+    /// running these drops.
+    implicit_else_drops: BTreeMap<ExprId, Vec<ExprId>>,
 }
 
 impl<'local, 'innter> TypeChecker<'local, 'innter> {
@@ -128,6 +147,9 @@ impl ExtendedTopLevelContext {
             instantiations: Default::default(),
             closure_environments: Default::default(),
             move_closures: Default::default(),
+            post_expr_drops: Default::default(),
+            pre_exit_drops: Default::default(),
+            implicit_else_drops: Default::default(),
         }
     }
 
@@ -217,6 +239,14 @@ impl ExtendedTopLevelContext {
         match self.more_expr_locations.get(&expr) {
             Some(location) => location.clone(),
             None => self.original.expr_location(expr).clone(),
+        }
+    }
+
+    /// Retrieve the location of the corresponding [Pattern] of the given [PatternId]
+    pub(crate) fn pattern_location(&self, pattern: PatternId) -> Location {
+        match self.more_pattern_locations.get(&pattern) {
+            Some(location) => location.clone(),
+            None => self.original.pattern_location(pattern).clone(),
         }
     }
 
@@ -333,10 +363,57 @@ impl ExtendedTopLevelContext {
         if self.move_closures.contains(&from) {
             self.move_closures.insert(to);
         }
+        if let Some(drops) = self.post_expr_drops.get(&from).cloned() {
+            self.post_expr_drops.insert(to, drops);
+        }
+        if let Some(drops) = self.pre_exit_drops.get(&from).cloned() {
+            self.pre_exit_drops.insert(to, drops);
+        }
+        if let Some(drops) = self.implicit_else_drops.get(&from).cloned() {
+            self.implicit_else_drops.insert(to, drops);
+        }
     }
 
     pub fn is_move_closure(&self, expr: ExprId) -> bool {
         self.move_closures.contains(&expr)
+    }
+
+    /// Append synthesized drop calls to run after `expr`'s value is computed.
+    pub(crate) fn push_post_expr_drops(&mut self, expr: ExprId, drops: Vec<ExprId>) {
+        self.post_expr_drops.entry(expr).or_default().extend(drops);
+    }
+
+    pub fn post_expr_drops(&self, expr: ExprId) -> Option<&Vec<ExprId>> {
+        self.post_expr_drops.get(&expr)
+    }
+
+    /// Append synthesized drop calls to run after `expr`'s value is computed but before the
+    /// exit edge it feeds (e.g. a `return`'s terminator).
+    pub(crate) fn push_pre_exit_drops(&mut self, expr: ExprId, drops: Vec<ExprId>) {
+        self.pre_exit_drops.entry(expr).or_default().extend(drops);
+    }
+
+    pub fn pre_exit_drops(&self, expr: ExprId) -> Option<&Vec<ExprId>> {
+        self.pre_exit_drops.get(&expr)
+    }
+
+    /// Remove the drop-table entries for `expr`. Used when a statement is rewritten in
+    /// place after inference (`tmp = <stmt>; drop (mut tmp)`): its metadata, including any
+    /// drop entries, was copied onto the relocated inner copy, and the builder's generic
+    /// post-expression hook must not fire the stale entries at the outer id a second time.
+    pub(crate) fn clear_expr_drops(&mut self, expr: ExprId) {
+        self.post_expr_drops.remove(&expr);
+        self.pre_exit_drops.remove(&expr);
+        self.implicit_else_drops.remove(&expr);
+    }
+
+    /// Record the drops for the implicit else edge of the else-less `if` at `expr`.
+    pub(crate) fn push_implicit_else_drops(&mut self, expr: ExprId, drops: Vec<ExprId>) {
+        self.implicit_else_drops.entry(expr).or_default().extend(drops);
+    }
+
+    pub fn implicit_else_drops(&self, expr: ExprId) -> Option<&Vec<ExprId>> {
+        self.implicit_else_drops.get(&expr)
     }
 }
 

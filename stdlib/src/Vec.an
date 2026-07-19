@@ -220,7 +220,13 @@ Vec.sort_by (v: mut Vec t) (cmp: fn (ref t) (ref t) => Bool): Unit =
         while j > 0 do
             a = v.data.[j]
             b = v.data.[j - 1]
-            if not (cmp a b) then break
+            if not (cmp a b) then
+                // a and b are bit-copies of elements the vec still owns. Write them
+                // back to their own slots (same bits) so they read as moved and
+                // --auto-drop's break-edge drops cannot double-free the elements.
+                array_insert v.data j a
+                array_insert v.data (j - 1) b
+                break
             array_insert v.data (j - 1) a
             array_insert v.data j b
             j -= 1
@@ -236,7 +242,9 @@ impl print_vec {p: Print t}: Print (Vec t) with
 
         for i in 0 .. v.len do
             if i != 0 then print ", "
-            elem: t = v.data.[i]
+            // Print through a reference: a by-value extraction is a bit-copy of an
+            // element the vec still owns, which --auto-drop would double-free.
+            elem: ref t = transmute (offset v.data i)
             print elem
 
         print "]"
@@ -281,8 +289,10 @@ impl eq_vec {Eq t}: Eq (Vec t) with
             return false
 
         for i in 0 .. l.len do
-            le = l.data.[i]
-            re = r.data.[i]
+            // Compare through references: by-value extraction bit-copies elements
+            // the vecs still own, which --auto-drop would double-free.
+            le: ref t = transmute (offset l.data i)
+            re: ref t = transmute (offset r.data i)
             if le != re then
                 return false
         true

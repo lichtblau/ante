@@ -1,0 +1,48 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+break_test () =
+    for i in 0 .. 3 do
+        _x = R 1
+        if i == 1 then
+            _y = R 2
+            break
+        println "iter"
+
+continue_test () =
+    for _i in 0 .. 2 do
+        _x = R 3
+        continue
+
+while_break () =
+    var n = 0
+    while true do
+        _x = R 4
+        if n == 1 then break
+        n += 1
+
+main () =
+    break_test ()
+    println "--"
+    continue_test ()
+    println "--"
+    while_break ()
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// iter
+// drop 1
+// drop 2
+// drop 1
+// --
+// drop 3
+// drop 3
+// --
+// drop 4
+// drop 4
+// end

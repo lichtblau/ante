@@ -1,0 +1,109 @@
+// An arm whose pattern is an or-pattern (`| Lft d | Rgt d -> ...`) cannot have its bindings tracked
+// as sub-places of the scrutinee: the same binding aliases a different variant's payload depending
+// on which alternative matched. So linking is disabled for the whole match and it becomes a
+// consuming use -- the scrutinee is moved, and nothing drops it. Nothing dropped what the arms bound
+// either, so the payload leaked. The comment on that rule always said the bindings were "independent
+// owners"; now they are. Each arm's bindings are locals of a drop scope that ends with the arm.
+//
+// Alternative 0's `NameId`s are the canonical ones -- name resolution re-links the other
+// alternatives' to them so they share one storage slot -- so a drop must name alt 0's, and only
+// once. Naming all of them drops the same slot once per alternative.
+
+type D = tag: I32
+
+impl drop_d: Drop D with
+    drop (d: mut D) =
+        print "  drop "
+        println d.tag
+
+type Two =
+    | Lft D
+    | Rgt D
+
+type Pair =
+    | Ends D D
+    | Both D D
+
+consume (_d: D): Unit = ()
+
+mk (n: I32): Two = if n > 0 then Lft (D n) else Rgt (D n)
+mk_pair (n: I32): Pair = if n > 0 then Ends (D n) (D (n + 100)) else Both (D n) (D (n + 100))
+
+// The leak this fixes: the binding owns the payload and drops at the end of the arm.
+rvalue_or () =
+    println "rvalue or:"
+    match mk 1
+    | Lft d | Rgt d -> println d.tag
+    println "  after"
+
+// A local scrutinee is consumed by the match, so the binding -- not the local -- is the owner.
+local_or () =
+    println "local or:"
+    t = mk 2
+    match t
+    | Lft d | Rgt d -> println d.tag
+
+// The arm moves its binding out: `consume` drops it, the arm drops nothing. Not twice.
+moved_or () =
+    println "moved or:"
+    match mk 3
+    | Lft d | Rgt d -> consume d
+
+// Two bindings per alternative: each names one slot, and each drops once.
+two_bindings () =
+    println "two bindings:"
+    match mk_pair 4
+    | Ends a b | Both a b -> println (a.tag + b.tag)
+
+// The arm diverges, so `return` leaves through the binding's drop scope and the binding drops on
+// the return edge -- before the caller ever sees the value. Every alternative returns, so nothing
+// jumps to the block the match merges into, and the rest of `early` is dead. That block still
+// carries the match's result as a parameter, which used to leave the LLVM backend building a phi
+// for a block with no predecessor to take a value from ("No incoming for block b3").
+early (n: I32): I32 =
+    match mk n
+    | Lft d | Rgt d -> return d.tag
+    0
+
+diverging_or () =
+    println "diverging or:"
+    println (early 5)
+
+// An or-arm beside a plain arm: linking is off for both, so both own what they bind.
+mixed () =
+    println "mixed:"
+    match mk 6
+    | Lft d -> println d.tag
+    | Rgt d -> println d.tag
+
+main () =
+    rvalue_or ()
+    local_or ()
+    moved_or ()
+    two_bindings ()
+    diverging_or ()
+    mixed ()
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// rvalue or:
+// 1
+//   drop 1
+//   after
+// local or:
+// 2
+//   drop 2
+// moved or:
+//   drop 3
+// two bindings:
+// 108
+//   drop 104
+//   drop 4
+// diverging or:
+//   drop 5
+// 5
+// mixed:
+// 6
+//   drop 6
+// end

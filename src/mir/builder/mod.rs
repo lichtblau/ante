@@ -289,6 +289,20 @@ where
     }
 
     fn expression(&mut self, expr: ExprId) -> Value {
+        let value = self.expression_inner(expr);
+
+        // Auto-drop: lower any synthesized scope-exit drop calls recorded against this
+        // expression (block-fallthrough and function-exit edges), after its value is computed.
+        if let Some(drops) = self.context().post_expr_drops(expr) {
+            for drop_call in drops.clone() {
+                self.expression(drop_call);
+            }
+        }
+
+        value
+    }
+
+    fn expression_inner(&mut self, expr: ExprId) -> Value {
         match &self.context()[expr] {
             cst::Expr::Error => unreachable!("Error expression encountered while generating boxed mir"),
             cst::Expr::Literal(literal) => self.literal(literal, expr),
@@ -310,10 +324,10 @@ where
             cst::Expr::Loop(_) => unreachable!("Loops should be desugared before MIR generation"),
             cst::Expr::While(while_) => self.while_(while_),
             cst::Expr::For(for_) => self.for_(for_),
-            cst::Expr::Break => self.break_(),
-            cst::Expr::Continue => self.continue_(),
+            cst::Expr::Break => self.break_(expr),
+            cst::Expr::Continue => self.continue_(expr),
             cst::Expr::Return(return_) => self.return_(return_.expression),
-            cst::Expr::Assignment(assignment) => self.assignment(assignment),
+            cst::Expr::Assignment(assignment) => self.assignment(assignment, expr),
             cst::Expr::Extern(extern_) => self.extern_(extern_, expr),
             cst::Expr::InterpolatedString(_) => {
                 unreachable!("InterpolatedString should be desugared before MIR generation")
@@ -414,7 +428,11 @@ where
                 },
                 Some(Origin::Local(name)) => {
                     let ptr = *self.local_variables.get(&name).unwrap_or_else(|| {
-                        panic!("No cached variable for {} with name {name}", self.context()[path_id])
+                        let function = self.current_function.as_ref().map(|f| f.name.to_string());
+                        panic!(
+                            "No cached variable for {} with name {name} while lowering {function:?}",
+                            self.context()[path_id]
+                        )
                     });
                     if self.mutable_locals.contains(&name) {
                         // Mutable locals are StackAlloc'd pointers; auto-deref to load the value.
@@ -557,8 +575,35 @@ where
         if let cst::Expr::Variable(path_id) = &self.context()[call.function]
             && let Some((effect_op, op_index)) = self.try_resolve_ability_method(*path_id)
         {
-            let arguments = mapvec(&call.arguments, |expr| self.expression(expr.expr));
-            return self.emit_ability_method_call(effect_op, op_index, arguments, result_type, diverges);
+            // A capability built by applying a constrained impl (`drop_vec drop_i32`) heap-
+            // allocates each method closure's environment inside the impl function, freshly
+            // per call site execution. A `Drop` capability cannot outlive its method call
+            // (unlike e.g. Stream combinators, which legitimately capture their caps in
+            // returned closures), so for Drop calls we lower application-shaped capability
+            // arguments through `lower_drop_capability` -- collecting every nesting level's
+            // environments -- and free them once the drop completes. Static impls and
+            // capability parameters lower as plain variables and are never freed.
+            let is_drop_call = matches!(
+                self.context().path_origin(*path_id),
+                Some(Origin::TopLevelDefinition(name)) if self.is_prelude_drop_ability(name.top_level_item)
+            );
+
+            let mut cap_env_frees = Vec::new();
+            let arguments = mapvec(&call.arguments, |argument| {
+                if is_drop_call && argument.is_implicit {
+                    self.lower_drop_capability(argument.expr, &mut cap_env_frees)
+                } else {
+                    self.expression(argument.expr)
+                }
+            });
+
+            let result = self.emit_ability_method_call(effect_op, op_index, arguments, result_type, diverges);
+            if !diverges {
+                for environment in cap_env_frees {
+                    self.emit_free(environment);
+                }
+            }
+            return result;
         }
 
         let function = self.expression(call.function);
@@ -612,6 +657,76 @@ where
             self.terminate_block(TerminatorInstruction::Unreachable);
         }
         value
+    }
+
+    /// True if `item` is the Prelude's `Drop` ability definition.
+    fn is_prelude_drop_ability(&mut self, item: TopLevelId) -> bool {
+        if item.source_file != crate::name_resolution::namespace::SourceFileId::prelude() {
+            return false;
+        }
+        let (raw_item, context) = GetItemRaw(item).get(self.compiler);
+        match &raw_item.kind {
+            cst::TopLevelItemKind::AbilityDefinition(ability) => context.names[ability.name].as_ref() == "Drop",
+            _ => false,
+        }
+    }
+
+    /// Lower a Drop call's capability argument. Application-shaped arguments (a constrained
+    /// impl applied to its own capabilities, e.g. `drop_vec drop_i32`) are lowered manually,
+    /// recursing into their arguments, so that every nesting level's freshly-constructed
+    /// capability value is at hand: each one's method-closure environments are recorded in
+    /// `env_frees` for release after the drop runs. Anything else (a static impl reference,
+    /// a `{Drop t}` parameter) lowers normally and owns nothing to free.
+    fn lower_drop_capability(&mut self, expr: ExprId, env_frees: &mut Vec<Value>) -> Value {
+        let call = match &self.context()[expr] {
+            cst::Expr::Call(call) => call.clone(),
+            _ => return self.expression(expr),
+        };
+
+        let function = self.expression(call.function);
+        let arguments = mapvec(&call.arguments, |argument| self.lower_drop_capability(argument.expr, env_frees));
+        let result_type = self.expr_type(expr);
+
+        let instruction = if self.type_of_value(&function).is_closure() {
+            Instruction::CallClosure { closure: function, arguments }
+        } else {
+            Instruction::Call { function, arguments }
+        };
+        let capability = self.push_instruction(instruction, result_type);
+
+        self.collect_capability_environments(capability, env_frees);
+        capability
+    }
+
+    /// Record the environment pointer of each closure-shaped method in the capability tuple.
+    /// Capture-less methods carry a null environment; `free(NULL)` is a no-op, so they need
+    /// no special casing.
+    fn collect_capability_environments(&mut self, capability: Value, env_frees: &mut Vec<Value>) {
+        let capability_type = self.type_of_value(&capability);
+        let Type::Tuple(fields) = &capability_type else { return };
+        let fields = fields.clone();
+        for (index, field) in fields.iter().enumerate() {
+            if field.is_closure() {
+                let closure = self.push_instruction(
+                    Instruction::IndexTuple { tuple: capability, index: index as u32 },
+                    field.clone(),
+                );
+                let environment =
+                    self.push_instruction(Instruction::IndexTuple { tuple: closure, index: 1 }, Type::POINTER);
+                env_frees.push(environment);
+            }
+        }
+    }
+
+    /// Emit a call to libc `free` for a heap pointer the drop machinery owns.
+    fn emit_free(&mut self, pointer: Value) {
+        let free_type = Type::Function(Arc::new(crate::mir::FunctionType {
+            parameters: vec![Type::POINTER],
+            environment: Type::NO_CLOSURE_ENV,
+            return_type: Type::UNIT,
+        }));
+        let free_function = self.push_instruction(Instruction::Extern("free".to_string()), free_type);
+        self.push_instruction(Instruction::Call { function: free_function, arguments: vec![pointer] }, Type::UNIT);
     }
 
     /// Like [Self::try_resolve_effect_op] but also returns the op's position within its
@@ -1030,24 +1145,43 @@ where
         Value::Unit
     }
 
-    fn break_(&mut self) -> Value {
+    fn break_(&mut self, expr: ExprId) -> Value {
+        self.lower_pre_exit_drops(expr);
         let exit = self.loop_targets.last().expect("`break` outside of a loop").1;
         self.terminate_block(TerminatorInstruction::jmp_no_args(exit));
         Value::Error
     }
 
-    fn continue_(&mut self) -> Value {
+    fn continue_(&mut self, expr: ExprId) -> Value {
+        self.lower_pre_exit_drops(expr);
         let cont = self.loop_targets.last().expect("`continue` outside of a loop").0;
         self.terminate_block(TerminatorInstruction::jmp_no_args(cont));
         Value::Error
     }
 
+    /// Auto-drop: lower the synthesized drops recorded for this exit edge (break/continue).
+    fn lower_pre_exit_drops(&mut self, expr: ExprId) {
+        if let Some(drops) = self.context().pre_exit_drops(expr) {
+            for drop_call in drops.clone() {
+                self.expression(drop_call);
+            }
+        }
+    }
+
     fn if_(&mut self, if_: &cst::If, expr: ExprId) -> Value {
         let condition = self.expression(if_.condition);
 
+        // Auto-drop: an else-less `if` whose then-branch moves values needs a real else
+        // block so the false edge can drop what it still owns.
+        let implicit_else_drops = self.context().implicit_else_drops(expr).cloned();
+
         let then = self.push_block_no_params();
         let else_ = self.push_block_no_params();
-        let end = if if_.else_.is_some() { self.push_block_no_params() } else { else_ };
+        let end = if if_.else_.is_some() || implicit_else_drops.is_some() {
+            self.push_block_no_params()
+        } else {
+            else_
+        };
         self.terminate_block(TerminatorInstruction::if_(condition, then, else_, end));
 
         self.switch_to_block(then);
@@ -1065,6 +1199,13 @@ where
             Value::Parameter(end, 0)
         } else {
             self.terminate_block(TerminatorInstruction::jmp_no_args(end));
+            if let Some(drops) = implicit_else_drops {
+                self.switch_to_block(else_);
+                for drop_call in drops {
+                    self.expression(drop_call);
+                }
+                self.terminate_block(TerminatorInstruction::jmp_no_args(end));
+            }
             self.switch_to_block(end);
             Value::Unit
         }
@@ -1377,7 +1518,7 @@ where
         }
     }
 
-    fn assignment(&mut self, assignment: &cst::Assignment) -> Value {
+    fn assignment(&mut self, assignment: &cst::Assignment, expr: ExprId) -> Value {
         let pointer = self.lhs_as_pointer(assignment.lhs);
 
         let value = if let Some((_, op_expr)) = assignment.op {
@@ -1404,6 +1545,14 @@ where
                 None => rhs,
             }
         };
+
+        // Auto-drop: the overwrite drop of the old value runs after the RHS is evaluated
+        // and before the store (Rust ordering; self-assignment never records one).
+        if let Some(drops) = self.context().pre_exit_drops(expr) {
+            for drop_call in drops.clone() {
+                self.expression(drop_call);
+            }
+        }
 
         self.push_instruction(Instruction::Store { pointer, value }, Type::UNIT);
         Value::Unit
@@ -1529,6 +1678,13 @@ where
 
     fn return_(&mut self, returned_expression: ExprId) -> Value {
         let value = self.expression(returned_expression);
+        // Auto-drop: scope-exit drops for this return edge run after the returned value is
+        // computed and before the Return terminator.
+        if let Some(drops) = self.context().pre_exit_drops(returned_expression) {
+            for drop_call in drops.clone() {
+                self.expression(drop_call);
+            }
+        }
         self.terminate_block(TerminatorInstruction::Return(value));
         // TODO: We'll need to try to filter these return blocks from
         // matches & ifs, and potentially check for instructions after returns.

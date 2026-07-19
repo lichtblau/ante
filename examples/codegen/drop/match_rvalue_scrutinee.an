@@ -1,0 +1,116 @@
+// `match <rvalue> | Ok d -> ...` -- a match whose scrutinee is a call result rather than a place.
+// The payloads its arms bind used to be owned by nobody: `try_build_move_path` finds no place for an
+// rvalue, so the bindings linked to no sub-place and nothing ever dropped them. Only the rvalue
+// form leaked; `tmp = parse x; match tmp` always worked, because then the payload is a sub-place of
+// `tmp` and dies with it. The scrutinee is now bound to a temporary of its own (`(tmp = <rvalue>;
+// tmp)`) that owns it exactly like the hand-written local does.
+//
+// The interesting cases are the ones where claiming ownership would be wrong, and would turn a
+// leak into a double free: an arm that moves the payload out, an arm that returns it, and a
+// scrutinee that is a borrow of someone else's value.
+
+type D = tag: I32
+
+impl drop_d: Drop D with
+    drop (d: mut D) =
+        print "  drop "
+        println d.tag
+
+type Res =
+    | Ok D
+    | Err I32
+
+type Holder = item: D
+
+make (n: I32): Res = Ok (D n)
+
+consume (_d: D): Unit = ()
+
+// The leak this fixes: nothing moves the payload out, so the temporary drops it whole.
+bound () =
+    println "bound:"
+    match make 1
+    | Ok _d -> println "  ok"
+    | Err _e -> ()
+
+// The arm moves the payload out and consumes it. `consume` drops it -- the temporary must drop
+// only the residual, or `1` would be freed twice.
+moved_out () =
+    println "moved out:"
+    match make 2
+    | Ok d -> consume d
+    | Err _e -> ()
+
+// The arm moves the payload out of the function. The caller owns it now; the match must not
+// drop it at all.
+extract (): D =
+    match make 3
+    | Ok d -> d
+    | Err _e -> D 0
+
+escaping () =
+    println "escaping:"
+    e = extract ()
+    println e.tag
+
+// A scrutinee that is a field read through a `ref` is a borrow: its owner is the caller, and
+// matching it must stay move-free. Claiming it here would double-free `h`.
+borrowed (h: ref Holder) =
+    match h.item
+    | d -> println d.tag
+
+through_ref () =
+    println "borrowed:"
+    h = Holder (D 4)
+    borrowed (ref h)
+
+// An arm that diverges still drops the residual on its edge.
+early (n: I32): I32 =
+    match make n
+    | Ok _d -> return 9
+    | Err _e -> 0
+
+diverging () =
+    println "diverging:"
+    println (early 5)
+
+// An rvalue match inside an arm of another: inner temporary dies first.
+nested () =
+    println "nested:"
+    match make 6
+    | Ok _d ->
+        match make 7
+        | Ok _d2 -> println "  inner"
+        | Err _e -> ()
+    | Err _e -> ()
+
+main () =
+    bound ()
+    moved_out ()
+    escaping ()
+    through_ref ()
+    diverging ()
+    nested ()
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// bound:
+//   ok
+//   drop 1
+// moved out:
+//   drop 2
+// escaping:
+// 3
+//   drop 3
+// borrowed:
+// 4
+//   drop 4
+// diverging:
+//   drop 5
+// 9
+// nested:
+//   inner
+//   drop 7
+//   drop 6
+// end

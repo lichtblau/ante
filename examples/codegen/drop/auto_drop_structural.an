@@ -1,0 +1,21 @@
+type Leaf = tag: I32
+
+impl drop_leaf: Drop Leaf with
+    drop (l: mut Leaf) =
+        print "drop "
+        println l.tag
+
+type Inner = a: Leaf, b: I32
+type Outer = x: Leaf, y: Inner
+type Plain = m: I32, n: Bool
+
+main () =
+    _o = Outer (Leaf 1) (Inner (Leaf 2) 9)
+    _p = Plain 4 true
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// end
+// drop 1
+// drop 2

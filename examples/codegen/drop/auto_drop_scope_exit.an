@@ -1,0 +1,30 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+consume (_r: R): Unit = ()
+
+early (flag: Bool): Unit =
+    x = R 10
+    if flag then return ()
+    consume x
+
+main () =
+    a = R 1
+    _b = R 2
+    consume a
+    early true
+    early false
+    print "end "
+    println 0
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// drop 1
+// drop 10
+// drop 10
+// end 0
+// drop 2

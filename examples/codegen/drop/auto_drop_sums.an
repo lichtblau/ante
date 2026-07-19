@@ -1,0 +1,47 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+type Duo =
+   | Both R R
+   | Neither
+
+consume (_r: R): Unit = ()
+make_opt (t: I32): Maybe R = Some (R t)
+
+whole_sum () =
+    _m: Maybe R = Some (R 1)
+    _n: Maybe R = None
+    println "whole"
+
+residual (d: Duo) =
+    match d
+    | Both a _b -> consume a
+    | Neither -> ()
+    println "after match"
+
+temp_sum () =
+    make_opt 3
+    println "after temp"
+
+main () =
+    whole_sum ()
+    residual (Both (R 21) (R 22))
+    residual Neither
+    temp_sum ()
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// whole
+// drop 1
+// drop 21
+// after match
+// drop 22
+// after match
+// drop 3
+// after temp
+// end

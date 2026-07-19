@@ -1,0 +1,21 @@
+type Holder 'a = r: ref 'a I32
+
+make (): Holder 'a =
+    x = 5
+    Holder (ref x)
+
+main () =
+    h = make ()
+    println h.r.*
+
+// args: --check --no-color --auto-drop
+// expected exit status: 1
+// expected stderr:
+// examples/typechecking/auto_drop_ref_escape_struct.an:5:13
+// 4 |     x = 5
+//   |     // error: This returns a reference to a value that is dropped when this function returns
+// 5 |     Holder (ref x)
+//   |             ^^^^^
+// 
+// Found 1 error and 0 warnings
+

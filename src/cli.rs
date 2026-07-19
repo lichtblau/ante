@@ -87,6 +87,13 @@ pub struct Cli {
     /// Add a directory to the native library search path when linking. May be repeated.
     #[arg(long = "link-search", short = 'L', value_name = "PATH", value_hint = ValueHint::DirPath)]
     pub link_search: Vec<PathBuf>,
+
+    #[arg(long)]
+    pub auto_drop: bool,
+
+    /// Disable automatic `Drop` calls at scope exit (and the stricter checks that accompanies them).
+    #[arg(long, conflicts_with = "auto_drop")]
+    pub no_auto_drop: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, ValueEnum)]
