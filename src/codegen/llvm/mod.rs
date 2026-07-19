@@ -6,7 +6,7 @@ use inkwell::{
     builder::Builder,
     module::{Linkage, Module},
     passes::PassBuilderOptions,
-    targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine},
+    targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine},
     types::{BasicType, BasicTypeEnum, IntType},
     values::{AggregateValue, BasicValue, BasicValueEnum, FunctionValue, PhiValue},
 };
@@ -148,6 +148,10 @@ struct ModuleContext<'ctx> {
 
     mir: &'ctx mir::Mir,
 
+    /// The native target's layout, used to size the scratch slot a `Transmute` round-trips
+    /// through. Only the store sizes of two types are ever asked of it.
+    target_data: TargetData,
+
     blocks: VecMap<BlockId, BasicBlock<'ctx>>,
 
     current_function: Option<DefinitionId>,
@@ -179,12 +183,13 @@ impl<'ctx> ModuleContext<'ctx> {
         llvm: &'ctx inkwell::context::Context, mir: &'ctx mir::Mir, name: &str, main_id: Option<DefinitionId>,
     ) -> Self {
         let module = llvm.create_module(name);
-        let target = TargetMachine::get_default_triple();
-        module.set_triple(&target);
+        let triple = TargetMachine::get_default_triple();
+        module.set_triple(&triple);
         Self {
             llvm,
             module,
             mir,
+            target_data: native_target_machine(OptLevel::O0).get_target_data(),
             current_function: None,
             current_function_value: None,
             ante_main: None,
@@ -256,7 +261,12 @@ impl<'ctx> ModuleContext<'ctx> {
                 backing.set_initializer(&init_value);
                 backing.as_pointer_value().into()
             },
-            ConstantValue::Transmute { typ } => Self::undef_value(self.convert_type(typ)),
+            // A constant transmute is always from a zero-sized source (that is the only transmute
+            // the constant evaluator folds), so every byte of the result is a widened one. `undef`
+            // let LLVM hand back whatever it liked: this is how a capture-less method in a `let`
+            // impl gets its environment pointer, and an `undef` environment is a refcount away from
+            // a segfault. Zero, like the C backend's `(T){0}`.
+            ConstantValue::Transmute { typ } => Self::zero_value(self.convert_type(typ)),
         }
     }
 
@@ -852,12 +862,40 @@ impl<'ctx> ModuleContext<'ctx> {
         self.builder.build_call(intrinsic, &[a.into(), b.into()], "").unwrap().try_as_basic_value().basic().unwrap()
     }
 
+    /// Reinterpret a value's bits as another type, by round-tripping it through a stack slot.
+    ///
+    /// The slot is sized for whichever of the two types is larger, and zeroed first when the
+    /// result is the larger one. A widening transmute is otherwise a load past the end of the slot:
+    /// `Unit` (zero-sized) into a `Pointer` -- how a capture-less closure gets its null environment
+    /// -- loaded 8 bytes of whatever the frame happened to hold there, and a garbage environment
+    /// pointer is a segfault as soon as anything refcounts it. Zeroing gives the widened tail a
+    /// defined value, matching the C backend's `memset` + min-size `memcpy`.
     fn transmute(&mut self, value: &mir::Value, function: &mir::Definition, id: InstructionId) -> BasicValueEnum<'ctx> {
         let result_type = self.convert_type(function.instruction_result_type(id));
         let value = self.lookup_value(value);
-        let alloca = self.builder.build_alloca(value.get_type(), "").unwrap();
+        let source_type = value.get_type();
+
+        let widening = self.target_data.get_store_size(&result_type) > self.target_data.get_store_size(&source_type);
+        let slot_type = if widening { result_type } else { source_type };
+
+        let alloca = self.builder.build_alloca(slot_type, "").unwrap();
+        if widening {
+            self.builder.build_store(alloca, Self::zero_value(slot_type)).unwrap();
+        }
         self.builder.build_store(alloca, value).unwrap();
         self.builder.build_load(result_type, alloca, "").unwrap()
+    }
+
+    fn zero_value(typ: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        match typ {
+            BasicTypeEnum::ArrayType(array) => array.const_zero().into(),
+            BasicTypeEnum::FloatType(float) => float.const_zero().into(),
+            BasicTypeEnum::IntType(int) => int.const_zero().into(),
+            BasicTypeEnum::PointerType(pointer) => pointer.const_zero().into(),
+            BasicTypeEnum::StructType(tuple) => tuple.const_zero().into(),
+            BasicTypeEnum::VectorType(vector) => vector.const_zero().into(),
+            BasicTypeEnum::ScalableVectorType(vector) => vector.const_zero().into(),
+        }
     }
 
     fn make_tuple(&mut self, fields: &[mir::Value]) -> BasicValueEnum<'ctx> {
