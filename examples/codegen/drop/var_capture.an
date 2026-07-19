@@ -1,0 +1,27 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+main () =
+    var r = R 1
+    show = fn () -> println r.tag
+    show ()
+
+    // Overwrite: `R 1` is dropped here, not leaked. The closure now reads `R 2` through its ref.
+    r := R 2
+    show ()
+
+    // A second borrow of the same owner: both closures borrow, neither owns.
+    twice = fn () -> println (r.tag + r.tag)
+    twice ()
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 1
+// drop 1
+// 2
+// 4
+// drop 2

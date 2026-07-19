@@ -30,6 +30,19 @@ struct LambdaOptions {
     /// it should be reported. The set is the names visible before the branch
     /// introduces its own pattern bindings.
     repeated_context: Option<(RepeatedContext, FxHashSet<NameId>)>,
+
+    /// True for a `handle`'s case-branch and body lambdas.
+    /// These closures cannot outlive their handle expression -- the branches are consumed
+    /// by the drive function and the body by the coroutine init, and the coroutine is
+    /// freed unconditionally when the handle completes -- so their captures do NOT poison
+    /// `captured_names`: the owning scope may drop them normally at its exit (which runs
+    /// after the handle). By-value escapes out of these lambdas (a branch returning its
+    /// capture, `resume <capture>`) are covered by `merge_moves_rooted_in`, which marks
+    /// the outer binding moved so the owner skips it; resume-using branches cannot move
+    /// captures at all (`check_moves_in_repeated_context`). Names ALSO captured by an
+    /// ordinary (escapable) closure keep their exclusion via that closure's own
+    /// `record_captured_names`.
+    handler_scoped: bool,
 }
 
 impl<'local, 'inner> TypeChecker<'local, 'inner> {
@@ -190,8 +203,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 }
                 // Block-fallthrough drops for this scope's locals. Synthesized before
                 // pop_implicits_scope so delayed `Drop` implicits resolve in this scope.
+                // Retract env-drop obligations of any move closure that escapes this
+                // block (returned/stored/passed), so the drop below never frees an aliased escapee.
                 let diverges = self.diverges(&result);
                 let location = self.current_extended_context().expr_location(id);
+                self.retract_escaping_closure_env_releases(id);
                 let drops = self.pop_drop_scope(diverges, &location);
                 if !drops.is_empty() {
                     self.current_extended_context_mut().push_post_expr_drops(id, drops);
@@ -479,7 +495,10 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 if !self.suppress_move_check {
                     self.check_use_of_move_path(&move_path, path);
                 }
-                if !self.suppress_move_record {
+                // Calling a closure borrows it. Fenced to function-typed callees so a non-function
+                // variable in callee position (an error path) still records normally.
+                let borrowed_as_callee = self.borrow_callee && matches!(self.follow_type(&typ), Type::Function(_));
+                if !self.suppress_move_record && !borrowed_as_callee {
                     let non_copy = !self.type_is_copy(&typ);
                     // Auto-drop: also record tentative moves for bare generic variables
                     // the lenient Copy search let through. Their Copy-ness may only be
@@ -715,6 +734,10 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             environment: self.next_type_variable(),
             return_type: expected.clone(),
         });
+        // Calling a closure borrows it. A direct variable callee (`m ()`) must not record a move of
+        // `m`, or an owning (now affine) closure would be consumed by its own call and its
+        // scope-exit env-teardown drop would never fire. Scoped to the callee expression only;
+        // arguments below still move normally.
         let callee_is_variable = matches!(self.expr_of(call.function).as_ref(), Expr::Variable(_));
         let old_borrow_callee = std::mem::replace(&mut self.borrow_callee, callee_is_variable);
         let actual_function_type = self.infer_expr(call.function, &Type::Function(expected_function_type.clone()));
@@ -1003,7 +1026,13 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Cow::Borrowed(&function_type.return_type)
         };
 
+        // A handler-scoped lambda (handle body / handler branch) cannot outlive its handle
+        // expression, so a `:=` through one of its captures may release the old value even though
+        // the slot lives in an enclosing function. Reflects only the innermost lambda: a nested
+        // ordinary lambda resets it to `false`.
+        let old_handler_scoped = std::mem::replace(&mut self.in_handler_scoped_lambda, options.handler_scoped);
         let body_type = self.check_expr(lambda.body, &return_type, TypeErrorKind::FunctionBody);
+        self.in_handler_scoped_lambda = old_handler_scoped;
 
         // Auto-drop: The body's value is this function's return value; a reference
         // derived from an owned local must not escape through it.
@@ -1045,8 +1074,28 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         if let Some(outer_names) = outer_names {
             self.move_tracker.merge_moves_rooted_in(&body_tracker, &outer_names);
             // Names this lambda captures must not be auto-dropped by their owning scope:
-            // the closure (e.g. one returned from the function) would dangle.
-            self.record_captured_names(expr);
+            // the closure (e.g. one returned from the function) would dangle. Handle-scoped
+            // lambdas (handler branches + handle bodies) are exempt -- they cannot outlive
+            // their handle expression, so the owner's scope-exit drop (which runs after the
+            // handle completes) is sound; see `LambdaOptions::handler_scoped`.
+            if !options.handler_scoped {
+                self.record_captured_names(expr);
+                // Restore shared captures to the owner and record the env-side release obligation
+                // for a bound closure. After `record_captured_names` so the owner-restore removal
+                // sticks. Fenced to stack (tuple) envs: a bare-`Pointer` env is a capability/method
+                // dictionary. that the builder's pack-retain also skips -- keeping the owner-restore
+                // release paired with a retain.  Handler-scoped lambdas are already exempt (their
+                // captures never entered `captured_names`, and the pack-retain is fenced off in the
+                // builder).
+                if !super::free_variables::is_pointer_env(&function_type.environment, &self.bindings) {
+                    self.record_shared_captures(expr, self_name);
+                    // Restore this lambda's `var` captures -- its env holds `MUT` refs into their
+                    // slots, so the owner still owns them. Eager: A deferred `check_for_closure`
+                    // would run after this scope's drops are already synthesized. See
+                    // `restore_mut_ref_captures`.
+                    self.restore_mut_ref_captures(expr, lambda.is_move);
+                }
+            }
         }
 
         // Must run before `check_for_closure` may be deferred, so later uses see the move.
@@ -1632,7 +1681,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 .handler_branch_uses_resume(pattern.resume_name, *branch)
                 .then(|| (RepeatedContext::HandlerBranch, outer_names.clone()));
 
-            let options = LambdaOptions { repeated_context };
+            let options = LambdaOptions { repeated_context, handler_scoped: true };
 
             // `resume` is a bare-`Pointer`-env closure but its environment is coroutine state, not
             // an `AllocShared` refcount block -- exclude it from closure-env RC.
@@ -1646,7 +1695,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.push_implicits_scope();
         self.add_implicit_name(handle.handler_name);
 
-        let options = LambdaOptions::default();
+        let options = LambdaOptions { handler_scoped: true, ..LambdaOptions::default() };
         let body_lambda = self.unwrap_lambda(handle.expression);
 
         // `Some(handler_name)` exempts the variable from being captured as a closure.

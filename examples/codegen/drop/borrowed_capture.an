@@ -1,0 +1,38 @@
+// A non-`move`, non-`var`, non-`Copy` capture is an `IMM` reference in the
+// closure's environment, not a by-value bit-copy. So:
+//
+//   - the owner keeps ownership and drops the value exactly ONCE at scope exit, and
+//   - the closure may be called repeatedly (it holds a borrow, not a moved value), and
+//   - the drop happens AFTER the borrowing closure dies, because scope exit drops in
+//     reverse-declaration order and a closure capturing `r` is declared after it.
+//
+// Previously the capture was captured by value and the `captured_names` blanket
+// suppressed the owner's drop entirely (dropping either side would double-free
+// the aliased value), so `r` leaked. `tag` is read through the borrow,
+// exercising the deref-on-read path.
+//
+// A closure that ESCAPES while borrowing is rejected at compile time (see
+// examples/typechecking/auto_drop_capture_escape.an), which is what makes this sound.
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+main () =
+    r = R 1
+    show = fn () -> println r.tag
+    show ()
+    show ()
+
+    // A second borrow of the same owner: both closures borrow, neither owns.
+    twice = fn () -> println (r.tag + r.tag)
+    twice ()
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 1
+// 1
+// 2
+// drop 1

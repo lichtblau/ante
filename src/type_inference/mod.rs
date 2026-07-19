@@ -282,10 +282,17 @@ struct TypeChecker<'local, 'inner> {
     /// Cached TopLevelName for the Prelude's `Drop` ability type, lazily resolved on first use.
     drop_type_name: Option<TopLevelName>,
 
-    /// Names captured (by reference) by any lambda in the current item (`--auto-drop` only).
-    /// Captured names are never auto-dropped: the closure may outlive the owning scope, so
-    /// dropping the referent would dangle it. Skipping only leaks for now.
+    /// Names captured by a lambda in the current item whose owning scope must not auto-drop them
+    /// (`--auto-drop` only): dropping the referent could dangle the closure. Skipping only leaks.
     captured_names: FxHashSet<NameId>,
+
+    /// True while inferring the body of a handler-scoped lambda (a handle body
+    /// or handler branch, `LambdaOptions::handler_scoped`). Such a lambda provably cannot outlive
+    /// its handle expression, so its captures cannot outlive their owner -- a `:=` through one of
+    /// them (`assignment_overwrite_drop`) may release the old value even though the slot lives in an
+    /// enclosing function. Reset per lambda (a nested ordinary lambda sets it back to `false`), so
+    /// it reflects only the innermost lambda directly containing the assignment.
+    in_handler_scoped_lambda: bool,
 
     /// The top-level definition name whose lambda body is about to be inferred, so
     /// [`Self::compute_return_origin_summary`] can key its summary -- set only for a top-level
@@ -330,6 +337,17 @@ struct TypeChecker<'local, 'inner> {
     /// state, not an `AllocShared` refcount block. Retaining or releasing it would read a bogus
     /// header off the stack. Excluded from closure-env RC for now.
     effect_continuation_names: FxHashSet<NameId>,
+
+    /// Each closure binding (`move` or not) → the concretely `shared`-typed, non-`var` variables
+    /// it captured by value. A shared handle is `Copy`, so the capture is a bit-copy the owner
+    /// keeps too; the pack-time `RcRetain` (`pack_closure_environment`) gives the env its own
+    /// reference, and this table drives the balancing release when the closure value dies
+    /// un-escaped. The owner's own release is restored in tandem (the capture is removed from
+    /// `captured_names`), so the pair is: +1 capture retain, −1 env death, −1 owner exit against
+    /// the original +1 ownership. Keyed by the binding name; an escaping closure is retracted from
+    /// this table (`retract_escaping_closure_env_releases`) so only the leak-not-UAF fallback
+    /// remains.
+    shared_closure_captures: FxHashMap<NameId, Vec<NameId>>,
 
     /// Recursion guard for structural drop expansion (`--auto-drop`): recursive types
     /// cannot be expanded inline, so expansion stops at a fixed depth (skips leak).
@@ -423,6 +441,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_method_name: None,
             drop_type_name: None,
             captured_names: Default::default(),
+            in_handler_scoped_lambda: false,
             summary_binding_name: None,
             borrowed_param_masks: Default::default(),
             return_origin_summaries: Default::default(),
@@ -431,6 +450,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             call_argument_depth: 0,
             pending_autoref_temp_drops: Vec::new(),
             effect_continuation_names: Default::default(),
+            shared_closure_captures: Default::default(),
             drop_expansion_depth: 0,
             copy_check_depth: 0,
             function_local_names: Vec::new(),
@@ -615,12 +635,14 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.drop_scopes.clear();
         self.synthesizing_drops = false;
         self.captured_names.clear();
+        self.in_handler_scoped_lambda = false;
         self.summary_binding_name = None;
         self.borrowed_local_params.clear();
         self.borrowed_bindings.clear();
         self.call_argument_depth = 0;
         self.pending_autoref_temp_drops.clear();
         self.effect_continuation_names.clear();
+        self.shared_closure_captures.clear();
         self.drop_expansion_depth = 0;
         self.function_local_names.clear();
         self.diagnosed_missing_drops.clear();

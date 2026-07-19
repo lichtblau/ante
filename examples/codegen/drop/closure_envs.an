@@ -1,6 +1,6 @@
 get_closure () =
     msg = "hi"
-    stuff () = println msg
+    stuff = move fn () -> println msg
     stuff
 
 main () =
@@ -23,6 +23,14 @@ main () =
     m ()
     println x
 
+    // A move closure capturing an OWNED (heap) String by value.
+    // The env is its sole owner (the move is recorded; the outer scope can neither use
+    // nor drop `owned`), so when the closure dies un-moved its capture is dropped --
+    // the heap buffer is freed here, not leaked.
+    payload = "moved " ++ "string"
+    p = move fn () -> println payload
+    p ()
+
 // args: --delete-binary --no-color
 // expected stdout:
 // hi
@@ -31,3 +39,4 @@ main () =
 // 12
 // 100
 // 200
+// moved string

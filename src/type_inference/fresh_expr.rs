@@ -85,6 +85,13 @@ pub struct ExtendedTopLevelContext {
     /// by reference. Used by the MIR builder to determine capture semantics.
     move_closures: FxHashSet<ExprId>,
 
+    /// Per closure, the captures held by reference (an `IMM` ref in the env) rather than by
+    /// value -- the non-`move`, non-`var`, non-reference-typed, non-`Copy` captures. Their owner
+    /// keeps ownership and drops them; the env only borrows. The MIR builder must not guess this
+    /// set from types (a `shared` handle and a borrow both lower to `Pointer`), so the frontend
+    /// records it here.
+    borrowed_captures: FxHashMap<ExprId, FxHashSet<NameId>>,
+
     /// RHS expressions of real (user-written, drop-registered) local bindings, keyed by the
     /// binding's rhs [ExprId]. The MIR builder emits an `RcRetain` when such an rhs is a shared
     /// handle place -- the binding is a new owning location whose scope-exit release balances the
@@ -124,6 +131,15 @@ pub struct ExtendedTopLevelContext {
     /// value. Unlike shared handles, closures have no nominal `release_T`, so the place is recorded
     /// directly rather than as a synthesized call.
     closure_env_releases: FxHashSet<ExprId>,
+
+    /// Closure place expressions rewritten by the MIR builder into "extract environment slot `n`
+    /// of this closure". An affine closure owns the non-`Copy` values in its env tuple, and whoever
+    /// holds the closure when it dies must drop them -- including a caller that received the closure
+    /// from an escape, which knows only the closure's type. Env slots have no surface syntax
+    /// (`get_field_types` on a `Type::Function` is empty, and there is no tuple pattern), so drop
+    /// elaboration binds each owned slot to a fresh local through one of these markers and drops
+    /// that local by name.
+    closure_env_slots: FxHashMap<ExprId, u32>,
 
     /// Drop calls synthesized by drop elaboration (`--auto-drop`), keyed by the expression
     /// whose value immediately precedes the scope-exit edge. The MIR builder lowers them
@@ -187,11 +203,13 @@ impl ExtendedTopLevelContext {
             instantiations: Default::default(),
             closure_environments: Default::default(),
             move_closures: Default::default(),
+            borrowed_captures: Default::default(),
             retain_bindings: Default::default(),
             escape_retains: Default::default(),
             copy_place_paths: Default::default(),
             copy_place_exprs: Default::default(),
             closure_env_releases: Default::default(),
+            closure_env_slots: Default::default(),
             post_expr_drops: Default::default(),
             pre_exit_drops: Default::default(),
             implicit_else_drops: Default::default(),
@@ -391,6 +409,20 @@ impl ExtendedTopLevelContext {
         self.move_closures.insert(expr);
     }
 
+    /// Record which of this closure's captures are held by reference. See
+    /// [`Self::borrowed_captures`].
+    pub(crate) fn insert_borrowed_captures(&mut self, expr: ExprId, names: FxHashSet<NameId>) {
+        if !names.is_empty() {
+            self.borrowed_captures.insert(expr, names);
+        }
+    }
+
+    /// True when this closure holds `name` by reference rather than by value.
+    #[allow(dead_code, reason = "read by the MIR builder, which the lib target does not compile")]
+    pub(crate) fn capture_is_borrowed(&self, expr: ExprId, name: NameId) -> bool {
+        self.borrowed_captures.get(&expr).is_some_and(|names| names.contains(&name))
+    }
+
     /// Copy all per-`ExprId` codegen metadata recorded for `from` onto `to`.
     pub(crate) fn copy_expr_metadata(&mut self, from: ExprId, to: ExprId) {
         if let Some(&index) = self.member_access_indices.get(&from) {
@@ -408,6 +440,9 @@ impl ExtendedTopLevelContext {
         if self.move_closures.contains(&from) {
             self.move_closures.insert(to);
         }
+        if let Some(borrowed) = self.borrowed_captures.get(&from).cloned() {
+            self.borrowed_captures.insert(to, borrowed);
+        }
         if self.retain_bindings.contains(&from) {
             self.retain_bindings.insert(to);
         }
@@ -419,6 +454,9 @@ impl ExtendedTopLevelContext {
         }
         if self.closure_env_releases.contains(&from) {
             self.closure_env_releases.insert(to);
+        }
+        if let Some(&slot) = self.closure_env_slots.get(&from) {
+            self.closure_env_slots.insert(to, slot);
         }
         if let Some(drops) = self.post_expr_drops.get(&from).cloned() {
             self.post_expr_drops.insert(to, drops);
@@ -481,6 +519,17 @@ impl ExtendedTopLevelContext {
 
     pub fn is_closure_env_release(&self, expr: ExprId) -> bool {
         self.closure_env_releases.contains(&expr)
+    }
+
+    /// Rewrite `expr` (a closure place) into an extract of its env slot `index`; see
+    /// [Self::closure_env_slots].
+    pub(crate) fn mark_closure_env_slot(&mut self, expr: ExprId, index: u32) {
+        self.closure_env_slots.insert(expr, index);
+    }
+
+    #[allow(dead_code, reason = "read by the MIR builder, which the lib target does not compile")]
+    pub(crate) fn closure_env_slot(&self, expr: ExprId) -> Option<u32> {
+        self.closure_env_slots.get(&expr).copied()
     }
 
     /// Append synthesized drop calls to run after `expr`'s value is computed.

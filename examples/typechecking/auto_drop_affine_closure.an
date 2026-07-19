@@ -1,0 +1,20 @@
+main () =
+    payload = "a" ++ "b"
+    m = move fn () -> println payload
+    n = m
+    m ()
+    n ()
+
+// args: --check --no-color --auto-drop
+// expected exit status: 1
+// expected stderr:
+// examples/typechecking/auto_drop_affine_closure.an:5:5
+// 3 |     m = move fn () -> println payload
+// 4 |     n = m	// note: m was previously moved here
+//   |         -
+// 5 |     m ()	// error: Use of moved value m
+//   |     ^
+// 6 |     n ()
+// 
+// Found 1 error and 0 warnings
+

@@ -326,6 +326,21 @@ where
             self.push_instruction(Instruction::ReleaseClosureEnv(env), Type::UNIT);
         }
 
+        // The frontend marked this closure place as an env-slot extract, so its value is the slot,
+        // not the closure. A closure is a `(function, environment)` pair, so the env is field 1 and
+        // the slot is field `index` of the env tuple. Only stack (tuple) envs are marked -- a heap
+        // env is an opaque pointer at the type layer, and its captures are released wholesale by
+        // `ReleaseClosureEnv` above.
+        if let Some(index) = self.context().closure_env_slot(expr)
+            && let Type::Function(function) = self.type_of_value(&value)
+            && let Type::Tuple(slots) = function.environment.clone()
+        {
+            let slot_type = slots[index as usize].clone();
+            let env_type = function.environment.clone();
+            let env = self.push_instruction(Instruction::IndexTuple { tuple: value, index: 1 }, env_type);
+            return self.push_instruction(Instruction::IndexTuple { tuple: env, index }, slot_type);
+        }
+
         value
     }
 
@@ -857,23 +872,17 @@ where
         if let cst::Expr::Variable(path_id) = &self.context()[call.function]
             && let Some((effect_op, op_index)) = self.try_resolve_ability_method(*path_id)
         {
-            // A capability built by applying a constrained impl (`drop_vec drop_i32`) heap-
-            // allocates each method closure's environment inside the impl function, freshly
-            // per call site execution. A `Drop` capability cannot outlive its method call
-            // (unlike e.g. Stream combinators, which legitimately capture their caps in
-            // returned closures), so for Drop calls we lower application-shaped capability
-            // arguments through `lower_drop_capability` -- collecting every nesting level's
-            // environments -- and free them once the drop completes. Static impls and
-            // capability parameters lower as plain variables and are never freed.
-            let is_drop_call = matches!(
-                self.context().path_origin(*path_id),
-                Some(Origin::TopLevelDefinition(name)) if self.is_prelude_drop_ability(name.top_level_item)
-            );
-
-            let mut cap_env_frees = Vec::new();
+            // An implicit capability (`print_vec print_i32`, `drop_vec drop_i32`) heap-allocates
+            // each method closure's environment inside the impl function, freshly per call-site
+            // execution. The caller owns those envs: release them (count-zero free via the
+            // null-safe, immortal-safe ReleaseClosureEnv) once the call completes. Static impls and
+            // capability parameters lower as plain variables -- nothing is collected for them, so
+            // effect capabilities (stack cap_state envs, no RC header) are never touched. A callee
+            // that legitimately stores a method closure beyond the call must retain it.
+            let mut cap_env_releases = Vec::new();
             let arguments = mapvec(&call.arguments, |argument| {
-                if is_drop_call && argument.is_implicit {
-                    self.lower_drop_capability(argument.expr, &mut cap_env_frees)
+                if argument.is_implicit {
+                    self.lower_drop_capability(argument.expr, &mut cap_env_releases)
                 } else {
                     let value = self.expression(argument.expr);
                     // Callee-owns retain, same as the plain-call path below: an effect-op or
@@ -882,17 +891,15 @@ where
                     // refcount bumped or the arm's release double-frees the caller's handle.
                     // Implicit capability tuples are excluded: they are not shared handles,
                     // and their ownership is audited separately.
-                    if !argument.is_implicit {
-                        self.retain_if_shared_place(argument.expr, value);
-                    }
+                    self.retain_if_shared_place(argument.expr, value);
                     value
                 }
             });
 
             let result = self.emit_ability_method_call(effect_op, op_index, arguments, result_type, diverges);
             if !diverges {
-                for environment in cap_env_frees {
-                    self.emit_free(environment);
+                for environment in cap_env_releases {
+                    self.push_instruction(Instruction::ReleaseClosureEnv(environment), Type::UNIT);
                 }
                 // `Extract`'s `(.[])` is a read: the collection still holds the element it hands
                 // back, so an element that owns refcounted data comes back as an alias while the
@@ -929,6 +936,11 @@ where
         let implicits_pure = callee_mask.is_some()
             && call.arguments.iter().filter(|arg| arg.is_implicit).all(|arg| self.implicit_is_pure_static(arg.expr));
 
+        // Implicit capability arguments to plain calls (a generic wrapper like `println x
+        // {Print t}`) get the same treatment as ability-method calls above: an
+        // application-shaped cap is freshly allocated for this call, so the caller releases
+        // its method-closure environments once the call completes.
+        let mut cap_env_releases = Vec::new();
         // (value, expr, retain id when this is an elidable pair)
         let mut post_call_releases: Vec<(Value, ExprId, Option<crate::mir::InstructionId>)> = Vec::new();
         let mut implicit_positions: Vec<u32> = Vec::new();
@@ -937,7 +949,7 @@ where
         let arguments = mapvec(&call.arguments, |arg| {
             let value = if arg.is_implicit && !is_release_call {
                 implicit_positions.push(arg_index);
-                self.expression(arg.expr)
+                self.lower_drop_capability(arg.expr, &mut cap_env_releases)
             } else {
                 let value = self.expression(arg.expr);
                 if !is_release_call {
@@ -989,6 +1001,9 @@ where
         if diverges {
             self.terminate_block(TerminatorInstruction::Unreachable);
         } else {
+            for environment in cap_env_releases {
+                self.push_instruction(Instruction::ReleaseClosureEnv(environment), Type::UNIT);
+            }
             for (arg_value, arg_expr, retain_id) in post_call_releases {
                 let release = self.emit_shared_release_for_expr(arg_value, arg_expr);
                 if let (Some(retain), Some(call), Some(Value::InstructionResult(release_call))) =
@@ -1078,24 +1093,11 @@ where
         value
     }
 
-    /// True if `item` is the Prelude's `Drop` ability definition.
-    fn is_prelude_drop_ability(&mut self, item: TopLevelId) -> bool {
-        if item.source_file != crate::name_resolution::namespace::SourceFileId::prelude() {
-            return false;
-        }
-        let (raw_item, context) = GetItemRaw(item).get(self.compiler);
-        match &raw_item.kind {
-            cst::TopLevelItemKind::AbilityDefinition(ability) => context.names[ability.name].as_ref() == "Drop",
-            _ => false,
-        }
-    }
-
-    /// Lower a Drop call's capability argument. Application-shaped arguments (a constrained
-    /// impl applied to its own capabilities, e.g. `drop_vec drop_i32`) are lowered manually,
-    /// recursing into their arguments, so that every nesting level's freshly-constructed
-    /// capability value is at hand: each one's method-closure environments are recorded in
-    /// `env_frees` for release after the drop runs. Anything else (a static impl reference,
-    /// a `{Drop t}` parameter) lowers normally and owns nothing to free.
+    /// True if `item` is the Prelude's `Drop` ability definition.  Lower an ability-method call's
+    /// capability argument. Recursing into the arguments, so that every nesting level's
+    /// freshly-constructed capability value is at hand: each one's method-closure environments are
+    /// recorded in `env_frees` for release after the call runs. Anything else (a static impl
+    /// reference, a capability parameter) lowers normally and owns nothing to release.
     fn lower_drop_capability(&mut self, expr: ExprId, env_frees: &mut Vec<Value>) -> Value {
         let call = match &self.context()[expr] {
             cst::Expr::Call(call) => call.clone(),
@@ -1135,15 +1137,6 @@ where
                 env_frees.push(environment);
             }
         }
-    }
-
-    /// Free a heap pointer the drop machinery owns. These pointers come from [Instruction::
-    /// AllocShared] (closure/capability-method environments), which carry a refcount header before
-    /// the value; [Instruction::FreeShared] subtracts that offset and is null-safe (capture-less
-    /// methods carry a null environment). Raw `Ptr` frees in the stdlib use a plain `free` and are
-    /// unaffected.
-    fn emit_free(&mut self, pointer: Value) {
-        self.push_instruction(Instruction::FreeShared(pointer), Type::UNIT);
     }
 
     /// Like [Self::try_resolve_effect_op] but also returns the op's position within its
@@ -1365,10 +1358,14 @@ where
                     let environment = Value::Parameter(this.current_block, lambda.parameters.len() as u32);
                     this.unpack_closure_environment(free_vars.iter().copied(), environment);
 
-                    // For regular closures, mutable captures are pointers (by reference).
+                    // Regular closures hold captures by reference: `var` captures are `Mut` refs
+                    // and borrowed captures are `IMM` refs. Both arrive as pointers, so mark them
+                    // deref-backed -- the read path (`variable`) then auto-derefs. The frontend
+                    // forbids assigning to an immutable binding, so reusing `mutable_locals` for
+                    // the read-only deref cannot grant mutation.
                     if !is_move {
                         for var in free_vars.iter() {
-                            if mutable_captures.contains(var) {
+                            if mutable_captures.contains(var) || this.context().capture_is_borrowed(expr, *var) {
                                 this.mutable_locals.insert(*var);
                             }
                         }
@@ -1424,7 +1421,8 @@ where
         let env_is_pointer = matches!(env_type, Type::Primitive(crate::mir::PrimitiveType::Pointer));
         if free_vars.is_some() || env_is_pointer {
             let environment = if let Some(free_vars) = &free_vars {
-                self.pack_closure_environment(free_vars, is_move, &env_type)
+                let retain_shared = !env_is_pointer && handle_body_handler_name.is_none();
+                self.pack_closure_environment(expr, free_vars, is_move, &env_type, retain_shared)
             } else {
                 // Pointer-env slot with no captures (e.g. an ability impl assigning a plain function):
                 // use a null pointer for the env. Transmute from Unit so constant-folding works
@@ -1439,7 +1437,9 @@ where
     /// Packs each given variable into a closure environment.
     /// When `env_type` is a pointer, the capture tuple is heap-allocated (via [Instruction::AllocShared])
     /// and the returned value is the resulting pointer. Otherwise returns the tuple directly.
-    fn pack_closure_environment(&mut self, free_vars: &BTreeSet<NameId>, is_move: bool, env_type: &Type) -> Value {
+    fn pack_closure_environment(
+        &mut self, lambda: ExprId, free_vars: &BTreeSet<NameId>, is_move: bool, env_type: &Type, retain_shared: bool,
+    ) -> Value {
         assert!(!free_vars.is_empty());
 
         let values = mapvec(free_vars, |var| {
@@ -1451,7 +1451,27 @@ where
                 let tc_type = &self.types.result.maps.name_types[var];
                 let val_type = self.convert_type(tc_type, None);
                 self.push_instruction(Instruction::Deref(value), val_type)
+            } else if self.context().capture_is_borrowed(lambda, *var) {
+                // The frontend gave this capture an `IMM` ref env slot, so pack an address rather
+                // than the value. A deref-backed local (a `var` slot, or an outer closure's borrow
+                // we are re-borrowing) is already an address -- pass it through.  An immutable
+                // local is an SSA value with no address, so materialize a stack slot.  No `shared`
+                // retain: borrowed captures are non-`Copy`, and `shared` handles are Copy.
+                if self.mutable_locals.contains(var) {
+                    value
+                } else {
+                    self.push_instruction(Instruction::StackAlloc(value), Type::POINTER)
+                }
             } else {
+                // A `shared` handle captured by value is a new owning location -- retain it so the
+                // env carries its own count. `var` captures are Mut-refs into the owner's slot (no
+                // handle copy), so they are excluded, matching the frontend's owner-restore fence.
+                if retain_shared
+                    && !self.mutable_locals.contains(var)
+                    && self.types.result.maps.name_types.get(var).is_some_and(|tc| self.shared_inner_layout_of(tc).is_some())
+                {
+                    self.push_instruction(Instruction::RcRetain(value), Type::UNIT);
+                }
                 value
             }
         });

@@ -2,9 +2,9 @@
 //
 //   - `acc := acc ++ s` inside an arm drops the OLD acc on every overwrite,
 //     across suspensions -- the intermediate strings do NOT leak, and nothing
-//     double-frees (the handler env holding acc is mutated across resumes).
-//   - the final value of the handler-captured `var acc` is never dropped when
-//     the handle completes: 24 bytes leak.
+//     double-frees (the handler env holds a Mut-ref to acc across resumes).
+//   - the final value of the handler-captured `var acc` is dropped by
+//     `run_log`'s own scope exit, exactly once, after the handle completes.
 
 ability Log =
     log: resume fn String -> Unit
