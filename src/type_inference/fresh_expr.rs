@@ -85,6 +85,46 @@ pub struct ExtendedTopLevelContext {
     /// by reference. Used by the MIR builder to determine capture semantics.
     move_closures: FxHashSet<ExprId>,
 
+    /// RHS expressions of real (user-written, drop-registered) local bindings, keyed by the
+    /// binding's rhs [ExprId]. The MIR builder emits an `RcRetain` when such an rhs is a shared
+    /// handle place -- the binding is a new owning location whose scope-exit release balances the
+    /// retain. Synthesized match-variable definitions (`$mv = l`, payload copies) are not
+    /// recorded here: the frontend never drop-registers them, so retaining them would leak (an
+    /// unmatched increment).
+    retain_bindings: FxHashSet<ExprId>,
+
+    /// Tail-position shared-handle place expressions (variables / field accesses) that escape as
+    /// a function's return value. A `shared` value is Copy, never move-tracked, so a function
+    /// returning one of its locals/params would release it at scope exit while the caller also owns
+    /// it. The MIR builder emits an `RcRetain` when lowering such an expression to fund the
+    /// caller's reference; the scope-exit release then balances it.
+    escape_retains: FxHashSet<ExprId>,
+
+    /// Place expressions whose read is a copy: the source keeps its own drop obligation because
+    /// its type is `Copy`, so no move was recorded for it. Only places whose drop is not provably a
+    /// no-op are recorded (`type_needs_no_drop`), which is what keeps this off every `I32` read.
+    ///
+    /// The MIR builder consults this at its retain sites. A `shared` handle and a heap-env closure
+    /// are recognizable from the type alone and retain without asking; an aggregate that holds
+    /// them (`Maybe (Node b)`, a struct of handles) is not, and the question the type cannot answer
+    /// is whether this read copied the value or moved it. A copy's own drop releases every handle
+    /// inside it, field by field, while the source's drop still releases the same handles -- so the
+    /// copy must retain them. A move, whose obligation transfers with the value, is absent here:
+    /// retaining it would leak.
+    ///
+    /// Variables are keyed by [PathId] (the copy/move decision is made in `infer_path`, which has no
+    /// [ExprId] to hand); field reads by the member access's own [ExprId].
+    copy_place_paths: FxHashSet<PathId>,
+    copy_place_exprs: FxHashSet<ExprId>,
+
+    /// Heap-env closure place expressions (variables / field accesses) whose environment refcount
+    /// must be released here. Recorded by drop elaboration at scope-exit edges and threaded through
+    /// the drop tables (`post_expr_drops` / `pre_exit_drops`) like a synthesized drop call; the MIR
+    /// builder emits a null-safe `ReleaseClosureEnv` on the place's env pointer after computing its
+    /// value. Unlike shared handles, closures have no nominal `release_T`, so the place is recorded
+    /// directly rather than as a synthesized call.
+    closure_env_releases: FxHashSet<ExprId>,
+
     /// Drop calls synthesized by drop elaboration (`--auto-drop`), keyed by the expression
     /// whose value immediately precedes the scope-exit edge. The MIR builder lowers them
     /// right after that expression's value is computed. Keys today: a `Sequence` (block
@@ -147,6 +187,11 @@ impl ExtendedTopLevelContext {
             instantiations: Default::default(),
             closure_environments: Default::default(),
             move_closures: Default::default(),
+            retain_bindings: Default::default(),
+            escape_retains: Default::default(),
+            copy_place_paths: Default::default(),
+            copy_place_exprs: Default::default(),
+            closure_env_releases: Default::default(),
             post_expr_drops: Default::default(),
             pre_exit_drops: Default::default(),
             implicit_else_drops: Default::default(),
@@ -363,6 +408,18 @@ impl ExtendedTopLevelContext {
         if self.move_closures.contains(&from) {
             self.move_closures.insert(to);
         }
+        if self.retain_bindings.contains(&from) {
+            self.retain_bindings.insert(to);
+        }
+        if self.escape_retains.contains(&from) {
+            self.escape_retains.insert(to);
+        }
+        if self.copy_place_exprs.contains(&from) {
+            self.copy_place_exprs.insert(to);
+        }
+        if self.closure_env_releases.contains(&from) {
+            self.closure_env_releases.insert(to);
+        }
         if let Some(drops) = self.post_expr_drops.get(&from).cloned() {
             self.post_expr_drops.insert(to, drops);
         }
@@ -376,6 +433,54 @@ impl ExtendedTopLevelContext {
 
     pub fn is_move_closure(&self, expr: ExprId) -> bool {
         self.move_closures.contains(&expr)
+    }
+
+    /// Record `expr` (a real binding's rhs) as a retain site; see [Self::retain_bindings].
+    pub(crate) fn mark_retain_binding(&mut self, expr: ExprId) {
+        self.retain_bindings.insert(expr);
+    }
+
+    pub fn is_retain_binding(&self, expr: ExprId) -> bool {
+        self.retain_bindings.contains(&expr)
+    }
+
+    /// Record `expr` as a tail-position escaping shared place; see [Self::escape_retains].
+    pub(crate) fn mark_escape_retain(&mut self, expr: ExprId) {
+        self.escape_retains.insert(expr);
+    }
+
+    pub fn is_escape_retain(&self, expr: ExprId) -> bool {
+        self.escape_retains.contains(&expr)
+    }
+
+    /// Record a variable read as a copy of an existing place; see [Self::copy_place_paths].
+    pub(crate) fn mark_copy_place_path(&mut self, path: PathId) {
+        self.copy_place_paths.insert(path);
+    }
+
+    /// Record a field read as a copy of an existing place; see [Self::copy_place_paths].
+    pub(crate) fn mark_copy_place_expr(&mut self, expr: ExprId) {
+        self.copy_place_exprs.insert(expr);
+    }
+
+    /// True when `expr` is a place whose read copies the value out, leaving the source's own drop
+    /// obligation behind; see [Self::copy_place_paths].
+    pub fn is_copy_place(&self, expr: ExprId) -> bool {
+        match &self[expr] {
+            Expr::Variable(path) => self.copy_place_paths.contains(path),
+            Expr::MemberAccess(_) => self.copy_place_exprs.contains(&expr),
+            _ => false,
+        }
+    }
+
+    /// Record `expr` (a heap-env closure place) as a closure-env release site; see
+    /// [Self::closure_env_releases].
+    pub(crate) fn mark_closure_env_release(&mut self, expr: ExprId) {
+        self.closure_env_releases.insert(expr);
+    }
+
+    pub fn is_closure_env_release(&self, expr: ExprId) -> bool {
+        self.closure_env_releases.contains(&expr)
     }
 
     /// Append synthesized drop calls to run after `expr`'s value is computed.

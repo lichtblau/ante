@@ -1,0 +1,37 @@
+// Handler capturing OWNED state used across multiple performs.
+//
+//   - `acc := acc ++ s` inside an arm drops the OLD acc on every overwrite,
+//     across suspensions -- the intermediate strings do NOT leak, and nothing
+//     double-frees (the handler env holding acc is mutated across resumes).
+//   - the final value of the handler-captured `var acc` is never dropped when
+//     the handle completes: 24 bytes leak.
+
+ability Log =
+    log: resume fn String -> Unit
+    dump: resume fn Unit -> I32
+
+run_log (f: fn Log => I32): I32 =
+    var acc = "start" ++ ""
+    handler h for
+    | log s ->
+        acc := acc ++ s
+        resume ()
+    | dump () ->
+        print "acc = "
+        println acc
+        resume 4
+    in f h
+
+client {Log} : I32 =
+    log "|one"
+    log "|two"
+    log "|three"
+    dump ()
+
+main () =
+    println (run_log client)
+
+// args: --delete-binary --no-color
+// expected stdout:
+// acc = start|one|two|three
+// 4

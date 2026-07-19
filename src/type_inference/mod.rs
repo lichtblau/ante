@@ -290,6 +290,13 @@ struct TypeChecker<'local, 'inner> {
     /// argument inference; see [Self::call_argument_depth].
     pending_autoref_temp_drops: Vec<ExprId>,
 
+    /// Effect-continuation binding names -- a handler branch's `resume` (`--auto-drop` only).  A
+    /// `resume` continuation is a bare-`Pointer`-env closure would otherwise match it), but its
+    /// environment is supplied by the coroutine lowering -- a pointer to live coroutine/handler
+    /// state, not an `AllocShared` refcount block. Retaining or releasing it would read a bogus
+    /// header off the stack. Excluded from closure-env RC for now.
+    effect_continuation_names: FxHashSet<NameId>,
+
     /// Recursion guard for structural drop expansion (`--auto-drop`): recursive types
     /// cannot be expanded inline, so expansion stops at a fixed depth (skips leak).
     drop_expansion_depth: u32,
@@ -385,6 +392,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             captured_names: Default::default(),
             call_argument_depth: 0,
             pending_autoref_temp_drops: Vec::new(),
+            effect_continuation_names: Default::default(),
             drop_expansion_depth: 0,
             copy_check_depth: 0,
             function_local_names: Vec::new(),
@@ -536,6 +544,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.captured_names.clear();
         self.call_argument_depth = 0;
         self.pending_autoref_temp_drops.clear();
+        self.effect_continuation_names.clear();
         self.drop_expansion_depth = 0;
         self.function_local_names.clear();
         self.diagnosed_missing_drops.clear();
@@ -834,13 +843,30 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         let actual = match result {
             CoercionOutcome::AutoRef => self.type_autoref_wrapper(expr, expected, kind),
             CoercionOutcome::ReplacedExpr => {
-                // Re-check the wrapper but ignore moves since they were already recorded.
-                let old_check = std::mem::replace(&mut self.suppress_move_check, true);
-                let old_record = std::mem::replace(&mut self.suppress_move_record, true);
-                let actual = self.check_expr(expr, expected, kind);
-                self.suppress_move_check = old_check;
-                self.suppress_move_record = old_record;
-                actual
+                // An implicit-coercion wrapper (`fn p q -> f p {impl} q`) is a brand-new lambda
+                // standing where a bare function reference stood, and it must be checked like any
+                // other lambda. Suppressing move recording through it would also switch drop
+                // elaboration off for the whole body (`drop_elaboration_active` reads the same
+                // flag), and a lambda with no drop scope never releases what its parameters own.
+                // That is a leak the wrapper alone can pay: it is the only form the function takes
+                // at an indirect call, so every such call hands it a `shared` argument to consume
+                // -- either retained by the caller, or a bare generic the caller recorded as moved
+                // (`foldl`'s accumulator). Nothing releases it, and the count is orphaned.
+                //
+                // The suppression is for the other rewrites reaching this arm: auto-deref wraps
+                // `(.*)` around the original expression, whose operands' moves the first check
+                // already recorded. A wrapper re-checks a function reference, which moves nothing
+                // (function values are `Copy`), so it has nothing to double-record.
+                if self.coercion_wrapper_exprs.contains(&expr) {
+                    self.check_expr(expr, expected, kind)
+                } else {
+                    let old_check = std::mem::replace(&mut self.suppress_move_check, true);
+                    let old_record = std::mem::replace(&mut self.suppress_move_record, true);
+                    let actual = self.check_expr(expr, expected, kind);
+                    self.suppress_move_check = old_check;
+                    self.suppress_move_record = old_record;
+                    actual
+                }
             },
             CoercionOutcome::None => {
                 self.unify(actual, expected, kind, expr);

@@ -55,6 +55,18 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // (Top-level definitions have no enclosing scope; globals are not dropped.)
         if !is_top_level {
             self.register_drop_locals(definition.pattern);
+
+            // Mark this as a real, drop-registered binding so the MIR builder retains its rhs when
+            // it is a shared handle place (the scope-exit release balances it).  Only real user
+            // definitions reach here -- synthesized match-variable copies do not, so this excludes
+            // them from retaining (they are borrows the frontend never releases).
+            let mut names = Vec::new();
+            self.collect_pattern_binding_names(definition.pattern, &mut names);
+            let binds_droppable =
+                names.iter().any(|name| self.current_extended_context()[*name].as_ref() != "_");
+            if binds_droppable {
+                self.current_extended_context_mut().mark_retain_binding(definition.rhs);
+            }
         }
 
         // Track mutable definitions so closure capture analysis can wrap them in reference types
@@ -460,6 +472,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                     if non_copy || tentative {
                         let location = path.locate(self);
                         self.move_tracker.record_move(move_path, location);
+                    } else if self.drop_elaboration_active() && !self.type_needs_no_drop(&typ) {
+                        // The other half of the same decision: this read copies the value and leaves
+                        // the source's drop where it was, so the copy owes its own reference to
+                        // whatever refcounted data it carries (`copy_place_paths`).
+                        self.current_extended_context_mut().mark_copy_place_path(path);
                     }
                 }
                 typ
@@ -476,6 +493,17 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     ///
     /// Stores the result of the instantiation (if any) to the given [PathId].
     pub(super) fn type_of_top_level_name(&mut self, name: &TopLevelName, path: PathId) -> Type {
+        // See [Self::type_and_bindings_of_top_level_name]: `release_T` is synthesized, not parsed,
+        // so its generic type is computed here and its instantiation recorded on `path` (the
+        // builder reads it to emit `Instantiate(release_T, <bindings>)`).
+        if Self::is_release_function_name(*name) {
+            let typ = self.release_function_generalized_type(name.top_level_item);
+            let (typ, bindings) = self.instantiate(typ);
+            if let Some(bindings) = bindings {
+                self.current_extended_context_mut().insert_instantiation(path, bindings);
+            }
+            return typ;
+        }
         if let Some(typ) = self.item_types.get(name) {
             typ.clone()
         } else {
@@ -491,6 +519,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     /// Returns the type of a [TopLevelName], possibly instantiating it and returning the bindings,
     /// if any, along with the type.
     pub(super) fn type_and_bindings_of_top_level_name(&mut self, name: &TopLevelName) -> (Type, Option<Vec<Type>>) {
+        // A shared type's synthesized `release_T` is not a parsed item, so `GetType` has nothing
+        // to return; compute its `forall <generics>. SharedType -> Unit` type on demand instead.
+        if Self::is_release_function_name(*name) {
+            let typ = self.release_function_generalized_type(name.top_level_item);
+            return self.instantiate(typ);
+        }
         if let Some(typ) = self.item_types.get(name) {
             (typ.clone(), None)
         } else {
@@ -896,6 +930,9 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // the body is a Sequence: same key, appended). Must happen while this lambda's move
         // tracker and implicits scope are still in place.
         let body_location = self.current_extended_context().expr_location(lambda.body);
+        // Retain shared handles that escape via the body's tail value, before the function-exit
+        // releases below would otherwise free them out from under the caller.
+        self.mark_tail_escape_retains(lambda.body);
         let drops = self.pop_drop_scope(self.diverges(&body_type), &body_location);
         if !drops.is_empty() {
             self.current_extended_context_mut().push_post_expr_drops(lambda.body, drops);
@@ -985,9 +1022,16 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 if !old_suppress_check {
                     self.check_use_of_move_path(&move_path, expr);
                 }
-                if !old_suppress_record && !self.type_is_copy(&field) {
-                    let location = expr.locate(self);
-                    self.move_tracker.record_move(move_path, location);
+                if !old_suppress_record {
+                    if !self.type_is_copy(&field) {
+                        let location = expr.locate(self);
+                        self.move_tracker.record_move(move_path, location);
+                    } else if self.drop_elaboration_active() && !self.type_needs_no_drop(&field) {
+                        // A copied field read: same reasoning as a copied variable read
+                        // (`copy_place_exprs`). A field behind a `ref`/`Ptr` never reaches here --
+                        // it is coerced into a `Copy` `(.*)` call, which retains on its own.
+                        self.current_extended_context_mut().mark_copy_place_expr(expr);
+                    }
                 }
             }
 
@@ -1496,6 +1540,10 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
 
             let options = LambdaOptions { repeated_context };
 
+            // `resume` is a bare-`Pointer`-env closure but its environment is coroutine state, not
+            // an `AllocShared` refcount block -- exclude it from closure-env RC.
+            self.effect_continuation_names.insert(pattern.resume_name);
+
             let branch_lambda = self.unwrap_lambda(*branch);
             self.expr_types.insert(*branch, handler_type.clone());
             self.infer_lambda_impl(branch_lambda, &handler_type, *branch, None, options);
@@ -1703,6 +1751,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 // lowers these between computing the value and the Return terminator.
                 if self.drop_elaboration_active() {
                     self.check_reference_escape(returned_expr);
+                    self.mark_tail_escape_retains(returned_expr);
                     let location = id.locate(self);
                     let drops = self.drops_for_return(&location);
                     if !drops.is_empty() {

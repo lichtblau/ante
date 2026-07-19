@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 mod select_largest_variant;
 
 use crate::{
-    incremental::{GetCrateGraph, GetItem, GetItemRaw, Parse, TargetPointerSize, TypeCheck},
+    incremental::{ExportedTypes, GetCrateGraph, GetItem, GetItemRaw, Parse, TargetPointerSize, TypeCheck},
     mir::{
         self, Definition, DefinitionId, FunctionType, GenericBindings, Instruction, Mir, Type, Value,
         builder::build_initial_mir_with_shared_map, next_definition_id,
@@ -55,6 +55,7 @@ where
         + DbGet<GetCrateGraph>
         + DbGet<Parse>
         + DbGet<TargetPointerSize>
+        + DbGet<ExportedTypes>
         + Sync,
 {
     let initial_mir = collect_all_items(compiler)
@@ -292,6 +293,11 @@ impl<'local> FunctionContext<'local> {
             },
             Instruction::StackAlloc(v)
             | Instruction::AllocShared(v)
+            | Instruction::FreeShared(v)
+            | Instruction::RcRetain(v)
+            | Instruction::RcDecrement(v)
+            | Instruction::RetainClosureEnv(v)
+            | Instruction::ReleaseClosureEnv(v)
             | Instruction::Transmute(v)
             | Instruction::Id(v) => self.remap_value(v),
             Instruction::StackAllocUninit(typ) => {

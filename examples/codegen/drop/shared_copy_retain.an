@@ -1,0 +1,74 @@
+// `Copy` on a `shared` type must hand back an owned (+1) handle.
+//
+// Every other producer of a shared handle already does: a constructor allocates at count 1, and a
+// function returning a handle retains it. That is what lets every consumer release what it was
+// given. But `Copy`'s only method is `(.*): fn (ref t) -> t`, and the only body the language lets
+// you write for it is `deref` -- a bare load, which aliases at +0. The release then ran unmatched
+// and freed a cell that was still reachable, so a second read of the same field was a use-after-free.
+//
+// The compiler now supplies the method for shared types (load + retain), which is also the only
+// place the generic case can be served: inside `grab` below, `t` is still abstract, so no call-site
+// retain could know to fire.
+
+shared mut type Nd =
+    id: Usz
+    tag: Usz
+
+impl copy_nd: Copy Nd with
+    (.*) = deref
+
+shared mut type Gen b =
+    val: b
+    n: Usz
+
+impl copy_gen: Copy (Gen b) with
+    (.*) = deref
+
+type Holder = head: Nd
+type GHolder = head: Gen Usz
+
+peek (n: Nd): Usz = n.id
+gpeek (g: Gen Usz): Usz = g.n
+
+// Reading a shared handle out of a field behind a borrow: the frontend coerces `h.head` into a
+// `(.*)` call, so each of these used to net-decrement the node's refcount once per call.
+via_ref (h: ref Holder): Usz = peek h.head
+via_mut (h: mut Holder): Usz = peek h.head
+via_generic_ref (h: ref GHolder): Usz = gpeek h.head
+
+// A generic `{Copy t}` materializer -- the `(.*)` happens where `t` is still abstract.
+grab (r: ref t) {Copy t}: t = r.*
+via_grab (h: ref Holder): Usz = peek (grab h.head)
+
+// An owned local was already balanced; it must not regress into a leak.
+owned_local (): Usz =
+    held = Holder (Nd 42 0)
+    peek held.head
+
+main () =
+    hh = Holder (Nd 7 0)
+    gh = GHolder (Gen 1 9)
+    var i = 0
+    while i < 3 do
+        println (via_ref (ref hh))
+        println (via_mut (mut hh))
+        println (via_grab (ref hh))
+        println (via_generic_ref (ref gh))
+        i := i + 1
+    println (owned_local ())
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 7
+// 7
+// 7
+// 9
+// 7
+// 7
+// 7
+// 9
+// 7
+// 7
+// 7
+// 9
+// 42

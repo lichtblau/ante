@@ -347,20 +347,23 @@ impl Builder {
                 let name = format!("__shared_{}_{}", global_id.0, *aux_index);
                 *aux_index += 1;
 
-                // Emit `static T name = <inner>;` into the globals section, then take its address.
-                // `write_constant` runs inside `capture`, so any nested statics it emits are routed
-                // to their own sections rather than into this fragment.
+                // A 0-arg shared constructor lowers to a backing static, which has no malloc
+                // header. Give it a fake header inline -- `static struct { AnteRcHeader _hdr; T
+                // value; }`.  Return `&name.value`, so the pointer sits at the same negative offset
+                // (`value - ANTE_RC_HEADER_SIZE == &_hdr`) as a heap allocation. Statics are never
+                // freed, so `FreeShared` is never emitted for these.  `write_constant` runs inside
+                // `capture`, so any nested statics it emits are routed to their own sections rather
+                // than into this fragment.
                 let backing = self.capture(|this| {
-                    this.write("static ");
-                    this.write_declarator(typ, &|this| this.write(&name));
-                    this.write(" = ");
+                    this.write("static struct { AnteRcHeader _hdr; ");
+                    this.write_declarator(typ, &|this| this.write("value"));
+                    let _ = write!(this.current_item, "; }} {name} = {{ {{0}}, ");
                     this.write_constant(value, global_id, aux_index, mir);
-                    this.write(";");
+                    this.write(" };");
                 });
                 self.file.add_global_definition(&backing);
 
-                self.write("&");
-                self.write(&name);
+                let _ = write!(self.current_item, "&{name}.value");
             },
             ConstantValue::Transmute { typ } => {
                 // Zero-sized source: emit a zero-initializer of the destination type.
@@ -904,14 +907,81 @@ impl Builder {
                 let _ = write!(self.current_item, "; void* {id} = &{id}_slot;");
             },
             mir::Instruction::AllocShared(value) => {
+                // Allocate `header + value`, initialize the refcount to 1, and return a pointer AT
+                // `value` -- the header sits at `value - ANTE_RC_HEADER_SIZE`. `FreeShared` frees at
+                // that offset.
                 let typ = mir.type_of_value(value, definition);
-                let _ = write!(self.current_item, "void* {id} = malloc(sizeof(");
+                let _ = write!(self.current_item, "void* {id}_block = malloc(ANTE_RC_HEADER_SIZE + sizeof(");
                 self.write_type(&typ, "");
-                self.write(")); *(");
+                let _ = write!(
+                    self.current_item,
+                    ")); ((AnteRcHeader*){id}_block)->count = (size_t)1; void* {id} = (char*){id}_block + ANTE_RC_HEADER_SIZE; *("
+                );
                 self.write_type(&typ, "");
                 let _ = write!(self.current_item, "*){id} = ");
                 self.write_value(value, mir);
                 self.write(";");
+            },
+            mir::Instruction::FreeShared(value) => {
+                // Free a shared allocation: The pointer is at the value; the backing block starts
+                // one header before it, so free `value - ANTE_RC_HEADER_SIZE`. Null-safe:
+                // capture-less method environments are null, and `free(NULL - offset)` would be a
+                // wild free, so guard.
+                let _ = write!(self.current_item, "if (");
+                self.write_value(value, mir);
+                let _ = write!(self.current_item, ") free((char*)");
+                self.write_value(value, mir);
+                let _ = write!(self.current_item, " - ANTE_RC_HEADER_SIZE); Unit {id} = (Unit){{0}};");
+            },
+            mir::Instruction::RcRetain(value) => {
+                // Increment the refcount at `value - ANTE_RC_HEADER_SIZE`. A count of 0 marks an
+                // immortal static (0-arg constructor), left untouched. Only emitted for non-null
+                // user shared handles, so no null guard (unlike FreeShared).
+                let _ = write!(self.current_item, "AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
+                self.write_value(value, mir);
+                let _ = write!(
+                    self.current_item,
+                    " - ANTE_RC_HEADER_SIZE); if ({id}_h->count) {id}_h->count += 1; Unit {id} = (Unit){{0}};"
+                );
+            },
+            mir::Instruction::RcDecrement(value) => {
+                // Decrement and report whether the count reached zero (was exactly 1), so the
+                // caller runs the pointee glue + FreeShared. A count of 0 is an immortal static:
+                // left untouched, returns false.
+                let _ = write!(self.current_item, "AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
+                self.write_value(value, mir);
+                let _ = write!(
+                    self.current_item,
+                    " - ANTE_RC_HEADER_SIZE); size_t {id}_c = {id}_h->count; bool {id} = false; \
+                     if ({id}_c) {{ {id}_h->count = {id}_c - 1; {id} = ({id}_c == 1); }}"
+                );
+            },
+            mir::Instruction::RetainClosureEnv(value) => {
+                // Null-safe retain of a closure's heap environment (the env pointer). A
+                // bare-pointer-env slot may hold a capture-less value whose env is null, so guard
+                // the header access; a count of 0 marks an immortal static, left untouched.
+                let _ = write!(self.current_item, "Unit {id} = (Unit){{0}}; if (");
+                self.write_value(value, mir);
+                let _ = write!(self.current_item, ") {{ AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
+                self.write_value(value, mir);
+                let _ =
+                    write!(self.current_item, " - ANTE_RC_HEADER_SIZE); if ({id}_h->count) {id}_h->count += 1; }}");
+            },
+            mir::Instruction::ReleaseClosureEnv(value) => {
+                // Null-safe decrement of a closure's heap environment (the env pointer); on
+                // reaching zero, free the block (`value - header`). No pointee glue (owned
+                // captures leak, never double-free). Null-safe + immortal-safe like retain.
+                let _ = write!(self.current_item, "Unit {id} = (Unit){{0}}; if (");
+                self.write_value(value, mir);
+                let _ = write!(self.current_item, ") {{ AnteRcHeader* {id}_h = (AnteRcHeader*)((char*)");
+                self.write_value(value, mir);
+                let _ = write!(
+                    self.current_item,
+                    " - ANTE_RC_HEADER_SIZE); size_t {id}_c = {id}_h->count; \
+                     if ({id}_c) {{ {id}_h->count = {id}_c - 1; if ({id}_c == 1) free((char*)"
+                );
+                self.write_value(value, mir);
+                let _ = write!(self.current_item, " - ANTE_RC_HEADER_SIZE); }} }}");
             },
             mir::Instruction::Store { pointer, value } => {
                 let typ = mir.type_of_value(value, definition);
@@ -1126,7 +1196,7 @@ impl Builder {
     /// types become prototypes; other types become `extern` variable declarations.
     fn emit_extern_declaration(&mut self, name: &str, typ: &mir::Type) {
         // These are already declared in [CFile::add_starter_items], redeclaring would conflict.
-        if matches!(name, "malloc" | "memcpy" | "fmod") {
+        if matches!(name, "malloc" | "memcpy" | "fmod" | "free") {
             return;
         }
         let declaration = self.capture(|this| {

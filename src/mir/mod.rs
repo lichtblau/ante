@@ -537,7 +537,45 @@ pub enum Instruction {
     StackAllocUninit(Type),
 
     /// Heap-allocate and store a shared value, returning its pointer.
+    ///
+    /// The allocation carries a refcount header immediately before the value (padded to
+    /// max-align), and the returned pointer points at the value. Loads/GEPs/ stores through it are
+    /// unchanged; only [Instruction::FreeShared] knows the offset.
     AllocShared(Value),
+
+    /// Free a heap allocation created by [Instruction::AllocShared]. Its argument points at the
+    /// value; the backing block starts one refcount header before it, so the free subtracts the
+    /// header offset (a backend-specific, ABI-sized constant). Null-safe (capture-less method
+    /// environments are null). Distinct from a plain `free` on a `Ptr` block-start pointer, which
+    /// stays an ordinary extern call. Returns unit.
+    FreeShared(Value),
+
+    /// Increment the refcount of a shared allocation. The argument points at the value; the count
+    /// sits one header before it. A `count == 0` allocation is an immortal static (0-arg
+    /// constructor backing store) and is left unchanged. Only emitted for genuine (non-null) user
+    /// shared handles -- unlike [Instruction::FreeShared], no null guard. Returns unit.
+    RcRetain(Value),
+
+    /// Decrement the refcount of a shared allocation and return whether it reached zero, i.e. the
+    /// count was exactly 1 (so the caller -- a synthesized `release_T` -- runs the pointee's drop
+    /// glue then [Instruction::FreeShared]). A `count == 0` allocation is an immortal static: left
+    /// unchanged, returns false. Only emitted for non-null user handles.
+    RcDecrement(Value),
+
+    /// Null-safe retain of an escaping closure's heap environment. The argument is the environment
+    /// pointer (`IndexTuple(closure, 1)`) of a bare-`Pointer`-env closure. Unlike
+    /// [Instruction::RcRetain], it is null-guarded: a bare-pointer-env slot can be filled by a
+    /// capture-less value whose environment is null. A `count == 0` allocation is an immortal
+    /// static, left unchanged. Returns unit.
+    RetainClosureEnv(Value),
+
+    /// Null-safe release of an escaping closure's heap environment. The argument is the environment
+    /// pointer (`IndexTuple(closure, 1)`). Decrements the count and, on reaching zero, frees the
+    /// block (`ptr - header`). Null-safe (see [Instruction:: RetainClosureEnv]); immortal (`count
+    /// == 0`) statics are left unchanged. Unlike a shared type's `release_T`, it runs no pointee
+    /// glue: owned captures inside the environment are leaked, never double-freed. Returns
+    /// unit.
+    ReleaseClosureEnv(Value),
 
     /// Store a value into a pointer location. Returns unit.
     Store {
@@ -682,6 +720,11 @@ impl Instruction {
             Instruction::StackAlloc(value) => f(value),
             Instruction::StackAllocUninit(_) => (),
             Instruction::AllocShared(value) => f(value),
+            Instruction::FreeShared(value) => f(value),
+            Instruction::RcRetain(value) => f(value),
+            Instruction::RcDecrement(value) => f(value),
+            Instruction::RetainClosureEnv(value) => f(value),
+            Instruction::ReleaseClosureEnv(value) => f(value),
             Instruction::Store { pointer, value } => two(pointer, value),
             Instruction::Transmute(value) => f(value),
             Instruction::Instantiate(_, _) => (),

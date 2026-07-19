@@ -32,6 +32,13 @@ pub struct CodegenLlvmResult {
     pub object: Arc<Vec<u8>>,
 }
 
+/// Byte offset of a shared allocation's value from its block start -- the size of the refcount
+/// header. Two i64 words (16 bytes), matching the C backend's max-aligned `AnteRcHeader`, so
+/// `value` lands at a fixed offset regardless of the payload type and
+/// [mir::Instruction::FreeShared] -- which only sees a type-erased pointer -- can subtract it
+/// blindly.
+const RC_HEADER_BYTES: u64 = 16;
+
 pub fn initialize_native_target() {
     let config = InitializationConfig::default();
     Target::initialize_native(&config).unwrap();
@@ -256,10 +263,25 @@ impl<'ctx> ModuleContext<'ctx> {
             },
             ConstantValue::Shared { value, typ } => {
                 // No malloc in a constant initializer, so back the value with a global instead.
+                // Give the static the same fixed 16-byte header `{count, pad, value}` with `count =
+                // 0` (the immortal sentinel), and hand back a constant GEP to the value field so
+                // the pointer sits at the same negative offset as a heap allocation. Statics are
+                // never freed, so `FreeShared` is never emitted for these.
                 let init_value = self.lower_constant(value);
-                let backing = self.module.add_global(self.convert_type(typ), None, "__shared_static");
-                backing.set_initializer(&init_value);
-                backing.as_pointer_value().into()
+                let i64_ty = self.llvm.i64_type();
+                let value_ty = self.convert_type(typ);
+                let struct_ty = self.llvm.struct_type(&[i64_ty.into(), i64_ty.into(), value_ty], false);
+                let init_struct =
+                    self.llvm.const_struct(&[i64_ty.const_zero().into(), i64_ty.const_zero().into(), init_value], false);
+                let backing = self.module.add_global(struct_ty, None, "__shared_static");
+                backing.set_initializer(&init_struct);
+                let i32_ty = self.llvm.i32_type();
+                let value_ptr = unsafe {
+                    backing
+                        .as_pointer_value()
+                        .const_in_bounds_gep(struct_ty, &[i32_ty.const_zero(), i32_ty.const_int(2, false)])
+                };
+                value_ptr.into()
             },
             // A constant transmute is always from a zero-sized source (that is the only transmute
             // the constant evaluator folds), so every byte of the result is a widened one. `undef`
@@ -400,6 +422,20 @@ impl<'ctx> ModuleContext<'ctx> {
             let block = self.llvm.append_basic_block(function_value, "");
             self.blocks.push_existing(block_id, block);
         }
+    }
+
+    /// Emit an `alloca` in the current function's ENTRY block regardless of where the builder
+    /// currently is. An alloca emitted inside a loop body grows the stack every iteration at
+    /// -O0 (a long `while` loop overflows); entry-block allocas are the one slot per frame the
+    /// C backend's function-scoped locals already give.
+    fn build_entry_alloca(&self, typ: BasicTypeEnum<'ctx>) -> inkwell::values::PointerValue<'ctx> {
+        let entry = self.blocks[mir::BlockId::ENTRY_BLOCK];
+        let b = self.llvm.create_builder();
+        match entry.get_first_instruction() {
+            Some(first) => b.position_before(&first),
+            None => b.position_at_end(entry),
+        }
+        b.build_alloca(typ, "").unwrap()
     }
 
     /// Lower a block [Definition::topological_sort] yields but [Definition::reachable_blocks] does
@@ -604,19 +640,133 @@ impl<'ctx> ModuleContext<'ctx> {
             },
             mir::Instruction::StackAlloc(value) => {
                 let value = self.lookup_value(value);
-                let alloca = self.builder.build_alloca(value.get_type(), "").unwrap();
+                let alloca = self.build_entry_alloca(value.get_type());
                 self.builder.build_store(alloca, value).unwrap();
                 alloca.into()
             },
             mir::Instruction::StackAllocUninit(typ) => {
                 let typ = self.convert_type(typ);
-                self.builder.build_alloca(typ, "").unwrap().into()
+                self.build_entry_alloca(typ).into()
             },
             mir::Instruction::AllocShared(value) => {
+                // Allocate `{count, pad, value}` -- a fixed 16-byte header before the value (two i64
+                // words, matching the C backend's max-aligned `AnteRcHeader`, so `value` lands at a
+                // constant offset regardless of `T`). Init count = 1 and return a pointer to the
+                // value field. `FreeShared` frees at `value - RC_HEADER_BYTES`.
                 let value = self.lookup_value(value);
-                let ptr = self.builder.build_malloc(value.get_type(), "").unwrap();
-                self.builder.build_store(ptr, value).unwrap();
-                ptr.into()
+                let i64_ty = self.llvm.i64_type();
+                let struct_ty = self.llvm.struct_type(&[i64_ty.into(), i64_ty.into(), value.get_type()], false);
+                let block = self.builder.build_malloc(struct_ty, "").unwrap();
+                let count_ptr = self.builder.build_struct_gep(struct_ty, block, 0, "").unwrap();
+                self.builder.build_store(count_ptr, i64_ty.const_int(1, false)).unwrap();
+                let value_ptr = self.builder.build_struct_gep(struct_ty, block, 2, "").unwrap();
+                self.builder.build_store(value_ptr, value).unwrap();
+                value_ptr.into()
+            },
+            mir::Instruction::FreeShared(value) => {
+                // Free a shared allocation: The pointer is at the value; the block starts one
+                // header before it, so free `value - RC_HEADER_BYTES`. Null-safe: capture-less
+                // method environments are null, so a `select` yields null (and `free(null)` is a
+                // no-op) rather than freeing a wild `null - offset`.
+                let ptr = self.lookup_value(value).into_pointer_value();
+                let i8_ty = self.llvm.i8_type();
+                let i64_ty = self.llvm.i64_type();
+                let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
+                let block = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
+                let null = ptr.get_type().const_null();
+                let is_null = self.builder.build_int_compare(IntPredicate::EQ, ptr, null, "").unwrap();
+                let block = self.builder.build_select(is_null, null, block, "").unwrap().into_pointer_value();
+                self.builder.build_free(block).unwrap();
+                self.unit_value()
+            },
+            mir::Instruction::RcRetain(value) => {
+                // Increment the count at `value - RC_HEADER_BYTES` (the first header word).  A
+                // count of 0 is an immortal static, kept unchanged via a select. Only emitted for
+                // non-null user shared handles, so no null guard (unlike FreeShared).
+                let ptr = self.lookup_value(value).into_pointer_value();
+                let i8_ty = self.llvm.i8_type();
+                let i64_ty = self.llvm.i64_type();
+                let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
+                let count_ptr = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
+                let count = self.builder.build_load(i64_ty, count_ptr, "").unwrap().into_int_value();
+                let is_immortal =
+                    self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(0, false), "").unwrap();
+                let incremented = self.builder.build_int_add(count, i64_ty.const_int(1, false), "").unwrap();
+                let to_store = self.builder.build_select(is_immortal, count, incremented, "").unwrap().into_int_value();
+                self.builder.build_store(count_ptr, to_store).unwrap();
+                self.unit_value()
+            },
+            mir::Instruction::RcDecrement(value) => {
+                // Decrement the count and return whether it was exactly 1 (reached zero → caller
+                // runs the glue + FreeShared). A count of 0 is an immortal static: kept at 0 via a
+                // select, returns false.
+                let ptr = self.lookup_value(value).into_pointer_value();
+                let i8_ty = self.llvm.i8_type();
+                let i64_ty = self.llvm.i64_type();
+                let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
+                let count_ptr = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
+                let count = self.builder.build_load(i64_ty, count_ptr, "").unwrap().into_int_value();
+                let is_immortal =
+                    self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(0, false), "").unwrap();
+                let decremented = self.builder.build_int_sub(count, i64_ty.const_int(1, false), "").unwrap();
+                let to_store = self.builder.build_select(is_immortal, count, decremented, "").unwrap().into_int_value();
+                self.builder.build_store(count_ptr, to_store).unwrap();
+                // Reached zero iff the count was exactly 1 (immortal 0 → false, >1 → false).
+                let reached_zero =
+                    self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(1, false), "").unwrap();
+                reached_zero.as_basic_value_enum()
+            },
+            mir::Instruction::RetainClosureEnv(value) => {
+                // Null-safe retain of a closure's heap environment (the env pointer). Branchless:
+                // read/write the header through `select(is_null, scratch, block)` so a null
+                // (capture-less) env touches a dead stack slot instead of faulting; a count of 0
+                // (immortal static) is left unchanged.
+                let ptr = self.lookup_value(value).into_pointer_value();
+                let i8_ty = self.llvm.i8_type();
+                let i64_ty = self.llvm.i64_type();
+                let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
+                let block = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
+                let scratch = self.build_entry_alloca(i64_ty.into());
+                let null = ptr.get_type().const_null();
+                let is_null = self.builder.build_int_compare(IntPredicate::EQ, ptr, null, "").unwrap();
+                let addr = self.builder.build_select(is_null, scratch, block, "").unwrap().into_pointer_value();
+                let count = self.builder.build_load(i64_ty, addr, "").unwrap().into_int_value();
+                let is_immortal =
+                    self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(0, false), "").unwrap();
+                let incremented = self.builder.build_int_add(count, i64_ty.const_int(1, false), "").unwrap();
+                let via_immortal = self.builder.build_select(is_immortal, count, incremented, "").unwrap().into_int_value();
+                let to_store = self.builder.build_select(is_null, count, via_immortal, "").unwrap().into_int_value();
+                self.builder.build_store(addr, to_store).unwrap();
+                self.unit_value()
+            },
+            mir::Instruction::ReleaseClosureEnv(value) => {
+                // Null-safe decrement of a closure's heap environment (the env pointer); on
+                // reaching zero (count was exactly 1) free the block. Branchless like
+                // RetainClosureEnv; `free(null)` guards the not-reached-zero and immortal cases.
+                let ptr = self.lookup_value(value).into_pointer_value();
+                let i8_ty = self.llvm.i8_type();
+                let i64_ty = self.llvm.i64_type();
+                let neg = i64_ty.const_int(RC_HEADER_BYTES.wrapping_neg(), false);
+                let block = unsafe { self.builder.build_gep(i8_ty, ptr, &[neg], "").unwrap() };
+                let scratch = self.build_entry_alloca(i64_ty.into());
+                let null = ptr.get_type().const_null();
+                let is_null = self.builder.build_int_compare(IntPredicate::EQ, ptr, null, "").unwrap();
+                let addr = self.builder.build_select(is_null, scratch, block, "").unwrap().into_pointer_value();
+                let count = self.builder.build_load(i64_ty, addr, "").unwrap().into_int_value();
+                let is_immortal =
+                    self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(0, false), "").unwrap();
+                let decremented = self.builder.build_int_sub(count, i64_ty.const_int(1, false), "").unwrap();
+                let via_immortal = self.builder.build_select(is_immortal, count, decremented, "").unwrap().into_int_value();
+                let to_store = self.builder.build_select(is_null, count, via_immortal, "").unwrap().into_int_value();
+                self.builder.build_store(addr, to_store).unwrap();
+                // Reached zero iff non-null and the count was exactly 1 (immortal 0 → false).
+                let was_one =
+                    self.builder.build_int_compare(IntPredicate::EQ, count, i64_ty.const_int(1, false), "").unwrap();
+                let false_const = self.llvm.bool_type().const_int(0, false);
+                let reached_zero = self.builder.build_select(is_null, false_const, was_one, "").unwrap().into_int_value();
+                let free_arg = self.builder.build_select(reached_zero, block, null, "").unwrap().into_pointer_value();
+                self.builder.build_free(free_arg).unwrap();
+                self.unit_value()
             },
             mir::Instruction::Transmute(value) => self.transmute(value, function, id),
             mir::Instruction::Id(value) => self.lookup_value(value),
@@ -896,7 +1046,9 @@ impl<'ctx> ModuleContext<'ctx> {
         let widening = self.target_data.get_store_size(&result_type) > self.target_data.get_store_size(&source_type);
         let slot_type = if widening { result_type } else { source_type };
 
-        let alloca = self.builder.build_alloca(slot_type, "").unwrap();
+        // Entry-block scratch slot: a transmute inside a loop body must not grow the stack
+        // every iteration (see build_entry_alloca).
+        let alloca = self.build_entry_alloca(slot_type);
         if widening {
             self.builder.build_store(alloca, Self::zero_value(slot_type)).unwrap();
         }
