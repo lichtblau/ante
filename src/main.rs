@@ -523,7 +523,13 @@ fn files_to_program_name(files: &[PathBuf]) -> String {
 /// The output binary name for a project build
 fn project_program_name(compiler: &mut Db) -> String {
     let crates = GetCrateGraph.get(compiler);
-    let name = &crates[&CrateId::LOCAL].name;
+    let local = &crates[&CrateId::LOCAL];
+    // A manifest `name` sets the binary name via `output_name` without renaming the crate
+    // (so `import Local.*` keeps working); fall back to the crate name otherwise.
+    if let Some(output_name) = &local.output_name {
+        return output_name.clone();
+    }
+    let name = &local.name;
     if name == crate::find_files::DEFAULT_LOCAL_CRATE_NAME { "a".to_string() } else { name.clone() }
 }
 

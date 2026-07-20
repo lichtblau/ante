@@ -145,6 +145,12 @@ define_input!(102, AutoDrop -> bool, DbStorage);
 pub struct Crate {
     pub name: String,
 
+    /// Output binary name from this crate's `ante.toml` `name` field, when it should differ
+    /// from the import-visible crate `name`. Only meaningful for the local crate: it lets a
+    /// project name its binary (e.g. `pc`) while its modules are still imported under the
+    /// default `Local` crate name. `None` falls back to the crate `name`.
+    pub output_name: Option<String>,
+
     /// Path to the folder containing this crates's files
     pub path: PathBuf,
 
@@ -169,6 +175,7 @@ impl Crate {
     pub fn new(name: String, path: PathBuf) -> Crate {
         Crate {
             name,
+            output_name: None,
             path,
             dependencies: Vec::new(),
             source_files: BTreeMap::new(),

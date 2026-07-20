@@ -104,7 +104,7 @@ fn populate_local_crate_with_starting_files(
     let mut crate_ = Crate::new(DEFAULT_LOCAL_CRATE_NAME.to_string(), local_crate_root.to_path_buf());
     crate_.source_files = source_files;
     if let Some(manifest) = Manifest::read(local_crate_root) {
-        manifest.apply(&mut crate_);
+        manifest.apply_local(&mut crate_);
     }
     crates.insert(CrateId::LOCAL, crate_);
 }
