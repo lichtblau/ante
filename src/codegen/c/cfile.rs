@@ -190,7 +190,12 @@ typedef double ante_f64;
         // The message goes to fd 2 (unbuffered), but `abort` discards whatever the program itself
         // has buffered on stdout -- including the output of the `Drop` impl that just ran, which is
         // the context that makes the message legible. So flush every stream first.
-        self.function_declarations += "long write(int, const void*, unsigned long);\n";
+        // `void*` (not POSIX's `const void*`) so this matches the conventional user FFI binding
+        // `extern "write": fn I32 (Ptr U8) Usz -> Isz` -> `ptrdiff_t write(int32_t, void*, size_t)`.
+        // After typedef resolution the two are identical (ptrdiff_t==long, int32_t==int,
+        // size_t==unsigned long), so C accepts the redeclaration instead of erroring on a
+        // `const`-only mismatch. The internal call below casts away its message's const to match.
+        self.function_declarations += "long write(int, void*, unsigned long);\n";
         self.function_declarations += "int fflush(void*);\n";
         self.function_declarations += "void abort(void);\n";
         self.function_declarations += "\
@@ -199,7 +204,7 @@ static void ante_rc_resurrected(void) {
 zero and its Drop impl copied the handle back out. The block is freed when the impl returns, so the \
 copy would dangle.\\n\";
     fflush(0);
-    write(2, ante_rc_msg, sizeof(ante_rc_msg) - 1);
+    write(2, (void*)ante_rc_msg, sizeof(ante_rc_msg) - 1);
     abort();
 }
 ";
