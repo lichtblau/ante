@@ -20,7 +20,7 @@ main () =
 
 use _y = ()
 
-// args: -emir --no-color
+// args: -emir --no-color --no-auto-drop
 // expected stdout:
 // extern , d4: fn I32 I32 (#empty_tuple) -> (I32, I32)
 // extern use d2: fn (I32, I32) (#empty_tuple) -> Unit

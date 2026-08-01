@@ -58,6 +58,7 @@ pub struct DbStorage {
     files: HashMapStorage<SourceFileId>,
     crate_graph: SingletonStorage<GetCrateGraph>,
     ptr_size: SingletonStorage<TargetPointerSize>,
+    auto_drop: SingletonStorage<AutoDrop>,
 
     parse_results: HashMapStorage<Parse>,
     visible_definitions: HashMapStorage<VisibleDefinitions>,
@@ -133,6 +134,12 @@ define_input!(100, SourceFileId -> Arc<SourceFile>, DbStorage);
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct TargetPointerSize;
 define_input!(101, TargetPointerSize -> u32, DbStorage);
+
+/// Whether `--auto-drop` is enabled: the compiler inserts automatic `Drop` calls
+/// at scope exit. A DB input so type inference and the MIR builder can read it; off by default.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct AutoDrop;
+define_input!(102, AutoDrop -> bool, DbStorage);
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Crate {

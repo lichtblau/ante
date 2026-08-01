@@ -2,7 +2,7 @@ foo a =
     print a
     print a
 
-// args: -e ast-t --no-color
+// args: -e ast-t --no-color --no-auto-drop
 // expected exit status: 1
 // expected stdout:
 // (foo: fn _ -> Unit pure) (a: _) =

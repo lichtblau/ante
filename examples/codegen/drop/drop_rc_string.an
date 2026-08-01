@@ -1,0 +1,16 @@
+import Std.Rc.Rc, of, ref_count, clone_rc, drop_rc
+
+main () =
+    var a = Rc.of 42
+    println (ref_count (ref a))
+    var b = clone (ref a)
+    println (ref_count (ref a))
+    drop (mut b)
+    println (ref_count (ref a))
+    drop (mut a)
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 1
+// 2
+// 1

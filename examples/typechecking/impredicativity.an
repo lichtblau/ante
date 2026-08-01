@@ -27,7 +27,7 @@ a6_ = id (freeze auto_prime)
 
 a7 = choose id auto
 
-// args: -e ast-t --no-color
+// args: -e ast-t --no-color --no-auto-drop
 // expected exit status: 1
 // expected stdout:
 // (id: fn _ -> _ pure) (x: _) = (x: _)

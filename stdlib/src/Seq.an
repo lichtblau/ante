@@ -110,6 +110,8 @@ Seq.push (seq: Seq t) (elem: t) {Drop t}: Seq t =
     if seq.data == null () then
         data_ptr = malloc (size_of (MkType: Type (Data t)))
         ptr_store data_ptr (Data 1 0 1 1 0 (null ()) elem)
+        // seq's (null) data lives on in nothing; its bits are consumed here.
+        forget seq
         return Seq 1 data_ptr
 
     data_ref = ptr_to_mut seq.data
@@ -129,7 +131,11 @@ Seq.push (seq: Seq t) (elem: t) {Drop t}: Seq t =
             data_ref.len := new_len
 
         array_insert seq.data.elements (Usz seq.len) elem
-        return Seq new_len seq.data
+        // Ownership of seq.data transfers to the returned Seq: forget the original
+        // so --auto-drop's parameter drop cannot free the shared buffer.
+        data = seq.data
+        forget seq
+        return Seq new_len data
 
     // seq.len >= data.cap (no room) or
     // seq.len != data_ref.len (another seq has pushed to the same shared data)
@@ -162,7 +168,11 @@ Seq.push (seq: Seq t) (elem: t) {Drop t}: Seq t =
     buffer_ref.direct_rc := 1
 
     array_insert buffer.elements (Usz seq.len) elem
-    Seq (seq.len + 1) buffer
+    new_len = seq.len + 1
+    // As above: seq's data was reallocated into (or is a shared parent of) `buffer`,
+    // which the returned Seq now owns.
+    forget seq
+    Seq new_len buffer
 
 /// Return a new `Seq t` without the last element.
 /// Returns the popped element if this seq was non-empty.

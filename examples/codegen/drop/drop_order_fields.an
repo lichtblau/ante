@@ -1,0 +1,24 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+type Pair = first: R, second: R
+
+impl drop_pair: Drop Pair with
+    drop (p: mut Pair) =
+        println "drop Pair"
+        drop (mut p.first)
+        drop (mut p.second)
+
+main () =
+    var p = Pair (R 1) (R 2)
+    drop (mut p)
+
+// args: --delete-binary --no-color
+// expected stdout:
+// drop Pair
+// drop 1
+// drop 2

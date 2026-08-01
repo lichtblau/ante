@@ -1,0 +1,20 @@
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+main () =
+    var a = R 1
+    var b = R 2
+    var c = R 3
+    drop (mut c)
+    drop (mut b)
+    drop (mut a)
+
+// args: --delete-binary --no-color
+// expected stdout:
+// drop 3
+// drop 2
+// drop 1

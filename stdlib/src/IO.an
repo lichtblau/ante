@@ -11,7 +11,8 @@ File.open (path: String) (mode: String): File =
     File <| fopen (C.String path.data) (C.String mode.data)
 
 File.close (file: File): Unit =
-    fclose file.c_file
+    var f = file
+    drop (mut f)
 
 impl drop_file: Drop File with
     drop f =

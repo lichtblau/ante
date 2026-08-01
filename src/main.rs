@@ -57,7 +57,7 @@ use crate::{
     cli::{EmitTarget, OptLevel},
     diagnostics::{DiagnosticKind, collect_all_diagnostics},
     files::{make_compiler, write_metadata},
-    incremental::{TargetPointerSize, TypeCheck, ValidateExports},
+    incremental::{AutoDrop, TargetPointerSize, TypeCheck, ValidateExports},
     paths::binary_name,
 };
 
@@ -155,6 +155,8 @@ fn compile(request: CompileRequest) {
 
     // TODO: Pointer size should be configurable depending on the target machine
     TargetPointerSize.set(&mut compiler, 8);
+    // Auto-drop is the default; --no-auto-drop opts out.
+    AutoDrop.set(&mut compiler, !options.no_auto_drop);
 
     if options.show_time {
         eprintln!("Phase timings:");

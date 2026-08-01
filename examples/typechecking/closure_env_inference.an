@@ -9,7 +9,7 @@ main () =
     pair a = (a, fn n -> use (n, x))
     needs (pair 0)
 
-// args: --check --no-color
+// args: --check --no-color --no-auto-drop
 // expected exit status: 1
 // expected stderr:
 // examples/typechecking/closure_env_inference.an:10:12

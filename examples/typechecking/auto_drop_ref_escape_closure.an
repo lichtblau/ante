@@ -1,0 +1,21 @@
+make_closure () =
+    x = 5
+    r = ref x
+    fn () -> r.*
+
+main () =
+    f = make_closure ()
+    println (f ())
+
+// args: --check --no-color --auto-drop
+// expected exit status: 1
+// expected stderr:
+// examples/typechecking/auto_drop_ref_escape_closure.an:3:9
+// 2 |     x = 5
+//   |     // error: This returns a reference to a value that is dropped when this function returns
+// 3 |     r = ref x
+//   |         ^^^^^
+// 4 |     fn () -> r.*
+// 
+// Found 1 error and 0 warnings
+

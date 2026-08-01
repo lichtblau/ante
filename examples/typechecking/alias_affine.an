@@ -57,47 +57,45 @@ main () = ()
 // expected exit status: 1
 // expected stderr:
 // examples/typechecking/alias_affine.an:9:13
-//  6 |     r = Resource 1
-//  7 |     match r	// note: r was previously moved here
-//    |           -
-//  8 |     | whole @ Resource _ -> consume whole
+//  7 |     match r
+//  8 |     | whole @ Resource _ -> consume whole	// note: r was previously moved here
+//    |                                     -----
 //  9 |     consume r	// error: Use of moved value r
 //    |             ^
 // 
 // examples/typechecking/alias_affine.an:16:17
 // 14 |     | whole @ Resource _ ->
-// 15 |         consume whole	// note: whole was previously moved here
+// 15 |         consume whole	// note: r was previously moved here
 //    |                 -----
-// 16 |         consume whole	// error: Use of moved value whole
+// 16 |         consume whole	// error: Use of moved value r
 //    |                 ^^^^^
 // 
 // examples/typechecking/alias_affine.an:23:17
 // 21 |     | a @ b ->
-// 22 |         consume a	// note: a was previously moved here
+// 22 |         consume a	// note: r was previously moved here
 //    |                 -
-// 23 |         consume b	// error: Use of moved value a
+// 23 |         consume b	// error: Use of moved value r
 //    |                 ^
 // 
 // examples/typechecking/alias_affine.an:30:17
 // 28 |     | whole @ Pair first _ ->
-// 29 |         consume whole	// note: whole.a was previously moved here
+// 29 |         consume whole	// note: p.a was previously moved here
 //    |                 -----
-// 30 |         consume first	// error: Use of moved value whole.a
+// 30 |         consume first	// error: Use of moved value p.a
 //    |                 ^^^^^
 // 
 // examples/typechecking/alias_affine.an:37:17
 // 35 |     | whole @ Pair first _ ->
-// 36 |         consume first	// note: whole was previously moved here
+// 36 |         consume first	// note: p was previously moved here
 //    |                 -----
-// 37 |         consume whole	// error: Use of moved value whole
+// 37 |         consume whole	// error: Use of moved value p
 //    |                 ^^^^^
 // 
 // examples/typechecking/alias_affine.an:52:17
 // 50 |     | whole @ Pair first _ ->
-// 51 |         _f = move fn () -> consume first	// note: whole was previously moved here
+// 51 |         _f = move fn () -> consume first	// note: p was previously moved here
 //    |              ---------------------------
-// 52 |         consume whole	// error: Use of moved value whole
+// 52 |         consume whole	// error: Use of moved value p
 //    |                 ^^^^^
 // 
 // Found 6 errors and 0 warnings
-

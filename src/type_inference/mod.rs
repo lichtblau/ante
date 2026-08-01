@@ -1,4 +1,10 @@
-use std::{borrow::Cow, cell::Cell, collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    rc::Rc,
+    sync::Arc,
+};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -31,12 +37,14 @@ use crate::{
 mod affine;
 mod cst_traversal;
 pub mod dependency_graph;
+mod drop_elaboration;
 pub mod errors;
 mod free_variables;
 pub mod fresh_expr;
 pub mod generics;
 pub mod get_type;
 mod implicits;
+mod origins;
 pub mod kinds;
 pub mod patterns;
 pub(crate) mod type_body;
@@ -99,6 +107,16 @@ pub struct IndividualTypeCheckResult {
     /// [TopLevelContext] will work for most expressions but lead to panics
     /// when newly created items from the type checking pass are used.
     pub context: ExtendedTopLevelContext,
+
+    /// For each reference-returning top-level function name, which of its explicit parameters'
+    /// origins can flow into the return value's reference elements -- the return-origin summary.
+    /// Positional mask aligned with explicit call arguments. Consumed by the escape check
+    /// post-inference (where all `TypeCheck` results are complete, see
+    /// `compute_return_origin_summary` and `call_origin`), as an additive refinement over the
+    /// fallback union: substitute the origins of exactly the arguments whose parameters flow.
+    /// Present only for reference-returning functions; an all-`false` entry means "returns a
+    /// reference, but not one derived from a parameter".
+    pub return_origins: FxHashMap<NameId, Vec<bool>>,
 
     /// One or more names may be externally visible outside this top-level item.
     /// Each of these names will be generalized and placed in this map.
@@ -194,12 +212,116 @@ struct TypeChecker<'local, 'inner> {
     /// plain `x := v` LHS (reassignment reads nothing from `x`).
     suppress_move_record: bool,
 
-    /// Keep track of which variable pattern aliases alias to catch double or partial
-    /// moves when both an alias and the original name are moved.
+    /// The top-level definition name whose lambda body is about to be inferred, so
+    /// [`Self::compute_return_origin_summary`] can key its summary -- set only for a top-level
+    /// function/method definition immediately before its `infer_lambda`, and `take`n at the start of
+    /// each `infer_lambda_impl` (so nested lambdas in the body see `None`). Unlike `self_name` this
+    /// covers `MethodName` patterns (`Vec.get`, `HashMap.get`) without perturbing recursion-capture.
+    summary_binding_name: Option<NameId>,
+
+    /// Return-origin summaries computed by [`Self::compute_return_origin_summary`], keyed by item
+    /// then function name, moved into each [`IndividualTypeCheckResult`] at `finish`.
+    return_origin_summaries: FxHashMap<TopLevelId, FxHashMap<NameId, Vec<bool>>>,
+
+    /// The place each local binding denotes. Absent ⇒ the binding denotes its own variable.
+    /// Present only for bindings that name a sub-place of another value — currently those
+    /// introduced under an alias pattern (`whole @ Box p` maps `p` to `whole.<inner-field>`),
+    /// so consuming both `whole` and `p` is caught as a partial move.
     binding_places: FxHashMap<NameId, affine::MovePath>,
 
     /// Cached TopLevelName for the Prelude's `Copy` type, lazily resolved on first use.
     copy_type_name: Option<TopLevelName>,
+
+    /// Memoized [`Self::get_field_types`] results, keyed by the `follow_all`-canonicalized
+    /// type. Only fully-concrete types (no unbound variables, no rigid generics) are cached:
+    /// a variable's binding can still change, and `Generic`s embed item-local NameIds that
+    /// could collide between items of one SCC.
+    field_types_cache: FxHashMap<Type, Arc<BTreeMap<Name, (Type, u32)>>>,
+
+    /// Memoized outcome of `type_is_copy`'s global implicit search, keyed like
+    /// [`Self::field_types_cache`] plus the current item's source file (visible implicits
+    /// are per-file). Local implicits are always re-checked before this cache is consulted,
+    /// so a scoped `Copy` impl still wins.
+    copy_search_cache: FxHashMap<(SourceFileId, Type), bool>,
+
+    /// Memoized outcome of `type_has_drop_impl`'s global implicit search, keyed like
+    /// [`Self::copy_search_cache`].
+    drop_search_cache: FxHashMap<(SourceFileId, Type), bool>,
+
+    /// Memoized `type_needs_no_drop` verdicts for concrete types: `true` = dropping a value
+    /// of this type is provably a no-op, so drop synthesis is skipped entirely.
+    no_drop_cache: FxHashMap<Type, bool>,
+
+    /// Caches the `(shared, mutable)` flags of user-defined types so `shared_type_flags`
+    /// does not re-run the `GetItemRaw` query (and its dependency registration) per call.
+    shared_flags_cache: RefCell<FxHashMap<TopLevelId, Option<(bool, bool)>>>,
+
+    /// Caches whether a top-level item is an ability definition, for the same reason.
+    ability_cache: RefCell<FxHashMap<TopLevelId, bool>>,
+
+    /// Whether `--auto-drop` is enabled (the `AutoDrop` DB input). Gates the parts of move
+    /// checking that only matter once drops are inserted automatically, e.g. linking match
+    /// payload bindings to the scrutinee's place.
+    auto_drop: bool,
+
+    /// Innermost-last stack of drop scopes (`--auto-drop`). Each records the owned-root
+    /// locals declared in that scope, in declaration order. See `drop_elaboration.rs`.
+    drop_scopes: Vec<drop_elaboration::DropScope>,
+
+    /// True while a synthesized drop call is being inferred, so drop-elaboration hooks
+    /// (and the explicit-drop-as-move rule) do not observe their own output.
+    synthesizing_drops: bool,
+
+    /// Cached TopLevelName for the Prelude's `Drop.drop` method, lazily resolved on first use.
+    drop_method_name: Option<TopLevelName>,
+
+    /// Cached TopLevelName for the Prelude's `Drop` ability type, lazily resolved on first use.
+    drop_type_name: Option<TopLevelName>,
+
+    /// Names captured (by reference) by any lambda in the current item (`--auto-drop` only).
+    /// Captured names are never auto-dropped: the closure may outlive the owning scope, so
+    /// dropping the referent would dangle it. Skipping only leaks for now.
+    captured_names: FxHashSet<NameId>,
+
+    /// Nonzero while inferring a call's argument list (`--auto-drop` only). Auto-ref of an
+    /// rvalue argument (`println ("a" ++ "b")`) creates a caller-owned temporary that no
+    /// scope would otherwise drop; the coercion binds it to a fresh local and queues its
+    /// drop here, and `infer_call` drains the queue into post-expr drops on the call -- the
+    /// temporary dies right after the call returns (the string-interpolation leak class).
+    call_argument_depth: u32,
+
+    /// Drop calls (one per auto-ref'd rvalue temporary) queued during the current call's
+    /// argument inference; see [Self::call_argument_depth].
+    pending_autoref_temp_drops: Vec<ExprId>,
+
+    /// Recursion guard for structural drop expansion (`--auto-drop`): recursive types
+    /// cannot be expanded inline, so expansion stops at a fixed depth (skips leak).
+    drop_expansion_depth: u32,
+
+    /// Recursion guard for Copy-impl constraint checking (`--auto-drop`); at the cap a
+    /// type is assumed non-Copy (tracked and dropped -- the safe direction).
+    copy_check_depth: u32,
+
+    /// One set per enclosing lambda (`--auto-drop`): every owned local registered anywhere
+    /// within that lambda, surviving block-scope pops. Used by the escape check to tell
+    /// this function's own locals (dropped at its exit) from captured outers.
+    function_local_names: Vec<FxHashSet<NameId>>,
+
+    /// Places already reported by the strict `{Drop t}` diagnostic (`--auto-drop`), so a
+    /// value dying on several edges is reported once.
+    diagnosed_missing_drops: FxHashSet<affine::MovePath>,
+
+    /// When true, an undroppable unbounded generic is silently skipped instead of raising
+    /// `MissingDropConstraint`. Set for assignment-overwrite drops: overwritten generic
+    /// places frequently hold bit-copies of values another structure owns (`out :=
+    /// blob_nth ...` loops), where demanding a bound would demand a double-free.
+    suppress_missing_drop_diagnostic: bool,
+
+    /// The free type variables of the current item's own signature (`--auto-drop`): its
+    /// rigid generics. Honest Copy/Drop treatment applies to these; other bare variables
+    /// are in-flight unification variables (lambda params before their call site unifies
+    /// them, unconstrained element types) and keep the legacy lenient behavior.
+    signature_type_vars: FxHashSet<TypeVariableId>,
 
     /// Names defined with `var` or as mutable parameters. Used by closure capture analysis
     /// to wrap mutable captures in a reference type so the closure shares the outer scope's storage.
@@ -250,8 +372,30 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             move_tracker: Default::default(),
             suppress_move_check: false,
             suppress_move_record: false,
+            summary_binding_name: None,
+            return_origin_summaries: Default::default(),
             binding_places: Default::default(),
             copy_type_name: None,
+            field_types_cache: Default::default(),
+            copy_search_cache: Default::default(),
+            drop_search_cache: Default::default(),
+            no_drop_cache: Default::default(),
+            shared_flags_cache: Default::default(),
+            ability_cache: Default::default(),
+            auto_drop: crate::incremental::AutoDrop.get(compiler),
+            drop_scopes: Vec::new(),
+            synthesizing_drops: false,
+            drop_method_name: None,
+            drop_type_name: None,
+            captured_names: Default::default(),
+            call_argument_depth: 0,
+            pending_autoref_temp_drops: Vec::new(),
+            drop_expansion_depth: 0,
+            copy_check_depth: 0,
+            function_local_names: Vec::new(),
+            diagnosed_missing_drops: Default::default(),
+            suppress_missing_drop_diagnostic: false,
+            signature_type_vars: Default::default(),
             mutable_definitions: Default::default(),
             integer_literal_vars: Default::default(),
             float_literal_vars: Default::default(),
@@ -371,10 +515,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             .into_iter()
             .map(|(id, maps)| {
                 let generalized = generalized.remove(&id).unwrap_or_default();
+                let return_origins = self.return_origin_summaries.remove(&id).unwrap_or_default();
                 let mut context = self.id_contexts.remove(&id).unwrap();
                 let item_context = self.item_contexts.get(&id).unwrap();
                 context.extend_from_resolution_result(item_context.2.as_ref());
-                (id, IndividualTypeCheckResult { maps, generalized, context })
+                (id, IndividualTypeCheckResult { maps, generalized, context, return_origins })
             })
             .collect();
 
@@ -399,14 +544,32 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.current_item = Some(item_id);
         self.move_tracker = Default::default();
         self.binding_places = Default::default();
+        self.drop_scopes.clear();
+        self.synthesizing_drops = false;
+        self.summary_binding_name = None;
+        self.captured_names.clear();
+        self.call_argument_depth = 0;
+        self.pending_autoref_temp_drops.clear();
+        self.drop_expansion_depth = 0;
+        self.function_local_names.clear();
+        self.diagnosed_missing_drops.clear();
 
         // Iterating over every item type here should be fine for performance.
         // The expected length of `self.item_types` is 1 in the vast majority of cases,
         // and is only a bit longer with mutually recursive type-inferred definitions
         // and definitions defining multiple names (e.g. `a, b = 1, 2`).
-        for (name, typ) in self.item_types.iter() {
+        self.signature_type_vars.clear();
+        let item_types = self.item_types.clone();
+        for (name, typ) in item_types.iter() {
             if name.top_level_item == item_id {
                 self.name_types.insert(name.local_name_id, typ.clone());
+                if self.auto_drop {
+                    for generic in typ.free_vars(&self.bindings) {
+                        if let generics::Generic::Inferred(id) = generic {
+                            self.signature_type_vars.insert(id);
+                        }
+                    }
+                }
             }
         }
     }
@@ -834,8 +997,15 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     fn auto_ref_coercion(&mut self, expr: ExprId, kind: ReferenceKind, element_type: Type) -> cst::Expr {
         let location = expr.locate(self);
         let original_expr = self.current_extended_context()[expr].clone();
-        let rhs = self.push_expr(original_expr, element_type, location);
+        let rhs = self.push_expr(original_expr, element_type.clone(), location.clone());
         self.current_extended_context_mut().copy_expr_metadata(expr, rhs);
+        // The metadata copy above includes any drop tables keyed on `expr` (e.g. an inner
+        // call's auto-ref temporary drops). They now live on `rhs` -- clear them at the
+        // outer id or the builder lowers them twice (a double-drop).
+        self.current_extended_context_mut().clear_expr_drops(expr);
+        // Auto-drop: an auto-ref'd rvalue in argument position is a caller-owned temporary;
+        // bind it so its drop can run after the enclosing call (see bind_autoref_temp_for_drop).
+        let rhs = self.bind_autoref_temp_for_drop(rhs, &element_type, &location);
         cst::Expr::Reference(cst::Reference { kind, rhs })
     }
 
@@ -1187,6 +1357,34 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         typ.follow(&self.bindings)
     }
 
+    /// True when `typ`, following bindings, contains no unbound type variables and no rigid
+    /// generics -- so no later unification can change what it denotes. This is the cache
+    /// admission test for the per-type memo tables ([`Self::field_types_cache`] and friends):
+    /// a read-only walk with no allocation, unlike `follow_all` + `free_vars`.
+    pub(super) fn type_is_concrete(&self, typ: &Type) -> bool {
+        match self.follow_type(typ) {
+            Type::Primitive(_) | Type::UserDefined(_) | Type::U32(_) => true,
+            Type::Variable(_) | Type::Generic(_) | Type::Forall(..) => false,
+            Type::Function(function) => {
+                function.parameters.iter().all(|parameter| self.type_is_concrete(&parameter.typ))
+                    && self.type_is_concrete(&function.environment)
+                    && self.type_is_concrete(&function.return_type)
+                    && self.type_is_concrete(&function.effects)
+            },
+            // A row is settled only when every effect in it is and its tail is closed: an
+            // open tail (`Variable`) or a row-polymorphic one (`Generic`) can still gain
+            // effects by unification, which would invalidate anything memoized under it.
+            Type::Effects(effects, tail) => {
+                effects.iter().all(|effect| self.type_is_concrete(effect))
+                    && tail.as_ref().is_none_or(|tail| self.type_is_concrete(tail))
+            },
+            Type::Application(constructor, args) => {
+                self.type_is_concrete(constructor) && args.iter().all(|arg| self.type_is_concrete(arg))
+            },
+            Type::Tuple(elements) => elements.iter().all(|element| self.type_is_concrete(element)),
+        }
+    }
+
     /// Convert a [cst::Type] into a [Type]. If `allow_implicit_type_vars` is true, we'll
     /// insert type variables to make functions automatically polymorphic over effects or
     /// their closure environment. If false, we'll assume these to be pure or empty.
@@ -1250,7 +1448,27 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     /// Returns an empty map if unsuccessful.
     ///
     /// The map maps from the field name to a pair of (field type, field index).
-    fn get_field_types(&mut self, typ: &Type, generic_args: Option<&[Type]>) -> BTreeMap<Name, (Type, u32)> {
+    ///
+    /// Results for fully-concrete types are memoized in [`Self::field_types_cache`]: this is
+    /// called per member access and per field of every structural drop expansion, and
+    /// rebuilding the map (a `type_body` substitution plus a `BTreeMap`) dominated compile
+    /// time on drop-heavy projects.
+    fn get_field_types(&mut self, typ: &Type, generic_args: Option<&[Type]>) -> Arc<BTreeMap<Name, (Type, u32)>> {
+        // The raw type is the cache key: bindings are only ever added, so a concrete-following
+        // type always denotes the same fields. (Canonicalizing the key with `follow_all` costs
+        // an allocating deep walk per query and was itself a profile hotspot.)
+        if generic_args.is_none() && self.type_is_concrete(typ) {
+            if let Some(cached) = self.field_types_cache.get(typ) {
+                return cached.clone();
+            }
+            let fields = Arc::new(self.compute_field_types(typ, None));
+            self.field_types_cache.insert(typ.clone(), fields.clone());
+            return fields;
+        }
+        Arc::new(self.compute_field_types(typ, generic_args))
+    }
+
+    fn compute_field_types(&mut self, typ: &Type, generic_args: Option<&[Type]>) -> BTreeMap<Name, (Type, u32)> {
         match self.follow_type(typ) {
             Type::Application(constructor, arguments) => {
                 // TODO: Error if `generic_args` is non-empty
@@ -1270,18 +1488,18 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                     };
                     let inner_fields = self.get_field_types(&inner, None);
                     return inner_fields
-                        .into_iter()
+                        .iter()
                         .map(|(name, (field_type, index))| {
                             let wrapped_args = match &lifetime {
-                                Some(lifetime) => vec![lifetime.clone(), field_type],
-                                None => vec![field_type],
+                                Some(lifetime) => vec![lifetime.clone(), field_type.clone()],
+                                None => vec![field_type.clone()],
                             };
                             let wrapped = Type::Application(constructor.clone(), Arc::new(wrapped_args));
-                            (name, (wrapped, index))
+                            (name.clone(), (wrapped, *index))
                         })
                         .collect();
                 }
-                self.get_field_types(&constructor, Some(&arguments))
+                self.compute_field_types(&constructor, Some(&arguments))
             },
             Type::UserDefined(origin) => {
                 if let Origin::TopLevelDefinition(id) = origin {
@@ -1326,9 +1544,10 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             return;
         }
 
-        let context = self.current_context();
-        let cst::Pattern::Variable(name) = context[pattern] else { return };
-        if context[name].as_str() != "main" {
+        // Extended-context-aware reads: synthesized definitions (auto-ref temporaries) have
+        // patterns/names the base context cannot index.
+        let cst::Pattern::Variable(name) = *self.pattern_of(pattern) else { return };
+        if self.current_extended_context()[name].as_str() != "main" {
             return;
         }
 

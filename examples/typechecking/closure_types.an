@@ -20,7 +20,7 @@ main () =
 
 use _y = ()
 
-// args: -east-t --no-color
+// args: -east-t --no-color --no-auto-drop
 // expected stdout:
 // (main: fn Unit -> Unit pure) () =
 //     (a: I32) = 1

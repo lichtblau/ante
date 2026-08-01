@@ -1,0 +1,22 @@
+import Std.Vec.Vec, empty, push, get_unchecked
+
+leak_ref (): imm I32 =
+    var v: Vec I32 = Vec.empty ()
+    Vec.push (mut v) 111
+    Vec.get_unchecked (imm v) 0
+
+main () =
+    r = leak_ref ()
+    println r.*
+
+// args: --check --no-color --auto-drop
+// expected exit status: 1
+// expected stderr:
+// examples/typechecking/auto_drop_ref_escape_vec.an:6:24
+// 5 |     Vec.push (mut v) 111
+//   |     // error: This returns a reference to a value that is dropped when this function returns
+// 6 |     Vec.get_unchecked (imm v) 0
+//   |                        ^^^^^
+// 
+// Found 1 error and 0 warnings
+

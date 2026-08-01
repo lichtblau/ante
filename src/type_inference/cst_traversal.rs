@@ -34,11 +34,26 @@ struct LambdaOptions {
 
 impl<'local, 'inner> TypeChecker<'local, 'inner> {
     pub(super) fn check_definition(&mut self, definition: &Definition, is_top_level: bool) {
-        let expected_type = self.with_next_id(|next_id| {
-            get_partial_type(definition, self.current_context(), self.current_resolve(), self.compiler, next_id)
-        });
+        // A synthesized definition (e.g. an auto-ref temporary binding hit by a coercion
+        // re-check) has its pattern/rhs in the extended context, which get_partial_type's
+        // base-context reads cannot see (and would panic indexing). Synthesized bindings
+        // are always plain un-annotated variables, so their partial type is a fresh
+        // variable -- exactly what get_partial_type returns for that shape.
+        let expected_type = if self.current_extended_context().extended_pattern(definition.pattern).is_some() {
+            self.next_type_variable()
+        } else {
+            self.with_next_id(|next_id| {
+                get_partial_type(definition, self.current_context(), self.current_resolve(), self.compiler, next_id)
+            })
+        };
 
         self.check_pattern(definition.pattern, &expected_type);
+
+        // Auto-drop: local bindings are owned by the innermost drop scope.
+        // (Top-level definitions have no enclosing scope; globals are not dropped.)
+        if !is_top_level {
+            self.register_drop_locals(definition.pattern);
+        }
 
         // Track mutable definitions so closure capture analysis can wrap them in reference types
         if definition.mutable {
@@ -58,6 +73,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Expr::Lambda(lambda) => {
                 let lambda = lambda.clone();
                 self.expr_types.insert(rhs, expected_type.clone());
+                // Name the top-level function/method whose body follows so its return-origin
+                // summary can be keyed (covers `MethodName`, unlike `self_name`).  Taken at
+                // `infer_lambda_impl` entry, so nested body lambdas do not inherit it.
+                if is_top_level {
+                    self.summary_binding_name = self.definition_binding_name(definition.pattern);
+                }
                 self.infer_lambda(&lambda, &expected_type, rhs, self_name);
             },
             _ => {
@@ -66,6 +87,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         if definition.implicit {
+            // Auto-drop: custom Drop impls on `shared` types have no coherent run point.
+            if is_top_level {
+                self.reject_shared_drop_impl(&expected_type, definition.pattern);
+            }
+
             // Local definitions without types are fine, they won't cause globally cascading
             // errors on every implicit search site if their type is too general.
             let has_type = !is_top_level
@@ -101,10 +127,27 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Expr::Lambda(lambda) => self.infer_lambda(lambda, expected, id, None),
             Expr::Sequence(items) => {
                 self.push_implicits_scope();
+                self.push_drop_scope(super::drop_elaboration::DropScopeKind::Block);
                 let mut result = Type::UNIT;
                 for (i, item) in items.iter().enumerate() {
-                    let expected_type = if i == items.len() - 1 { expected } else { &self.next_type_variable() };
+                    let last = i == items.len() - 1;
+                    let expected_type = if last { expected } else { &self.next_type_variable() };
                     result = self.infer_expr(item.expr, expected_type);
+                    // Auto-drop: a discarded owned statement value drops at statement end.
+                    // (The block's own value belongs to the parent, which sees this block
+                    // as one of its statements -- the rewrite composes.)
+                    if !last {
+                        let statement_type = result.clone();
+                        self.drop_discarded_statement_value(item.expr, &statement_type);
+                    }
+                }
+                // Block-fallthrough drops for this scope's locals. Synthesized before
+                // pop_implicits_scope so delayed `Drop` implicits resolve in this scope.
+                let diverges = self.diverges(&result);
+                let location = self.current_extended_context().expr_location(id);
+                let drops = self.pop_drop_scope(diverges, &location);
+                if !drops.is_empty() {
+                    self.current_extended_context_mut().push_post_expr_drops(id, drops);
                 }
                 self.pop_implicits_scope();
                 result
@@ -136,12 +179,23 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Expr::While(while_) => self.infer_while(while_),
             Expr::For(for_) => self.infer_for(for_, id),
             // Allow break/continue to return any type
-            Expr::Break | Expr::Continue => Type::NEVER,
+            Expr::Break | Expr::Continue => {
+                // Auto-drop: break/continue exit every scope up to the innermost loop body;
+                // both skip the body block's own fallthrough drops, so they carry the full set.
+                if self.drop_elaboration_active() {
+                    let location = id.locate(self);
+                    let drops = self.drops_for_loop_exit(&location);
+                    if !drops.is_empty() {
+                        self.current_extended_context_mut().push_pre_exit_drops(id, drops);
+                    }
+                }
+                Type::NEVER
+            },
             Expr::Return(return_) => {
                 self.check_return(return_.expression, id);
                 Type::NEVER
             },
-            Expr::Assignment(assignment) => self.infer_assignment(assignment),
+            Expr::Assignment(assignment) => self.infer_assignment(assignment, id),
             // Error expressions assume the expected type to suppress cascading errors.
             // This also preserves the recorded types of implicit-argument placeholder
             // slots when their wrapper is re-inferred.
@@ -200,7 +254,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
 
     /// Read the pattern for `id`, preferring one added by this type-checking pass and
     /// falling back to the original parsed pattern.
-    fn pattern_of(&self, id: PatternId) -> Cow<'local, Pattern> {
+    pub(super) fn pattern_of(&self, id: PatternId) -> Cow<'local, Pattern> {
         match self.current_extended_context().extended_pattern(id) {
             Some(pattern) => Cow::Owned(pattern.clone()),
             None => Cow::Borrowed(&self.current_context()[id]),
@@ -275,15 +329,36 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             },
             Pattern::TypeAnnotation(inner, _) => self.assign_binding_places(*inner, place),
             Pattern::Or(alts) => {
-                for alt in alts {
-                    self.assign_binding_places(*alt, place.clone());
+                if self.auto_drop {
+                    // Or-alternatives may bind the same name under different variant
+                    // qualifications; the runtime tag decides which one actually moved.
+                    // Conservatively alias every binding to the whole or-place so residual
+                    // drop glue never re-drops a maybe-moved payload (a leak instead).
+                    let mut names = Vec::new();
+                    for alt in alts {
+                        self.collect_pattern_binding_names(*alt, &mut names);
+                    }
+                    for name in names {
+                        self.binding_places.insert(name, place.clone());
+                    }
+                } else {
+                    for alt in alts {
+                        self.assign_binding_places(*alt, place.clone());
+                    }
                 }
             },
-            Pattern::Constructor(_, args) => {
-                // Prefer real struct field names; enum payloads and tuples fall back to indices.
+            Pattern::Constructor(path, args) => {
+                // Prefer real struct field names. Enum payloads are qualified by their variant
+                // (`Ok#0` vs `Error#0`) so different variants' payloads get distinct places --
+                // `#` cannot appear in a member name, so these never collide with member-access
+                // paths. Tuples and unresolved types fall back to plain indices.
                 let names_by_index = self.field_names_by_index(id);
+                let variant = if names_by_index.is_empty() { self.pattern_variant_name(*path) } else { None };
                 for (i, arg) in args.iter().enumerate() {
-                    let field = names_by_index.get(&(i as u32)).cloned().unwrap_or_else(|| i.to_string());
+                    let field = names_by_index.get(&(i as u32)).cloned().unwrap_or_else(|| match &variant {
+                        Some(variant) => format!("{variant}#{i}"),
+                        None => i.to_string(),
+                    });
                     let child = super::affine::MovePath::field(place.clone(), field);
                     self.assign_binding_places(*arg, child);
                 }
@@ -292,13 +367,53 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
     }
 
+    /// True if the pattern contains an or-pattern that binds any name. Such patterns make
+    /// variant-qualified sub-place tracking unreliable (the same binding may alias different
+    /// variants' payloads), so match-binding linking is disabled for the whole match.
+    fn pattern_contains_or_bindings(&self, id: PatternId) -> bool {
+        match self.pattern_of(id).as_ref() {
+            Pattern::Or(alts) => {
+                let mut names = Vec::new();
+                for alt in alts {
+                    self.collect_pattern_binding_names(*alt, &mut names);
+                }
+                !names.is_empty()
+            },
+            Pattern::Constructor(_, args) => args.iter().any(|arg| self.pattern_contains_or_bindings(*arg)),
+            Pattern::Alias(_, inner) | Pattern::TypeAnnotation(inner, _) => self.pattern_contains_or_bindings(*inner),
+            Pattern::Variable(_) | Pattern::MethodName { .. } | Pattern::Literal(_) | Pattern::Error => false,
+        }
+    }
+
+    /// If `path` resolves to an enum variant constructor, return that variant's name.
+    /// Returns `None` for structs (whose fields have real names) and anything unresolved.
+    fn pattern_variant_name(&mut self, path: PathId) -> Option<String> {
+        let mut origin = self.path_origin(path)?;
+        // Mirrors `path_to_constructor`: a `TypeResolution` origin needs one extra lookup.
+        for _ in 0..2 {
+            match origin {
+                Origin::TopLevelDefinition(top_level_name) => {
+                    let (item, item_context) = GetItemRaw(top_level_name.top_level_item).get(self.compiler);
+                    let cst::TopLevelItemKind::TypeDefinition(type_definition) = &item.kind else { return None };
+                    let cst::TypeDefinitionBody::Enum(variants) = &type_definition.body else { return None };
+                    let name = top_level_name.local_name_id;
+                    let is_variant = variants.iter().any(|(variant_name, _)| *variant_name == name);
+                    return is_variant.then(|| item_context.names[name].to_string());
+                },
+                Origin::Local(_) | Origin::Builtin(_) => return None,
+                Origin::TypeResolution => origin = self.current_extended_context().path_origin(path)?,
+            }
+        }
+        None
+    }
+
     /// Map each field index of the constructor pattern `id` to its declared field name.
     /// Returns an empty map for non-struct types.
     fn field_names_by_index(&mut self, id: PatternId) -> BTreeMap<u32, String> {
         let Some(typ) = self.pattern_types.get(&id).cloned() else {
             return BTreeMap::default();
         };
-        self.get_field_types(&typ, None).into_iter().map(|(name, (_, index))| (index, name.to_string())).collect()
+        self.get_field_types(&typ, None).iter().map(|(name, (_, index))| (*index, name.to_string())).collect()
     }
 
     fn infer_path(&mut self, path: PathId, expected: &Type) -> Type {
@@ -316,9 +431,24 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 if !self.suppress_move_check {
                     self.check_use_of_move_path(&move_path, path);
                 }
-                if !self.suppress_move_record && !self.type_is_copy(&typ) {
-                    let location = path.locate(self);
-                    self.move_tracker.record_move(move_path, location);
+                if !self.suppress_move_record {
+                    let non_copy = !self.type_is_copy(&typ);
+                    // Auto-drop: also record tentative moves for bare generic variables
+                    // the lenient Copy search let through. Their Copy-ness may only be
+                    // settled by later unification (an unannotated `first (a, _) = a`
+                    // connects `a` to the signature at the final unify), so the exit-time
+                    // drop logic needs the use recorded. Tentative records never produce
+                    // use-of-moved errors while the type still reads as Copy (the check
+                    // gate in `check_use_of_move_path`), and suppressing a drop of a value
+                    // that turns out Copy drops nothing anyway.
+                    let tentative = !non_copy
+                        && self.auto_drop
+                        && matches!(self.follow_type(&typ),
+                            Type::Variable(id) if !self.is_literal_variable(*id));
+                    if non_copy || tentative {
+                        let location = path.locate(self);
+                        self.move_tracker.record_move(move_path, location);
+                    }
                 }
                 typ
             },
@@ -484,11 +614,17 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         // Infer the arguments. For `+ - * / %`, allow auto-deref of operands.
+        // Auto-drop: track that we're in argument position so an auto-ref'd rvalue argument
+        // gets bound to a droppable temporary (bind_autoref_temp_for_drop); the queued drops
+        // are drained below once the call's return type is known.
+        let pending_temp_drops_before = self.pending_autoref_temp_drops.len();
         let deref_operands = self.is_arithmetic_operator(call.function);
+        self.call_argument_depth += 1;
         for (index, (arg, expected_arg_type)) in call.arguments.iter().zip(expected_parameter_types).enumerate() {
             let kind = TypeErrorKind::CallArgument { index };
             self.infer_and_coerce(arg.expr, &expected_arg_type.typ, kind, deref_operands);
         }
+        self.call_argument_depth -= 1;
 
         // Linked after arguments so same-head ambient entries route by the argument's pinned type.
         self.thread_call_effects(&effects_var, call.function);
@@ -501,12 +637,71 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             self.bindings.extend(bindings);
         }
 
+        // An explicit `drop (mut <path>)` on a tracked root path marks the path moved, so the scope
+        // exit will not drop it a second time and all currently-correct manual code keeps working
+        // under --auto-drop.
+        self.apply_explicit_drop_move_rule(call);
+
         // A lot of Extract implicits (.[]) break without this
         self.resolve_new_delayed_implicits(implicit_count_before_call);
+
+        // Auto-drop: attach the auto-ref temporary drops queued by this call's argument
+        // coercions, so they run right after the call returns. This must happen BEFORE the
+        // return coercion below: when the expected type is a reference pushed down from an
+        // enclosing call's parameter, that coercion auto-refs THIS call's own result. That
+        // temporary belongs to the enclosing call and must bubble to its drain (draining it
+        // here would drop it before the enclosing call runs). Skipped (leaking, never UB)
+        // when the call could hand back a pointer into the temporary (a reference-typed or
+        // still-unresolved return) or when the call diverges (its block is terminated).
+        if self.pending_autoref_temp_drops.len() > pending_temp_drops_before {
+            let drops = self.pending_autoref_temp_drops.split_off(pending_temp_drops_before);
+            let returned = self.follow_type(&actual_return_type).clone();
+            let may_alias_temp = returned.reference_element(&self.bindings).is_some()
+                || matches!(returned, Type::Variable(_));
+            if !may_alias_temp && !self.diverges(&returned) {
+                self.current_extended_context_mut().push_post_expr_drops(call_expr, drops);
+            }
+        }
 
         // Ideally we only coerce on call arguments, but this is currently needed.
         // TODO: Take another stab at cleaning up these call rules, but this took much iteration.
         self.coerce(&actual_return_type, expected, call_expr, None, TypeErrorKind::CallReturn, None)
+    }
+
+    /// A direct call to the `Drop` trait's method whose argument is
+    /// `mut <path>` (or `uniq <path>`) on a tracked root path records
+    /// the path as moved. Pointer-derived drops (`Drop.drop (ptr_to_mut
+    /// e)`, container internals) involve no tracked path and are
+    /// unaffected.
+    fn apply_explicit_drop_move_rule(&mut self, call: &cst::Call) {
+        if !self.drop_elaboration_active() {
+            return;
+        }
+
+        let callee_path = match self.resolved_expr(call.function).as_ref() {
+            Expr::Variable(path) => *path,
+            _ => return,
+        };
+        let drop_method = self.get_drop_method_name();
+        match self.path_origin(callee_path) {
+            Some(Origin::TopLevelDefinition(name)) if name == drop_method => (),
+            _ => return,
+        }
+
+        let mut explicit_args = call.arguments.iter().filter(|arg| !arg.is_implicit);
+        let (Some(arg), None) = (explicit_args.next(), explicit_args.next()) else {
+            return;
+        };
+        let rhs = match self.resolved_expr(arg.expr).as_ref() {
+            Expr::Reference(reference) if matches!(reference.kind, ReferenceKind::Mut | ReferenceKind::Uniq) => {
+                reference.rhs
+            },
+            _ => return,
+        };
+        if let Some(place) = self.try_build_move_path(rhs) {
+            let location = arg.expr.locate(self);
+            self.move_tracker.record_move(place, location);
+        }
     }
 
     /// If `call` is `v.push 3`, try to resolve `push` as a function in the module where `v`'s type
@@ -602,6 +797,9 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         &mut self, lambda: &cst::Lambda, expected: &Type, expr: ExprId, self_name: Option<NameId>,
         options: LambdaOptions,
     ) -> Type {
+        // Claim the return-origin summary name for this lambda before its body is checked, so
+        // nested body lambdas (which re-enter here) take `None` rather than this name.
+        let summary_name = self.summary_binding_name.take();
         let function_type = match self.follow_type(expected) {
             Type::Function(function_type) => function_type.clone(),
             _ => {
@@ -622,10 +820,21 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // Remember the return type so that it can be checked by `return` statements
         let old_return_type = self.function_return_type.replace(function_type.return_type.clone());
         let old_effect_row = std::mem::replace(&mut self.current_effect_row, function_type.effects.clone());
+
+        // Auto-drop: snapshot which names exist before this lambda introduces its own, so
+        // body moves of captured outer values can be surfaced to the enclosing scope below
+        // (the drop plan must not re-drop a value a closure moved -- e.g. the lambda that
+        // `a ~> handler` desugars to moving a local into a by-value callee).
+        let outer_names =
+            self.auto_drop.then(|| self.name_types.keys().copied().collect::<FxHashSet<NameId>>());
+
         // Closures capture by reference, so moves inside the lambda don't affect the outer scope
         let old_move_tracker = std::mem::take(&mut self.move_tracker);
 
         self.push_implicits_scope();
+        // Auto-drop: the function-body scope owns the parameters and is the boundary
+        // `return` unwinds to.
+        self.push_drop_scope(super::drop_elaboration::DropScopeKind::Function);
         self.check_function_parameter_count(&function_type.parameters, lambda.parameters.len(), expr);
         let parameter_lengths_match = function_type.parameters.len() == lambda.parameters.len();
 
@@ -633,6 +842,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             // Avoid extra errors if the parameter length isn't as expected
             let expected_type = if parameter_lengths_match { &expected_type.typ } else { &Type::ERROR };
             self.check_pattern(parameter.pattern, expected_type);
+            self.register_drop_locals(parameter.pattern);
 
             if parameter.is_mutable {
                 self.record_mutable_pattern(parameter.pattern);
@@ -656,7 +866,31 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             Cow::Borrowed(&function_type.return_type)
         };
 
-        self.check_expr(lambda.body, &return_type, TypeErrorKind::FunctionBody);
+        let body_type = self.check_expr(lambda.body, &return_type, TypeErrorKind::FunctionBody);
+
+        // Auto-drop: The body's value is this function's return value; a reference
+        // derived from an owned local must not escape through it.
+        if self.drop_elaboration_active() {
+            self.check_reference_escape(lambda.body);
+        }
+
+        // Record the return-origin summary for a named top-level function -- which explicit
+        // parameters' origins flow into the return value's references. Computed here, while this
+        // function's scope is still live (parameters resolve to `Param`, body locals to `Local`),
+        // before `pop_drop_scope` below tears it down. `summary_name` was claimed at entry above so
+        // nested body lambdas did not consume it.
+        if let Some(fn_name) = summary_name {
+            self.compute_return_origin_summary(fn_name, lambda, &function_type.return_type);
+        }
+
+        // Function-exit drops for the parameters (run after the body's own block drops when
+        // the body is a Sequence: same key, appended). Must happen while this lambda's move
+        // tracker and implicits scope are still in place.
+        let body_location = self.current_extended_context().expr_location(lambda.body);
+        let drops = self.pop_drop_scope(self.diverges(&body_type), &body_location);
+        if !drops.is_empty() {
+            self.current_extended_context_mut().push_post_expr_drops(lambda.body, drops);
+        }
 
         // If this is a handler branch, report free var moves before dropping the branch-local move tracker
         if let Some((context, outer_names)) = options.repeated_context.as_ref() {
@@ -665,7 +899,13 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
 
         self.function_return_type = old_return_type;
         self.current_effect_row = old_effect_row;
-        self.move_tracker = old_move_tracker;
+        let body_tracker = std::mem::replace(&mut self.move_tracker, old_move_tracker);
+        if let Some(outer_names) = outer_names {
+            self.move_tracker.merge_moves_rooted_in(&body_tracker, &outer_names);
+            // Names this lambda captures must not be auto-dropped by their owning scope:
+            // the closure (e.g. one returned from the function) would dangle.
+            self.record_captured_names(expr);
+        }
 
         // Must run before `check_for_closure` may be deferred, so later uses see the move.
         if lambda.is_move {
@@ -885,12 +1125,36 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
                 branches.push(else_moves);
             }
             self.move_tracker = super::affine::MoveTracker::merge_branches(&pre_branch_moves, &branches);
+
+            // Auto-drop: a value moved in one branch only is still owned at the end of the
+            // other branch -- the only edge that can drop it (the merged state above reads
+            // it moved). `branches` holds the non-diverging end states in then/else order.
+            if self.drop_elaboration_active() {
+                let mut edges = Vec::new();
+                let mut branch_states = branches.iter();
+                if !then_diverges {
+                    edges.push((if_.then, branch_states.next().unwrap().clone()));
+                }
+                if !else_diverges {
+                    edges.push((else_, branch_states.next().unwrap().clone()));
+                }
+                self.equalize_branch_drops(&pre_branch_moves, &edges);
+            }
             result
         } else {
             // If-without-else: if the then-branch always returns, moves don't carry forward
             if then_diverges {
                 self.move_tracker = pre_branch_moves;
             } else {
+                // Auto-drop: values the then-branch moved are still owned on the implicit
+                // else edge; the builder materializes an else block running these drops.
+                if self.drop_elaboration_active() {
+                    let location = self.current_extended_context().expr_location(expr);
+                    let drops = self.implicit_else_edge_drops(&pre_branch_moves, &then_moves, &location);
+                    if !drops.is_empty() {
+                        self.current_extended_context_mut().push_implicit_else_drops(expr, drops);
+                    }
+                }
                 self.move_tracker = super::affine::MoveTracker::merge_branches(&pre_branch_moves, &[then_moves]);
             }
 
@@ -907,31 +1171,138 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         // to an `I32` before the decision tree checks occur. This lets us compile `match 1 | ...`
         // without errors that the type of `1` is not yet known.
         self.push_implicits_scope();
+
+        // Auto-drop: if the scrutinee is a tracked place, remember its exact move record so the
+        // whole-value move recorded while inferring it can be rolled back below.
+        let tracked_place = if self.auto_drop { self.try_build_move_path(match_.expression) } else { None };
+        let saved_scrutinee_move = tracked_place.as_ref().map(|place| self.move_tracker.save_move(place));
+        let scrutinee_place = tracked_place.clone();
+
         let expr_type = self.infer_expr(match_.expression, &scrutinee_hint);
+
+        // Link constructor-pattern payload bindings to the scrutinee's place (per arm, below), so
+        // moving a payload marks the scrutinee partially moved and re-extraction or whole-value
+        // use afterwards is rejected -- without this the same owned payload can be consumed twice,
+        // a double-free once drops are automatic. Only for owned scrutinees: payload bindings
+        // under a `ref`/`mut`/`imm`/`uniq` (or pointer) scrutinee are not owned sub-places, and
+        // matching through a borrow must stay move-free (e.g. `Hash.hash` matches on `ref t`).
+        // The root must be owned too: `match s.field` where `s` is a reference borrows, not owns.
+        //
+        // Arms with or-patterns that bind payloads disable linking for the whole match: the
+        // alternatives may qualify one binding under different variants, so sub-place tracking
+        // is unreliable -- the match stays a consuming use instead (the scrutinee's whole-value
+        // move is not rolled back; bindings are independent owners).
+        let has_or_bindings = match_.cases.iter().any(|(pattern, _)| self.pattern_contains_or_bindings(*pattern));
+
+        // Does this match consume the value it inspects? A place whose root is a reference, or a
+        // reference/pointer-typed value, is a borrow -- someone else owns the referent and matching
+        // must stay move-free. Anything else (a local, a parameter, an rvalue) the match consumes.
+        let root_is_indirect = scrutinee_place.as_ref().is_some_and(|place| {
+            self.name_types.get(&place.root_variable()).cloned().is_some_and(|typ| {
+                typ.reference_element(&self.bindings).is_some() || typ.pointer_element(&self.bindings).is_some()
+            })
+        });
+        let scrutinee_is_owned = !root_is_indirect
+            && expr_type.reference_element(&self.bindings).is_none()
+            && expr_type.pointer_element(&self.bindings).is_none();
+
+        let scrutinee_place = scrutinee_place.filter(|_| scrutinee_is_owned && !has_or_bindings);
+
+        // Auto-drop: an rvalue scrutinee (`match parse text | Ok doc -> ...`) is owned by nobody --
+        // no place, so the arm bindings link to nothing and every payload they bind leaks. Give it
+        // an owner: `own_match_temporary` rewrites it to `(tmp = <rvalue>; tmp)` and registers `tmp`
+        // as a local of the innermost drop scope -- exactly what `tmp = parse text; match tmp`, the
+        // spelling that always worked, gets for free. The arm bindings then link to `tmp` as
+        // sub-places, so what an arm moves out is the arm's, and what it leaves behind dies with
+        // `tmp` at scope exit.
+        //
+        // Only for a scrutinee with no place at all: one whose place was filtered out just above
+        // is a borrow of a value someone else owns, and claiming it here would double-free it.
+        // Or-patterns take the other route below instead: their bindings cannot be sub-place tracked,
+        // so an owning `tmp` would drop payloads the arms have moved out of it.
+        let scrutinee_place = match scrutinee_place {
+            Some(place) => Some(place),
+            None if tracked_place.is_none() && !has_or_bindings && !self.diverges(&expr_type) => {
+                self.own_match_temporary(match_.expression, &expr_type)
+            },
+            None => None,
+        };
+
+        // The other half of the or-pattern rule. Linking is off for the whole match, so it consumes
+        // the scrutinee whole -- nothing drops it, and until now nothing dropped the payloads its
+        // arms bind either. Make each arm's bindings the owners of what they bind: locals of a drop
+        // scope that ends with the arm, which is what "bindings are independent owners" always
+        // meant. An arm that moves one out drops nothing (the move tracker sees it gone), so this
+        // cannot double-free what the arm hands away.
+        //
+        // Only when the match really does consume the scrutinee, which a `Copy` one it cannot: a
+        // `shared` handle is `Copy`, and matching it leaves the pointee alive and still owning every
+        // field the arms bind (the pointee's `release_T` drops them at refcount zero). Those bindings
+        // are views into live storage, retained by nobody -- an arm-end drop of one is a double free,
+        // and the red-black tree's `balance` (four alternatives, all binding subtrees) is exactly the
+        // shape that proves it. A borrowed scrutinee is the caller's for the same reason.
+        let scrutinee_is_consumed = scrutinee_is_owned && !self.type_is_copy(&expr_type);
+        let arm_bindings_own = has_or_bindings && scrutinee_is_consumed;
+
+        // An owned match is a place projection, not a consuming use: roll back the whole-value
+        // move recorded above (its use-of-moved check has already run) so the payload sub-places
+        // linked below are not spuriously ancestor-moved.
+        if let Some(place) = &scrutinee_place {
+            self.move_tracker.restore_move(place, saved_scrutinee_move.flatten());
+        }
 
         // Save move state before branches
         let pre_branch_moves = self.move_tracker.clone();
         let mut branch_trackers = Vec::new();
+        // Auto-drop: (arm body, arm end-state) for each non-diverging arm, for edge equalization.
+        let mut arm_edges = Vec::new();
         let mut result_type = Type::NEVER;
 
         for (pattern, branch) in match_.cases.iter() {
             self.move_tracker = pre_branch_moves.clone();
             self.check_pattern(*pattern, &expr_type);
+            if let Some(place) = &scrutinee_place {
+                self.assign_binding_places(*pattern, place.clone());
+            }
             self.push_implicits_scope();
-            if self.diverges(&result_type) {
+            if arm_bindings_own {
+                self.push_drop_scope(super::drop_elaboration::DropScopeKind::Block);
+                self.register_drop_locals(*pattern);
+            }
+            let arm_type = if self.diverges(&result_type) {
                 result_type = self.infer_expr(*branch, expected);
+                result_type.clone()
             } else {
-                self.check_expr(*branch, &result_type, TypeErrorKind::MatchBranch);
+                self.check_expr(*branch, &result_type, TypeErrorKind::MatchBranch)
+            };
+            // The arm's own bindings die with it. Synthesized before `pop_implicits_scope` so a
+            // delayed `Drop` implicit still resolves in this scope; skipped when the arm diverges,
+            // whose `return`/`break` edge dropped them on the way out (this scope was on the stack).
+            if arm_bindings_own {
+                let diverges = self.diverges(&arm_type);
+                let location = self.current_extended_context().expr_location(*branch);
+                let drops = self.pop_drop_scope(diverges, &location);
+                if !drops.is_empty() {
+                    self.current_extended_context_mut().push_post_expr_drops(*branch, drops);
+                }
             }
             self.pop_implicits_scope();
+            if self.drop_elaboration_active() && !self.diverges(&arm_type) {
+                arm_edges.push((*branch, self.move_tracker.clone()));
+            }
             branch_trackers.push(self.move_tracker.clone());
         }
         self.move_tracker = super::affine::MoveTracker::merge_branches(&pre_branch_moves, &branch_trackers);
+
+        // Auto-drop: a value moved in some arms only must be dropped at the end of each arm
+        // that still owns it. Keyed by the original arm body -- the decision tree re-lowers
+        // that body as the last expression of any wrapper it creates.
+        self.equalize_branch_drops(&pre_branch_moves, &arm_edges);
         self.pop_implicits_scope();
 
         // Now compile the match into a decision tree. The `match expr | ...` expression will be
         // replaced with `<fresh> = expr; <decision tree>`
-        let location = self.current_context().expr_location(match_.expression).clone();
+        let location = self.current_extended_context().expr_location(match_.expression);
         let (match_var, match_var_name) = self.fresh_variable("match_var", expr_type.clone(), location.clone());
 
         // `<match_var> = <expression being matched>`
@@ -1165,7 +1536,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
     }
 
-    fn infer_assignment(&mut self, assignment: &cst::Assignment) -> Type {
+    fn infer_assignment(&mut self, assignment: &cst::Assignment, id: ExprId) -> Type {
         let lhs_hint = self.next_type_variable();
 
         // Allow `x := v` to use `x` even if moved but `x += v` cannot since it reads `x`
@@ -1226,6 +1597,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         }
 
         self.check_expr(assignment.rhs, &value_type, TypeErrorKind::Assignment);
+
+        // Auto-drop: `x := new` over a live owned place drops the old value (after the RHS,
+        // before the store). Must run before `clear_moves` re-marks the place owned.
+        if is_plain {
+            self.assignment_overwrite_drop(assignment, id);
+        }
 
         // The LHS always holds a value after an assignment
         if let Some(path) = self.try_build_move_path(assignment.lhs) {
@@ -1335,6 +1712,18 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         match self.function_return_type.as_ref().cloned() {
             Some(expected_return) => {
                 self.check_expr(returned_expr, &expected_return, TypeErrorKind::Return);
+                // Auto-drop: a `return` exits every scope up to the enclosing function body.
+                // The returned value was inferred above, so if it is a local it is already
+                // marked moved and excluded. Keyed by the returned expression; the builder
+                // lowers these between computing the value and the Return terminator.
+                if self.drop_elaboration_active() {
+                    self.check_reference_escape(returned_expr);
+                    let location = id.locate(self);
+                    let drops = self.drops_for_return(&location);
+                    if !drops.is_empty() {
+                        self.current_extended_context_mut().push_pre_exit_drops(returned_expr, drops);
+                    }
+                }
             },
             None => {
                 let location = id.locate(self);
@@ -1349,8 +1738,13 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         let outer_names = self.name_types.keys().copied().collect::<FxHashSet<_>>();
         let old_tracker = std::mem::take(&mut self.move_tracker);
 
+        // Auto-drop: mark the loop-body boundary that break/continue unwind to. The marker
+        // scope itself owns nothing; each iteration's locals drop at the body block's end.
+        self.push_drop_scope(super::drop_elaboration::DropScopeKind::LoopBody);
         self.check_expr(while_.condition, &Type::BOOL, TypeErrorKind::Condition);
         self.check_expr(while_.body, &Type::UNIT, TypeErrorKind::LoopBody);
+        let location = self.current_extended_context().expr_location(while_.body);
+        let _ = self.pop_drop_scope(true, &location);
 
         self.check_moves_in_repeated_context(&outer_names, RepeatedContext::WhileLoop);
         self.move_tracker = old_tracker;
@@ -1376,7 +1770,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.name_types.insert(for_.variable, int_ty);
 
         let old_tracker = std::mem::take(&mut self.move_tracker);
+        // Auto-drop: mark the loop-body boundary that break/continue unwind to.
+        self.push_drop_scope(super::drop_elaboration::DropScopeKind::LoopBody);
         self.check_expr(for_.body, &Type::UNIT, TypeErrorKind::LoopBody);
+        let location = self.current_extended_context().expr_location(for_.body);
+        let _ = self.pop_drop_scope(true, &location);
         self.check_moves_in_repeated_context(&outer_names, RepeatedContext::ForLoop);
         self.move_tracker = old_tracker;
 
