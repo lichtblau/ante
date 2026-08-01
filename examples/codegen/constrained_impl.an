@@ -1,0 +1,56 @@
+// A constrained impl (`impl show_box {Show t} {Copy t}: Show (Box t)`) is a *function* returning the
+// trait type, so the capability its call sites receive is built at runtime -- including the
+// environment pointer of each method closure it packs. A method that uses none of the constraints
+// captures nothing, and its environment is null. Null arrives as `transmute ()`: a zero-sized value
+// reinterpreted as a pointer.
+//
+// The LLVM backend round-tripped a transmute through a stack slot sized for the *source* type, so
+// this one loaded 8 bytes out of a zero-byte slot -- whatever the frame happened to hold there. The
+// garbage came back as the closure's environment, and the caller's `ReleaseClosureEnv` (null-safe,
+// but not garbage-safe) dereferenced it. The constant-folded form of the same transmute was `undef`,
+// which is no better. Both are now zero, matching the C backend's `memset` / `(T){0}`.
+//
+// `describe` below is the capture-less method that used to blow up; `show` spends `{Show t}`, so its
+// environment is a real heap block and it always worked. Both are exercised. (`{Copy t}` is what
+// keeps `describe` capture-less under `--auto-drop`: a `{Drop t}` would be captured to tear the box
+// down, and the environment would not be null at all.)
+
+trait Show t =
+    show: fn t -> Unit
+    describe: fn t -> Unit
+
+type Box t = value: t
+
+impl show_i32: Show I32 with
+    show (b: I32) = println b
+    describe (_b: I32) = println "an i32"
+
+impl show_u32: Show U32 with
+    show (b: U32) = println b
+    describe (_b: U32) = println "a u32"
+
+impl show_box {Show t} {Copy t}: Show (Box t) with
+    show (b: Box t) = show b.value
+    describe (_b: Box t) = println "a box"
+
+// Reached through a generic caller as well as directly, and at two instantiations, so the impl is
+// specialized more than once.
+describe_via (b: Box t) {Show (Box t)}: Unit = describe b
+
+main () =
+    a: Box I32 = Box 1
+    b: Box U32 = Box 2
+    show a
+    show b
+
+    c: Box I32 = Box 3
+    d: Box U32 = Box 4
+    describe c
+    describe_via d
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 1
+// 2
+// a box
+// a box
