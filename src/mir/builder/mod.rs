@@ -1995,7 +1995,16 @@ where
         match &self.context()[expr] {
             cst::Expr::Variable(path_id) => {
                 let path_id = *path_id;
-                matches!(self.context().path_origin(path_id), Some(Origin::Local(name)) if self.mutable_locals.contains(&name))
+                if matches!(self.context().path_origin(path_id), Some(Origin::Local(name)) if self.mutable_locals.contains(&name)) {
+                    return true;
+                }
+                // A `shared mut` root: field addresses reached through it are genuine (they go
+                // via the shared pointer), even though the handle itself is an immutable `=`
+                // binding rather than a `mutable_local`. Mirrors the shared-mut short-circuit in
+                // `lhs_as_pointer`. Without this, `mut shared_handle.field` fell to the StackAlloc
+                // copy path and the callee mutated a throwaway.
+                let root_type = self.types.result.maps.expr_types[&expr].follow(&self.types.bindings);
+                self.shared_mut_inner_layout_of(root_type).is_some()
             },
             cst::Expr::MemberAccess(ma) => self.reference_target_is_addressable(ma.object),
             cst::Expr::TypeAnnotation(ta) => self.reference_target_is_addressable(ta.lhs),

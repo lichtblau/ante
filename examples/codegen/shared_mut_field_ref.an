@@ -1,0 +1,17 @@
+shared mut type P =
+    value: I32
+
+set100 (n: mut I32) =
+    n.* := 100
+
+main () =
+    p: P = P 5
+    q: P = p                 // second handle to the same shared value
+    set100 (mut p.value)
+    println p.value          // 100
+    println q.value          // 100
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 100
+// 100
