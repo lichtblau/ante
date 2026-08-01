@@ -232,7 +232,9 @@ pub enum Diagnostic {
     TopLevelImplicitTypeAnnotationRequired {
         location: Location,
     },
-    DropImplForSharedType {
+    SharedFieldLeaked {
+        typ: String,
+        reason: SharedLeakReason,
         location: Location,
     },
     ReferenceEscapesScope {
@@ -330,6 +332,19 @@ impl ConfusingBodyKind {
     }
 }
 
+/// Why a `shared` type's field is left un-torn-down when its refcount reaches zero
+/// (see [`Diagnostic::SharedFieldLeaked`]). The MIR release glue can only release shared
+/// handles it reaches directly or through a non-shared aggregate; these are the two ways a
+/// field can own heap data the glue cannot reclaim.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum SharedLeakReason {
+    /// The field's type owns its data through a `Drop` impl, which the glue cannot call.
+    DropImpl,
+    /// The field is a closure whose heap environment is reference-counted; the glue never
+    /// releases it.
+    ClosureEnv,
+}
+
 /// A hint the compiler can add to a diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum Hint {
@@ -400,6 +415,7 @@ impl Diagnostic {
             | UnusedName { .. }
             | UnreachableCase { .. }
             | InvalidRangeInPattern { .. }
+            | SharedFieldLeaked { .. }
             | ConfusingOperatorAfterBody { .. } => DiagnosticKind::Warning,
             _ => DiagnosticKind::Error,
         }
@@ -625,8 +641,16 @@ impl Diagnostic {
             Diagnostic::TopLevelImplicitTypeAnnotationRequired { location: _ } => {
                 "Type annotations are required on top-level implicits".to_string()
             },
-            Diagnostic::DropImplForSharedType { location: _ } => {
-                "Cannot implement Drop for a shared type: shared handles are Copy, so there is no coherent point to run it".to_string()
+            Diagnostic::SharedFieldLeaked { typ, reason, location: _ } => {
+                let cause = match reason {
+                    SharedLeakReason::DropImpl => {
+                        format!("{} has a Drop impl the release glue cannot call yet", color_type(typ))
+                    },
+                    SharedLeakReason::ClosureEnv => {
+                        "the release glue does not release closure environments yet".to_string()
+                    },
+                };
+                format!("This field leaks when the shared value's reference count reaches zero: {cause}")
             },
             Diagnostic::ReferenceEscapesScope { location: _ } => {
                 "This returns a reference to a value that is dropped when this function returns".to_string()
@@ -764,7 +788,7 @@ impl Diagnostic {
             | Diagnostic::MultipleImplicitsFound { location, .. }
             | Diagnostic::AmbiguousImplicit { location, .. }
             | Diagnostic::TopLevelImplicitTypeAnnotationRequired { location }
-            | Diagnostic::DropImplForSharedType { location }
+            | Diagnostic::SharedFieldLeaked { location, .. }
             | Diagnostic::ReferenceEscapesScope { location }
             | Diagnostic::MissingDropConstraint { location, .. }
             | Diagnostic::ExpectedTypeKind { location, .. }

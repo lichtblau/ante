@@ -1,0 +1,45 @@
+// The hardest corner of the borrowing-value story: a function that has both a borrowing parameter
+// and an implicit one, bound to a local before use.
+//
+// `step`'s `old: Acc` is borrowing (by-value, immutable, concretely `shared`) and its `{Drop t}` is
+// implicit. Bound directly to a `foldl` (`foldl .. step`), the checker coerces `step` against a
+// concrete `fn Acc b -> Acc` and builds an implicit-inserting wrapper that calls `step` directly --
+// leak-clean (that is `coercion_wrapper_params.an`). Bound to a local first, the binding's expected
+// type is only a fresh variable, so that coercion never fires. Left alone, a wrapper would still get
+// built at the eventual use `foldl .. f`, but it would capture the local `f` and call it
+// indirectly -- and an indirect call cannot see `step`'s borrowing mask, so it retains for a callee
+// that never releases, orphaning one accumulator per fold step (the leak this file guards).
+//
+// The fix builds the wrapper at the binding instead, driven by `step` being inferred in value
+// position rather than by any coercion: it references `step` directly (borrow elided), inserts the
+// `{Drop t}` as a delayed implicit resolved once `foldl` settles the element type, and owns and
+// releases its own parameters. Without it, none of the `drop 0..2` lines below print.
+import Std.Stream.foldl, iota, stream_fn
+
+shared type Acc = n: I32
+
+impl drop_acc: Drop Acc with
+    drop (a: mut Acc) =
+        print "  drop "
+        println a.n
+
+// `_x: t` is an owned generic dropped at the end of `step`, which is what makes `{Drop t}` an
+// implicit parameter -- and so what makes `foldl .. f` build a wrapper at all.
+step (old: Acc) (_x: t) {Drop t}: Acc = Acc (old.n + 1)
+
+main () =
+    // The reference bound to a local, then handed to `foldl`. Each superseded accumulator dies as
+    // the wrapper releases what the fold moved into it; the last survives to be returned.
+    f = step
+    total = foldl (iota 3) (Acc 0) f
+    println total.n
+    println "end"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+//   drop 0
+//   drop 1
+//   drop 2
+// 3
+// end
+//   drop 3

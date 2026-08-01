@@ -1,7 +1,7 @@
 use inc_complete::DbGet;
 
 use crate::{
-    incremental::{ExportedTypes, GetItem, GetItemRaw, TypeCheck},
+    incremental::{AutoDrop, ExportedTypes, GetItem, GetItemRaw, TypeCheck},
     mir::{AtomicOrdering, AtomicRmwOp, Instruction, Value, builder::Context},
     name_resolution::{Origin, builtin::Builtin},
     parser::{
@@ -13,7 +13,7 @@ use crate::{
 
 impl<'local, Db> Context<'local, Db>
 where
-    Db: DbGet<TypeCheck> + DbGet<GetItem> + DbGet<GetItemRaw> + DbGet<ExportedTypes>,
+    Db: DbGet<TypeCheck> + DbGet<GetItem> + DbGet<GetItemRaw> + DbGet<ExportedTypes> + DbGet<AutoDrop>,
 {
     pub(super) fn try_lower_intrinsic(&mut self, call: &cst::Call, call_id: ExprId) -> Option<Value> {
         // Function must be the `intrinsic` defined only within the stdlib

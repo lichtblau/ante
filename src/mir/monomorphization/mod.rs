@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 mod select_largest_variant;
 
 use crate::{
-    incremental::{ExportedTypes, GetCrateGraph, GetItem, GetItemRaw, Parse, TargetPointerSize, TypeCheck},
+    incremental::{AutoDrop, ExportedTypes, GetCrateGraph, GetItem, GetItemRaw, Parse, TargetPointerSize, TypeCheck},
     mir::{
         self, Definition, DefinitionId, FunctionType, GenericBindings, Instruction, Mir, Type, Value,
         builder::build_initial_mir_with_shared_map, next_definition_id,
@@ -56,6 +56,7 @@ where
         + DbGet<Parse>
         + DbGet<TargetPointerSize>
         + DbGet<ExportedTypes>
+        + DbGet<AutoDrop>
         + Sync,
 {
     let initial_mir = collect_all_items(compiler)

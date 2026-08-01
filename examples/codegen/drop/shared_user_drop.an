@@ -1,0 +1,88 @@
+// A user-written `Drop` impl on a `shared` type. It runs once, when the refcount reaches zero --
+// never at the death of a handle -- and it runs first: before the pointee's fields are torn down
+// and before the block is freed. That is `Rc<T: Drop>` parity.
+//
+// The impl is not what a dying handle uses. `Drop Node` still resolves to the synthesized
+// release-the-handle witness, so a `Vec Node` releases its elements rather than running this impl
+// per element; the impl is reached only from inside the release, at count zero. If implicit search
+// could see it, every dying alias would run it and the refcount would mean nothing -- so it is
+// deliberately held out of implicit scope, and named directly by the glue.
+import Std.Vec.Vec, empty, push, drop_vec
+
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "  field "
+        println r.tag
+
+shared type Node =
+    id: I32
+    payload: R
+
+// The receiver is the handle, so the fields are still readable: the impl runs before they are torn
+// down, exactly as a non-shared `Drop` impl sees its value intact.
+impl drop_node: Drop Node with
+    drop (n: mut Node) =
+        print "user "
+        println n.id
+
+// Ordering: `user 1`, then the field teardown that follows it, then the free.
+ordering () =
+    _n = Node 1 (R 10)
+    println "ordering"
+
+// Aliasing: three handles, one block. The impl runs when the last one dies, not three times.
+aliased () =
+    println "aliased"
+    a = Node 2 (R 20)
+    b = a
+    c = b
+    println (a.id + b.id + c.id)
+
+// Churn: a handle overwritten in a loop drops the old value each iteration -- once per iteration,
+// not once at the end and not twice.
+churn (n: I32) =
+    println "churn"
+    var i = 0
+    while i < n do
+        _live = Node (3 + i) (R 0)
+        i := i + 1
+
+// A container of handles: the elements are released, and only the release that reaches zero runs
+// the impl. Two nodes in, two `user` lines out.
+container () =
+    println "container"
+    var v = Vec.empty ()
+    push (mut v) (Node 7 (R 70))
+    push (mut v) (Node 8 (R 80))
+    println "pushed"
+
+main () =
+    ordering ()
+    aliased ()
+    churn 2
+    container ()
+    println "done"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// ordering
+// user 1
+//   field 10
+// aliased
+// 6
+// user 2
+//   field 20
+// churn
+// user 3
+//   field 0
+// user 4
+//   field 0
+// container
+// pushed
+// user 7
+//   field 70
+// user 8
+//   field 80
+// done

@@ -248,7 +248,7 @@ where
         let checked = TypeCheck(effect_item).get(self.compiler);
         let fields = mapvec(effect.body.iter(), |decl| {
             let method_type = checked.get_generalized(decl.name);
-            let method_type = crate::type_inference::type_body::apply_type_constructor(&method_type, args, &checked);
+            let method_type = crate::type_inference::type_body::apply_type_constructor(&method_type, args, &checked.bindings);
             self.convert_operation_type(&method_type)
         });
         Type::Tuple(Arc::new(fields))

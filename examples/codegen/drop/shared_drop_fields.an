@@ -1,0 +1,94 @@
+// A `shared` value's pointee now gets real teardown when its refcount reaches zero: user `Drop`
+// impls are called, aggregates expand field by field, shared fields release -- the same teardown a
+// local of the pointee's shape would get. Previously the release glue freed the node's own block
+// and released the shared handles it found, and left everything else behind (`shared_field_leak.an`
+// is the warning that named the loss).
+//
+// The teardown is synthesized where the `shared type` is defined, which is the only resolution
+// point that cannot depend on which file happens to release first. So the `Drop` impls its fields
+// need must be visible there -- as `drop_r` is below, and as the Prelude's `String` and `Vec` impls
+// are wherever they are imported.
+import Std.Vec.Vec, empty, push, drop_vec
+
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+// A non-shared aggregate is expanded field by field, so both the `R` (a user `Drop` impl to call)
+// and the `String` (a character buffer to reclaim -- the motivating leak) inside it are reached.
+type Note = body: R, text: String
+
+// A product pointee: each field is torn down in declaration order.
+shared type Leaf =
+    name: String
+    note: Note
+
+// A sum pointee lowers to an exhaustive match, one arm per variant.
+shared type Doc =
+    | Empty
+    | Text String R
+    | Section Note (Vec R)
+
+// A generic shared type tears down its concrete fields, and its bare-generic payload through the
+// `{Drop t}` its release function carries (`shared_generic_payload.an` is the test of that; here
+// `t` is an `I32`, which drops to nothing). Synthesizing the match needs the type's own
+// constructors, which -- unlike a function still being inferred alongside it -- are a finished
+// polytype by now and instantiate like a constructor from any other file.
+shared type Tagged t =
+    | Plain t
+    | Marked R t
+
+// A borrowing parameter: the call site elides the argument retain and the callee never releases.
+// The teardown must not move -- the pair was balanced, so it can never have been the release that
+// reached zero.
+peek (l: Leaf): I32 = l.note.body.tag
+
+// Teardown runs at count zero, not at every handle death: `copy` dies first and only decrements.
+counted () =
+    leaf: Leaf = Leaf "leaf" (Note (R 1) "note")
+    copy = leaf
+    println copy.name
+    println (peek leaf)
+    println "one handle left"
+
+sum_teardown () =
+    _text: Doc = Text "text" (R 2)
+    var items = Vec.empty ()
+    push (mut items) (R 3)
+    push (mut items) (R 4)
+    _section: Doc = Section (Note (R 5) "sec") items
+    _tagged: Tagged I32 = Marked (R 6) 60
+    println "sum built"
+
+// Churn: every iteration allocates a node and drops it at scope exit, so a leak here is a leak per
+// iteration rather than a one-off.
+churn (n: I32) =
+    var i = 0
+    while i < n do
+        _leaf: Leaf = Leaf "churn" (Note (R 9) "c")
+        i := i + 1
+
+main () =
+    counted ()
+    sum_teardown ()
+    churn 2
+    println "done"
+
+// args: --delete-binary --no-color --auto-drop
+// expected stdout:
+// leaf
+// 1
+// one handle left
+// drop 1
+// sum built
+// drop 6
+// drop 5
+// drop 3
+// drop 4
+// drop 2
+// drop 9
+// drop 9
+// done

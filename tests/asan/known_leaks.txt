@@ -1,15 +1,16 @@
 # Files with KNOWN remaining leaks, allowlisted so `run.sh --gate-leaks` fails only on
 # NEW ones.
 #
-# CALIBRATED TO M5 (4/5, closure ownership). This is deliberately not the end-state list:
-# each later milestone clears whole classes below, so entries must be DELETED as their
-# owning pick lands, not carried forward. A line that stops leaking and stays here
-# silently re-admits the leak later.
+# CALIBRATED TO M6 (5/5, teardown at refcount zero) -- the end of the drop stack. Entries
+# must still be DELETED as whatever owns them is fixed, not carried forward: a line that
+# stops leaking and stays here silently re-admits the leak later.
 #
-# Measured totals at M5: 11 files, 59760 bytes (58656 of it one coroutine stack, below).
+# Measured totals: 11 files, 59760 bytes (58656 of it one coroutine stack, below).
 # M5 cleared 11 of the 22 files listed at M3, all of the closure-capture class:
 # constrained_impl, method_calls, handle_multiple_effects, closure_capture_across_performs,
 # handler_owned_state, and stdlib-tests/{char,early_return,fail,math,string,throw}.
+# M6 cleared none of these 11 -- its subject is shared pointees that own payloads, and all
+# nine of its own tests are leak-free. What is left below is other classes.
 #
 # --- the abort contract (owned by the abort design, not a later pick) ---
 #
@@ -44,12 +45,22 @@
 #   stdlib-tests/seq.an (148, drop_seq). Plain `main` locals; rc.an also does manual
 #   inc_ref_count/dec_ref_count bookkeeping. Unowned, needs a fresh look.
 #
-# --- survived the closure-capture class, re-attribute ---
+# --- a generic Vec local with no witness to drop it ---
 #
-#   stdlib-tests/stream.an -- 704 bytes at M3, 160 now. Most of it was closure captures,
-#   so M5 took the bulk; the remainder is something else and was clean at the pre-rebase
-#   finished stack, which suggests M6 owns it. Recheck when (5/5) lands rather than
-#   assuming it clears.
+#   stdlib-tests/stream.an -- 704 bytes at M3, 160 now: M5 took the closure-capture bulk,
+#   and M6 did not touch the rest (guessing it would was wrong -- it is not a shared
+#   payload). Traced to `Stream.map2`, whose `v1 = Vec.of s1` / `v2 = Vec.of s2` locals are
+#   never dropped, at its two call sites in the test (map2 and zip, which delegates to it):
+#   4 buffers, 64 + 32 + 32 + 32. Dropping a `Vec a` needs a `Drop a` witness, and neither
+#   `map2` nor `zip` declares one -- they carry only `{Copy a} {Copy b}`. Adding `{Drop a}
+#   {Drop b}` to both does clear it, but that changes a stdlib signature and belongs to the
+#   same open decision as the class above, not here.
+#
+#   Not from the effects rebase: `map2`'s body, its constraints and the Prelude's whole
+#   `Drop` surface are textually equivalent to drop-before-rebase-7, so the missing witness
+#   predates it. That tag's leak list does not name this file, but that list carries its own
+#   record of stale attributions, and the constraint gap it would have needed to avoid is
+#   demonstrably present in its own source.
 #
 # --- not a compiler leak, pinned deliberately ---
 #

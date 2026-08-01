@@ -9,7 +9,7 @@ use inc_complete::DbGet;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    incremental::{ExportedTypes, GetItem, GetItemRaw, TypeCheck},
+    incremental::{AutoDrop, ExportedTypes, GetItem, GetItemRaw, TypeCheck},
     iterator_extensions::mapvec,
     lexer::token::{FloatKind, Integer, IntegerKind},
     mir::{
@@ -47,7 +47,7 @@ pub(crate) fn lookup_definition_id(name: &TopLevelName) -> Option<DefinitionId> 
 /// Builds the MIR with the default shared global [SharedIdsMap].
 pub(crate) fn build_initial_mir_with_shared_map<T>(compiler: &T, item_id: TopLevelId) -> Option<Mir>
 where
-    T: DbGet<TypeCheck> + DbGet<GetItem> + DbGet<GetItemRaw> + DbGet<ExportedTypes>,
+    T: DbGet<TypeCheck> + DbGet<GetItem> + DbGet<GetItemRaw> + DbGet<ExportedTypes> + DbGet<AutoDrop>,
 {
     build_initial_mir(compiler, &NAME_IDS, item_id)
 }
@@ -61,7 +61,7 @@ where
 /// which will pass around unsized values by reference.
 pub(crate) fn build_initial_mir<T>(compiler: &T, ids: &SharedIdsMap, item_id: TopLevelId) -> Option<Mir>
 where
-    T: DbGet<TypeCheck> + DbGet<GetItem> + DbGet<GetItemRaw> + DbGet<ExportedTypes>,
+    T: DbGet<TypeCheck> + DbGet<GetItem> + DbGet<GetItemRaw> + DbGet<ExportedTypes> + DbGet<AutoDrop>,
 {
     let types = TypeCheck(item_id).get(compiler);
     let (item, _) = GetItem(item_id).get(compiler);
@@ -231,7 +231,7 @@ impl<'local, Db> Context<'local, Db> {
 
 impl<'local, Db> Context<'local, Db>
 where
-    Db: DbGet<TypeCheck> + DbGet<GetItem> + DbGet<GetItemRaw> + DbGet<ExportedTypes>,
+    Db: DbGet<TypeCheck> + DbGet<GetItem> + DbGet<GetItemRaw> + DbGet<ExportedTypes> + DbGet<AutoDrop>,
 {
     fn push_instruction(&mut self, instruction: Instruction, result_type: Type) -> Value {
         if self.current_block().terminator.is_some() {
@@ -315,12 +315,18 @@ where
     }
 
     fn get_definition_name(&self, name: &TopLevelName) -> Name {
-        // A shared type's synthesized `release_T` uses a reserved name id that has no entry in the
-        // parsed name arrays; give it a stable synthetic name.
+        // A shared type's synthesized `release_T` and `Drop` impl use reserved name ids that have
+        // no entry in the parsed name arrays; give them stable synthetic names.
         if name.local_name_id == NameId::RELEASE_FUNCTION {
             return Arc::new("release".to_string());
         }
-        let (_, context) = GetItemRaw(name.top_level_item).get(self.compiler);
+        let (item, context) = GetItemRaw(name.top_level_item).get(self.compiler);
+        if name.local_name_id == NameId::DROP_IMPL {
+            let cst::TopLevelItemKind::TypeDefinition(definition) = &item.kind else {
+                return Arc::new("drop_shared".to_string());
+            };
+            return Arc::new(format!("drop_{}", context.names[definition.name]));
+        }
         context.names[name.local_name_id].clone()
     }
 
@@ -515,7 +521,8 @@ where
                     let is_extern = self.name_is_extern(&name);
                     let name = self.get_definition_name(&name);
                     if is_release_function {
-                        self.make_definition_value(id, name, Self::release_function_mir_type())
+                        let caps = self.release_reference_cap_types(path_id);
+                        self.make_definition_value(id, name, Self::release_function_mir_type(caps))
                     } else if is_extern {
                         let tc_type = &self.types.result.maps.path_types[&path_id];
                         let c_type = self.convert_context().convert_c_function_type(tc_type);
@@ -557,8 +564,11 @@ where
         if let Value::Definition(id) = value
             && let Some(bindings) = self.types.result.context.get_instantiation(path_id)
         {
-            let typ =
-                if is_release_function { Self::release_function_mir_type() } else { self.convert_path_type(path_id) };
+            let typ = if is_release_function {
+                Self::release_function_mir_type(self.release_reference_cap_types(path_id))
+            } else {
+                self.convert_path_type(path_id)
+            };
             let bindings = Arc::new(mapvec(bindings, |typ| self.convert_type(typ, None)));
             let instruction = Instruction::Instantiate(id, bindings);
             value = self.push_instruction(instruction, typ);
@@ -655,11 +665,20 @@ where
         // If the object has a reference/pointer type, the MIR value is a pointer, so use GetFieldPtr instead.
         let object_expr = member_access.object;
         let object_type = self.types.result.maps.expr_types[&object_expr].follow(&self.types.bindings);
-        let reference_element =
-            object_type.reference_or_pointer_element(&self.types.bindings).map(|typ| self.convert_type(typ, None));
+        let referenced = object_type.reference_or_pointer_element(&self.types.bindings).cloned();
 
-        if let Some(struct_type) = reference_element {
+        if let Some(referenced) = referenced {
             let struct_ptr = self.expression(object_expr);
+            // A reference to a shared value (`mut Res`, the receiver a `Drop` impl on a shared type
+            // gets) points at the handle, not at the fields: the handle is itself a pointer, and the
+            // fields live in the pointee. Load it, then index the pointee's layout. Indexing the
+            // handle slot as if it were the struct reads whatever sits next to it in the frame.
+            if let Some(struct_type) = self.shared_inner_layout_of(&referenced) {
+                let handle = self.push_instruction(Instruction::Deref(struct_ptr), Type::POINTER);
+                let field = Instruction::GetFieldPtr { struct_ptr: handle, struct_type, index };
+                return self.push_instruction(field, Type::POINTER);
+            }
+            let struct_type = self.convert_type(&referenced, None);
             self.push_instruction(Instruction::GetFieldPtr { struct_ptr, struct_type, index }, Type::POINTER)
         } else {
             let value = self.expression(object_expr);
@@ -1008,7 +1027,10 @@ where
         let mut explicit_index = 0usize;
         let mut arg_index = 0u32;
         let mut arguments = mapvec(&call.arguments, |arg| {
-            let value = if arg.is_implicit && !is_release_call {
+            // A release call's implicit arguments are the `{Drop g}` witnesses its glue spends on
+            // the pointee's owned generics -- ordinary capability values. Only its explicit handle
+            // argument is exempt from the callee-owns retain.
+            let value = if arg.is_implicit {
                 implicit_positions.push(arg_index);
                 self.lower_drop_capability(arg.expr, &mut cap_env_releases)
             } else {
@@ -1096,7 +1118,15 @@ where
                 self.push_instruction(Instruction::ReleaseClosureEnv(environment), Type::UNIT);
             }
             for (arg_value, arg_expr, retain_id) in post_call_releases {
-                let release = self.emit_shared_release_for_expr(arg_value, arg_expr);
+                // A retained place is balanced: the retain right before the call funds this
+                // decrement, so it can never be the one reaching zero. Decrement it directly rather
+                // than through `release_T` -- no call, and no witnesses to find for a teardown that
+                // provably does not run. An rvalue has no such retain: the caller owns the only
+                // reference and its release may well be the last, so it goes through `release_T`.
+                let release = match retain_id {
+                    Some(_) => Some(self.push_instruction(Instruction::RcDecrement(arg_value), Type::BOOL)),
+                    None => self.emit_shared_release_for_expr(arg_value, arg_expr),
+                };
                 if let (Some(retain), Some(call), Some(Value::InstructionResult(release_call))) =
                     (retain_id, call_id, release)
                 {
@@ -1139,12 +1169,23 @@ where
 
     /// Release a shared handle the caller owns past the call (`release_T` derived from the argument
     /// expression's TC type). No-op for non-shared types.
+    ///
+    /// Any `{Drop g}` witnesses `release_T` wants were resolved by the checker against this same
+    /// argument expression (`record_release_witnesses`) -- there is no implicit search to run here.
+    /// The capability environments they allocate are freed as soon as the release returns.
     fn emit_shared_release_for_expr(&mut self, value: Value, expr: ExprId) -> Option<Value> {
         let tc_type = self.types.result.maps.expr_types[&expr].follow(&self.types.bindings);
-        if let Some((type_id, type_args)) = self.shared_release_target(&tc_type) {
-            return Some(self.emit_release_call(value, type_id, &type_args));
+        let (type_id, type_args) = self.shared_release_target(&tc_type)?;
+
+        let witnesses = self.context().release_witnesses(expr).cloned().unwrap_or_default();
+        let mut cap_env_releases = Vec::new();
+        let caps = mapvec(&witnesses, |witness| self.lower_drop_capability(*witness, &mut cap_env_releases));
+
+        let release = self.emit_release_call(value, type_id, &type_args, &caps);
+        for environment in cap_env_releases {
+            self.push_instruction(Instruction::ReleaseClosureEnv(environment), Type::UNIT);
         }
-        None
+        Some(release)
     }
 
     /// A first-class effect operation: projects the operation out of the capability at the head of its own evidence.
@@ -2964,9 +3005,13 @@ where
         }
 
         // A shared type owns a synthesized `release_T`: decrement the refcount, and on the last
-        // reference run the pointee-drop glue then free the block.
+        // reference run the pointee-drop glue then free the block. It also owns the `Drop` impl
+        // that lets a container of its handles release them (`define_shared_drop_impl`).
         if type_definition.shared {
             self.define_release_function(type_definition);
+            if AutoDrop.get(self.compiler) {
+                self.define_shared_drop_impl(type_definition);
+            }
         }
 
         // Abilities are sugar for a struct of function-typed fields, however each "field" is treated
@@ -2978,27 +3023,23 @@ where
         }
     }
 
-    /// Emit a shared type's `release_T` function: `release(p) = if RcDecrement(p) then { <release
-    /// pointee's shared fields>; FreeShared(p) }`.  The glue is built directly in MIR from the
-    /// type's structure -- it cannot be synthesized in the frontend, which would need this type's
-    /// own (in-progress) `TypeCheck` result. Nested shared fields become recursive `release_U`
-    /// calls (terminating -- calls, not inline); non- shared owned fields are left un-dropped for
-    /// now.  Generic over the type's parameters so monomorphization specializes it per element
-    /// type, reached only through the `Instantiate` a release call site emits.
+    /// Emit a shared type's `release_T` function: `release(p) = if RcDecrement(p) then { <tear the
+    /// pointee down>; FreeShared(p) }`. Generic over the type's parameters so monomorphization
+    /// specializes it per element type, reached only through the `Instantiate` a release call site
+    /// emits.
+    ///
+    /// The teardown comes from one of two places. When the checker synthesized glue for this type
+    /// ([`crate::type_inference::SharedDropGlue`] -- it does so exactly when the pointee owns
+    /// something this builder cannot reach, such as a `String`'s buffer), that expression is the
+    /// teardown: it is lowered here with the handle bound to `release_T`'s parameter, and it
+    /// already emits the shared-field releases, so it supersedes the walk below entirely.
+    ///
+    /// Otherwise the glue is built directly in MIR from the type's structure. That walk sees only
+    /// shared handles -- resolving a `Drop` impl needs an inference context, which does not exist
+    /// here -- but it is the one that can express the pointer-chasing release loop, so glue-free
+    /// types (the list shapes that motivated the loop) keep it.
     fn define_release_function(&mut self, type_definition: &cst::TypeDefinition) {
-        // Recover the type's generics so recursive-release `Instantiate` bindings map to the right
-        // MIR generics (the last constructor already left them in scope, but be explicit).
-        let tc_generics: Vec<_> = type_definition
-            .generics
-            .iter()
-            .map(|p| type_inference::generics::Generic::Named(Origin::Local(p.name)))
-            .collect();
-        if tc_generics.is_empty() {
-            self.generics_in_scope.clear();
-        } else {
-            let forall = TCType::Forall(Arc::new(tc_generics), Arc::new(TCType::UNIT));
-            self.set_generics_in_scope(&forall);
-        }
+        self.set_type_definition_generics(type_definition);
         let generic_count = self.generics_in_scope.len() as u32;
 
         // The shared type applied to its own generics -- the TC type of the handle, used to read the
@@ -3015,8 +3056,21 @@ where
             self_tc = TCType::Application(Arc::new(self_tc), Arc::new(generic_args.clone()));
         }
 
+        let glue = self.types.result.shared_drop_glue.clone();
+
+        // One trailing `{Drop g}` capability per generic the pointee owns -- the implicit parameters
+        // the checker gave this function's type, which every call site has already been checked
+        // against. Only the synthesized glue can spend them, and a constrained type always has
+        // glue, so their types are read straight off the capability names it bound.
+        let drop_cap_tcs: Vec<TCType> = glue
+            .iter()
+            .flat_map(|glue| &glue.drop_caps)
+            .map(|cap| self.types.result.maps.name_types[cap].clone())
+            .collect();
+        let drop_cap_types = mapvec(&drop_cap_tcs, |typ| self.convert_type(typ, None));
+
         let name: Name = Arc::new(format!("release_{}", self.context()[type_definition.name].as_ref()));
-        let fn_type = Self::release_function_mir_type();
+        let fn_type = Self::release_function_mir_type(drop_cap_types.clone());
 
         let old_scope = std::mem::take(&mut self.local_variables);
         let old_mutables = std::mem::take(&mut self.mutable_locals);
@@ -3025,14 +3079,41 @@ where
         // node -- a long list overflows the stack. When any field releases through this same type
         // instantiation, lower the release as a pointer-chasing loop over the LAST such field per
         // variant (non-last self fields keep their recursive calls, so trees consume depth, not
-        // size).
-        let has_self_tail = self.type_has_self_release_field(&generic_args);
+        // size). Synthesized glue is a fixed expression tree with no way to defer a field into the
+        // loop's slot, so a glue-bearing type releases its tail recursively instead -- it consumes
+        // a frame per node, and a long one can still overflow.
+        let has_self_tail = glue.is_none() && self.type_has_self_release_field(&generic_args);
 
         let id = self.new_definition(name, Some(NameId::RELEASE_FUNCTION), generic_count, fn_type, |this| {
             this.push_parameter(Type::POINTER);
             let handle = Value::Parameter(this.current_block, 0);
+            let entry = this.current_block;
+            for cap_type in drop_cap_types {
+                this.push_parameter(cap_type);
+            }
 
-            if has_self_tail {
+            if let Some(glue) = glue {
+                let reached_zero = this.push_instruction(Instruction::RcDecrement(handle), Type::BOOL);
+                let glue_block = this.push_block_no_params();
+                let cont = this.push_block_no_params();
+                this.terminate_block(TerminatorInstruction::if_(reached_zero, glue_block, cont, cont));
+
+                // Last reference: run the checker's teardown of the pointee, then free the block.
+                // The teardown reads the pointee through the handle, so bind the handle first; it
+                // may open blocks of its own (a sum's match), so the `FreeShared` goes wherever it
+                // leaves the builder.
+                this.switch_to_block(glue_block);
+                this.local_variables.insert(glue.handle, handle);
+                for (i, cap) in glue.drop_caps.iter().enumerate() {
+                    this.local_variables.insert(*cap, Value::Parameter(entry, 1 + i as u32));
+                }
+                this.expression(glue.body);
+                this.push_instruction(Instruction::FreeShared(handle), Type::UNIT);
+                this.terminate_block(TerminatorInstruction::jmp_no_args(cont));
+
+                this.switch_to_block(cont);
+                this.terminate_block(TerminatorInstruction::Return(Value::Unit));
+            } else if has_self_tail {
                 // cur/next live in stack slots (the same shape `while_` lowers to):
                 //   header:  cur = *cur_slot; if !RcDecrement(cur) -> exit
                 //   glue:    *next_slot = null; <release fields, the tail deferred into
@@ -3091,6 +3172,176 @@ where
         self.local_variables = old_scope;
         self.mutable_locals = old_mutables;
         self.name_to_id.insert(TopLevelName::new(self.top_level_id, NameId::RELEASE_FUNCTION), id);
+    }
+
+    /// Emit a shared type's synthesized `Drop` impl: `impl Drop T with drop self = release_T self`.
+    ///
+    /// This is the witness that makes a shared handle satisfy a `{Drop t}` constraint, so a
+    /// container of handles releases its elements -- `Vec`'s own `Drop` impl needs `Drop t` to
+    /// drop each one, and until there was one, a `Vec Node` field of a shared pointee freed its
+    /// buffer and stranded every subtree in it. Implicit search finds it through
+    /// [`crate::definition_collection::visible_implicits`], which registers it for every visible
+    /// shared type; only its type and this body are synthesized, and it is an ordinary static impl
+    /// from every other angle.
+    ///
+    /// The one place the two calling conventions meet. `Drop.drop` takes `mut self`, so the method
+    /// receives a pointer to the handle; `release_T` takes the handle by value (it is a Copy
+    /// pointer). So the body is a load and a call.
+    ///
+    /// This impl is never what a dying handle itself uses -- drop elaboration resolves a shared
+    /// place straight to `release_T`, ahead of any impl lookup. It exists for the generic callers
+    /// that cannot see through to the handle.
+    fn define_shared_drop_impl(&mut self, type_definition: &cst::TypeDefinition) {
+        let Some(drop_ability) = self.drop_ability_name() else { return };
+
+        // The impl is generic over the type's own parameters, like `release_T` -- and it calls it,
+        // so the two must agree on which MIR generic each `Instantiate` binding names.
+        self.set_type_definition_generics(type_definition);
+
+        let generic_args = mapvec(&type_definition.generics, |p| {
+            TCType::Generic(type_inference::generics::Generic::Named(Origin::Local(p.name)))
+        });
+        let type_name = TopLevelName::new(self.top_level_id, type_definition.name);
+        let mut self_tc = TCType::UserDefined(Origin::TopLevelDefinition(type_name));
+        if !generic_args.is_empty() {
+            self_tc = TCType::Application(Arc::new(self_tc), Arc::new(generic_args.clone()));
+        }
+
+        // `Drop T` lowers to the ability's struct: one field, holding the `drop` method's closure.
+        let ability = TCType::UserDefined(Origin::TopLevelDefinition(drop_ability));
+        let impl_tc = TCType::Application(Arc::new(ability), Arc::new(vec![self_tc]));
+        let impl_type = self.convert_type(&impl_tc, None);
+        let Type::Tuple(fields) = &impl_type else { return };
+        let [Type::Function(method)] = fields.as_slice() else { return };
+
+        // The function behind the ability's closure field takes the environment as a trailing
+        // parameter -- the shape `coerce_to_closure` packs.
+        let closure_type = Type::Function(method.clone());
+        let mut parameters = method.parameters.clone();
+        parameters.push(method.environment.clone());
+        let function_type = Type::Function(Arc::new(crate::mir::FunctionType {
+            parameters: parameters.clone(),
+            environment: Type::NO_CLOSURE_ENV,
+            return_type: Type::UNIT,
+        }));
+
+        // The witnesses `release_T` wants. The impl takes them as its own (implicit) parameters --
+        // the checker typed it as `fn <caps> -> Drop T` -- and hands them to the method through its
+        // closure environment, the shape a user's `impl drop_vec {Drop t}` already lowers to.
+        let drop_caps: Vec<NameId> =
+            self.types.result.shared_drop_glue.iter().flat_map(|glue| glue.drop_caps.clone()).collect();
+        let cap_tcs: Vec<TCType> = mapvec(&drop_caps, |cap| self.types.result.maps.name_types[cap].clone());
+        let cap_types = mapvec(&cap_tcs, |tc| self.convert_type(tc, None));
+
+        let type_name_string = self.context()[type_definition.name].clone();
+        let method_name: Name = Arc::new(format!("drop_{type_name_string}_method"));
+        let generic_count = self.generics_in_scope.len() as u32;
+
+        let old_scope = std::mem::take(&mut self.local_variables);
+        let old_mutables = std::mem::take(&mut self.mutable_locals);
+
+        let caps = drop_caps.clone();
+        let method_id = self.new_definition(method_name.clone(), None, generic_count, function_type.clone(), |this| {
+            for parameter in &parameters {
+                this.push_parameter(parameter.clone());
+            }
+            // `mut self` is a pointer to the handle; load it, then release by value.
+            let reference = Value::Parameter(BlockId::ENTRY_BLOCK, 0);
+            let handle = this.push_instruction(Instruction::Deref(reference), Type::POINTER);
+            let cap_values = if caps.is_empty() {
+                Vec::new()
+            } else {
+                let environment = Value::Parameter(BlockId::ENTRY_BLOCK, parameters.len() as u32 - 1);
+                // This env carries only the `{Drop g}` witnesses, as ordinary captures. The method
+                // is pure -- `Drop.drop` declares no effects -- so there are no capability slots to
+                // restore and no row-polymorphic tail to forward.
+                this.unpack_closure_environment(caps.iter().copied(), &[], None, environment);
+                mapvec(&caps, |cap| this.local_variables[cap])
+            };
+            this.emit_release_call(handle, this.top_level_id, &generic_args, &cap_values);
+            this.terminate_block(TerminatorInstruction::Return(Value::Unit));
+        });
+
+        // The impl value itself: a global holding the ability struct -- or, when the release wants
+        // witnesses, a function from those witnesses to it.
+        let name: Name = Arc::new(format!("drop_{type_name_string}"));
+        let impl_definition_type = if cap_types.is_empty() {
+            impl_type.clone()
+        } else {
+            // The witness is reached through ordinary trait dispatch, so it takes the uniform
+            // convention: the checker types it pure, and `convert_type` therefore appends an
+            // empty-tuple evidence parameter to every reference to it. The definition has to
+            // declare that parameter too, or the two disagree and MIR validation rejects the
+            // reference.
+            let mut parameters = cap_types.clone();
+            parameters.push(Type::tuple(Vec::new()));
+            Type::Function(Arc::new(crate::mir::FunctionType {
+                parameters,
+                environment: Type::NO_CLOSURE_ENV,
+                return_type: impl_type.clone(),
+            }))
+        };
+        let id = self.new_definition(name, Some(NameId::DROP_IMPL), generic_count, impl_definition_type, |this| {
+            let environment = if cap_types.is_empty() {
+                this.push_instruction(Instruction::Transmute(Value::Unit), Type::POINTER)
+            } else {
+                let values = cap_types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, typ)| {
+                        this.push_parameter(typ.clone());
+                        Value::Parameter(BlockId::ENTRY_BLOCK, i as u32)
+                    })
+                    .collect::<Vec<_>>();
+                // The (ignored) evidence parameter, declared above and never read.
+                this.push_parameter(Type::tuple(Vec::new()));
+                let tuple = this.push_instruction(Instruction::MakeTuple(values), Type::tuple(cap_types.clone()));
+                this.push_instruction(Instruction::AllocShared(tuple), Type::POINTER)
+            };
+            let method = this.make_definition_value(method_id, method_name, function_type);
+            let method = if generic_count == 0 {
+                method
+            } else {
+                // Generic over the type's parameters, like `release_T`: monomorphization
+                // specializes the pair together, reached through the impl's own Instantiate.
+                let mir_generics = mapvec(0..generic_count, |i| Type::Generic(Generic(i)));
+                this.push_instruction(Instruction::Instantiate(method_id, Arc::new(mir_generics)), closure_type.clone())
+            };
+            let closure =
+                this.push_instruction(Instruction::PackClosure { function: method, environment }, closure_type);
+            let value = this.push_instruction(Instruction::MakeTuple(vec![closure]), impl_type);
+            if cap_types.is_empty() {
+                this.terminate_block(TerminatorInstruction::Result(value));
+            } else {
+                this.terminate_block(TerminatorInstruction::Return(value));
+            }
+        });
+
+        self.local_variables = old_scope;
+        self.mutable_locals = old_mutables;
+        self.name_to_id.insert(TopLevelName::new(self.top_level_id, NameId::DROP_IMPL), id);
+    }
+
+    fn drop_ability_name(&self) -> Option<TopLevelName> {
+        ExportedTypes(SourceFileId::prelude()).get(self.compiler).get(&Arc::new("Drop".to_string())).copied()
+    }
+
+    /// Put a type definition's own generics in scope, so that the functions synthesized for it
+    /// (`release_T`, its `Drop` impl) agree with each other on which MIR generic each
+    /// `Instantiate` binding names. The last constructor already left them there, but the
+    /// synthesized definitions do not otherwise depend on having been reached through one.
+    fn set_type_definition_generics(&mut self, type_definition: &cst::TypeDefinition) {
+        let tc_generics: Vec<_> = type_definition
+            .generics
+            .iter()
+            .map(|p| type_inference::generics::Generic::Named(Origin::Local(p.name)))
+            .collect();
+        if tc_generics.is_empty() {
+            self.generics_in_scope.clear();
+        } else {
+            let forall = TCType::Forall(Arc::new(tc_generics), Arc::new(TCType::UNIT));
+            self.set_generics_in_scope(&forall);
+        }
     }
 
     /// True when a directly-releasable field of this type's body is this same type applied to
@@ -3213,7 +3464,7 @@ where
     /// [Self::release_inline_body]; anything else carries no shared handle and is skipped.
     fn release_inline_value(&mut self, value: Value, tc: &TCType) {
         if let Some((type_id, type_args)) = self.shared_release_target(tc) {
-            self.emit_release_call(value, type_id, &type_args);
+            self.emit_release_call(value, type_id, &type_args, &[]);
         } else if let Some((type_id, type_args)) = self.aggregate_type_target(tc) {
             // Nested aggregates never defer: only the release loop's own top-level pointee
             // walk pointer-chases.
@@ -3221,37 +3472,77 @@ where
         }
     }
 
-    /// The MIR signature every synthesized `release_T` has: the handle is a shared pointer whatever
-    /// the element type is, so `fn(Pointer) -> Unit` serves them all and genericity lives in the
-    /// definition's generic count plus its body's `Instantiate`s.
+    /// The MIR signature of a synthesized `release_T`: the handle is a shared pointer whatever the
+    /// element type is, followed by one parameter per `{Drop g}` witness the pointee's owned
+    /// generics need. Genericity otherwise lives in the definition's generic count plus its body's
+    /// `Instantiate`s.
     ///
     /// C-shaped on purpose -- no trailing evidence parameter. A release performs no effects, and
     /// every call to one is emitted by the compiler, so there is no first-class use that would need
     /// the uniform shape. The definition, [Self::emit_release_call] and the `release_T` case in
-    /// [Self::variable] must agree exactly, so all three read the signature from here: reading it
-    /// off `path_types` instead would hand a reference the evidence parameter the definition lacks.
-    fn release_function_mir_type() -> Type {
+    /// [Self::variable] must agree exactly, so all three build the signature here: reading it off
+    /// `path_types` instead would hand a reference the evidence parameter the definition lacks.
+    /// The `{Drop g}` capability parameter types of a `release_T` reference, read off its converted
+    /// path type. The checker resolves those witnesses as ordinary implicit arguments, so they sit
+    /// between the handle and the trailing evidence parameter `convert_type` appends -- and which
+    /// `release_T` itself does not take (see [Self::release_function_mir_type]).
+    fn release_reference_cap_types(&self, path_id: PathId) -> Vec<Type> {
+        match self.convert_path_type(path_id) {
+            Type::Function(function_type) if function_type.parameters.len() >= 2 => {
+                function_type.parameters[1..function_type.parameters.len() - 1].to_vec()
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    fn release_function_mir_type(drop_cap_types: Vec<Type>) -> Type {
+        let mut parameters = vec![Type::POINTER];
+        parameters.extend(drop_cap_types);
         Type::Function(Arc::new(crate::mir::FunctionType {
-            parameters: vec![Type::POINTER],
+            parameters,
             environment: Type::NO_CLOSURE_ENV,
             return_type: Type::UNIT,
         }))
     }
 
-    /// Emit `release_T(handle)` for shared type `type_id` applied to `type_args` (instantiating the
-    /// generic release function when the type is generic). Returns the call so a borrowing call
-    /// site can record it as the release half of an elidable pair.
-    fn emit_release_call(&mut self, handle: Value, type_id: TopLevelId, type_args: &[TCType]) -> Value {
+    /// Emit `release_T(handle, drop_caps...)` for shared type `type_id` applied to `type_args`
+    /// (instantiating the generic release function when the type is generic). Returns the call so a
+    /// borrowing call site can record it as the release half of an elidable pair.
+    ///
+    /// `drop_caps` are the `{Drop g}` witnesses `release_T` declares for the generics its pointee
+    /// owns. Nothing here can find a witness -- implicit search belongs to the checker -- so every
+    /// caller has to already hold one: the type's own `Drop` impl takes them as parameters, and a
+    /// caller-owned rvalue's release reads the ones the checker resolved against its argument
+    /// expression. The hand-built glue holds none, and needs none: a shared field whose release
+    /// wants witnesses is reported as a gap, which routes its whole type through the synthesized
+    /// glue instead, where implicit search runs.
+    fn emit_release_call(
+        &mut self, handle: Value, type_id: TopLevelId, type_args: &[TCType], drop_caps: &[Value],
+    ) -> Value {
+        debug_assert_eq!(
+            drop_caps.len(),
+            self.release_drop_cap_count(type_id),
+            "release_T called with the wrong number of drop witnesses"
+        );
         let release_name = TopLevelName::new(type_id, NameId::RELEASE_FUNCTION);
         let release_id = self.get_definition_id(&release_name);
-        let fn_type = Self::release_function_mir_type();
+        let cap_types = mapvec(drop_caps, |cap| self.type_of_value(cap));
+        let fn_type = Self::release_function_mir_type(cap_types);
         let callee = if type_args.is_empty() {
             self.make_definition_value(release_id, Arc::new("release".to_string()), fn_type)
         } else {
             let mir_args = mapvec(type_args, |a| self.convert_type(a, None));
             self.push_instruction(Instruction::Instantiate(release_id, Arc::new(mir_args)), fn_type)
         };
-        self.push_instruction(Instruction::Call { function: callee, arguments: vec![handle] }, Type::UNIT)
+        let mut arguments = vec![handle];
+        arguments.extend(drop_caps.iter().cloned());
+        self.push_instruction(Instruction::Call { function: callee, arguments }, Type::UNIT)
+    }
+
+    /// How many `{Drop g}` witnesses shared type `type_id`'s `release_T` declares.
+    fn release_drop_cap_count(&self, type_id: TopLevelId) -> usize {
+        let check = crate::incremental::TypeCheck(type_id).get(self.compiler);
+        check.result.shared_drop_glue.as_ref().map_or(0, |glue| glue.drop_caps.len())
     }
 
     /// If `typ` resolves to a non-shared user-defined type (a product/sum whose inline layout may

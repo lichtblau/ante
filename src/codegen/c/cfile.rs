@@ -166,6 +166,14 @@ typedef double ante_f64;
         self.type_declarations += "typedef struct { _Alignas(max_align_t) size_t count; } AnteRcHeader;\n";
         self.type_declarations += "#define ANTE_RC_HEADER_SIZE (sizeof(AnteRcHeader))\n";
 
+        // The count a block wears between "the last reference went away" and `FreeShared`. During
+        // that window a user `Drop` impl is running, and it can still see the handle -- so it can
+        // copy it somewhere that outlives the free. The count cannot say so on its own: a plain 0
+        // is the immortal static sentinel, which retain deliberately ignores. The dying block
+        // gets its own value instead, so a retain during teardown is recognizable, and fatal:
+        // resurrection is a use-after-free the moment the block is freed a few instructions later.
+        self.type_declarations += "#define ANTE_RC_DYING ((size_t)-1)\n";
+
         self.function_declarations += "void* malloc(size_t);\n";
         // `free` is declared here (matching the stdlib FFI's `Unit free(void*)`) so `FreeShared`
         // can call it even when the program imports no `Std.C.free` of its own.
@@ -173,6 +181,28 @@ typedef double ante_f64;
         self.function_declarations += "void* memcpy(void*, void*, size_t);\n";
         self.function_declarations += "void* memset(void*, int, size_t);\n";
         self.function_declarations += "double fmod(double, double);\n";
+
+        // Declared rather than included (stdio.h/stdlib.h would clash with source `extern`s), and
+        // deliberately not through `puts`/`fputs`/`fwrite`: `Std.C` binds those under their real C
+        // names, so declaring them here is a conflicting redeclaration for any program that imports
+        // them. `write`, `fflush` and `abort` it does not bind.
+        //
+        // The message goes to fd 2 (unbuffered), but `abort` discards whatever the program itself
+        // has buffered on stdout -- including the output of the `Drop` impl that just ran, which is
+        // the context that makes the message legible. So flush every stream first.
+        self.function_declarations += "long write(int, const void*, unsigned long);\n";
+        self.function_declarations += "int fflush(void*);\n";
+        self.function_declarations += "void abort(void);\n";
+        self.function_declarations += "\
+static void ante_rc_resurrected(void) {
+    static const char ante_rc_msg[] = \"ante: a shared value was resurrected: its refcount reached \
+zero and its Drop impl copied the handle back out. The block is freed when the impl returns, so the \
+copy would dangle.\\n\";
+    fflush(0);
+    write(2, ante_rc_msg, sizeof(ante_rc_msg) - 1);
+    abort();
+}
+";
         self
     }
 }

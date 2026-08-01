@@ -7,12 +7,10 @@ use crate::{
     iterator_extensions::mapvec,
     parser::{
         cst::{self, Name, TopLevelItemKind},
-        ids::TopLevelId,
+        desugar_context::DesugarContext,
+        ids::{NameId, TopLevelId},
     },
-    type_inference::{
-        dependency_graph::TypeCheckResult,
-        types::{Type, TypeBindings},
-    },
+    type_inference::types::{Type, TypeBindings},
 };
 
 #[derive(Debug)]
@@ -42,53 +40,66 @@ impl TopLevelId {
     {
         let result = TypeCheck(self).get(compiler);
         let (item, item_context) = GetItem(self).get(compiler);
+        let constructor_type = |name| result.get_generalized(name);
+        build_type_body(&item.kind, &item_context, arguments, &result.bindings, constructor_type)
+    }
+}
 
-        let TopLevelItemKind::TypeDefinition(type_definition) = &item.kind else {
-            panic!("type_body: passed type_id is not a type!")
-        };
+/// Assemble a type's body from its constructors' types.
+///
+/// Split out of [`TopLevelId::type_body`] so the checker can reach it while the type's own
+/// `TypeCheck` query is still running -- querying it there would be an incremental cycle, and the
+/// constructor types it wants are the ones the checker just computed. `constructor_type` supplies
+/// each constructor's generalized type; everything else is read from the parsed item.
+pub(crate) fn build_type_body(
+    kind: &TopLevelItemKind, item_context: &DesugarContext, arguments: Option<&[Type]>, bindings: &TypeBindings,
+    constructor_type: impl Fn(NameId) -> Type,
+) -> TypeBody {
+    let TopLevelItemKind::TypeDefinition(type_definition) = kind else {
+        panic!("type_body: passed type_id is not a type!")
+    };
 
-        match &type_definition.body {
-            cst::TypeDefinitionBody::Struct(_) if type_definition.kind.is_effect() => {
-                let type_name = item_context[type_definition.name].clone();
-                TypeBody::Product { type_name, fields: Vec::new() }
-            },
-            cst::TypeDefinitionBody::Struct(fields) => {
-                // This'd be easier with an explicit type data field
-                let constructor_type = result.get_generalized(type_definition.name);
-                let constructor = apply_type_constructor(&constructor_type, arguments, &result);
-                let field_types = constructor.function_parameter_types();
+    match &type_definition.body {
+        // An effect's declaration body is not a real struct: it declares operations, and the
+        // type itself carries no fields to tear down.
+        cst::TypeDefinitionBody::Struct(_) if type_definition.kind.is_effect() => {
+            let type_name = item_context[type_definition.name].clone();
+            TypeBody::Product { type_name, fields: Vec::new() }
+        },
+        cst::TypeDefinitionBody::Struct(fields) => {
+            // This'd be easier with an explicit type data field
+            let constructor = apply_type_constructor(&constructor_type(type_definition.name), arguments, bindings);
+            let field_types = constructor.function_parameter_types();
 
-                assert_eq!(fields.len(), field_types.len());
-                let fields = mapvec(fields.iter().zip(field_types), |((field_name, _), typ)| {
-                    (item_context[*field_name].clone(), typ)
-                });
+            assert_eq!(fields.len(), field_types.len());
+            let fields = mapvec(fields.iter().zip(field_types), |((field_name, _), typ)| {
+                (item_context[*field_name].clone(), typ)
+            });
 
-                let type_name = item_context[type_definition.name].clone();
+            let type_name = item_context[type_definition.name].clone();
+            TypeBody::Product { type_name, fields }
+        },
+        cst::TypeDefinitionBody::Enum(variants) => {
+            let mut variants = mapvec(variants, |(name, _)| {
+                let constructor = apply_type_constructor(&constructor_type(*name), arguments, bindings);
+                let fields: Vec<_> = constructor.function_parameter_types().collect();
+                (item_context[*name].clone(), fields)
+            });
+            if variants.len() == 1 {
+                let (type_name, fields) = variants.pop().unwrap();
+                let fields = mapvec(fields.into_iter().enumerate(), |(i, field)| (Arc::new(i.to_string()), field));
+
                 TypeBody::Product { type_name, fields }
-            },
-            cst::TypeDefinitionBody::Enum(variants) => {
-                let mut variants = mapvec(variants, |(name, _)| {
-                    let constructor_type = result.get_generalized(*name);
-                    let constructor = apply_type_constructor(&constructor_type, arguments, &result);
-                    let fields: Vec<_> = constructor.function_parameter_types().collect();
-                    (item_context[*name].clone(), fields)
-                });
-                if variants.len() == 1 {
-                    let (type_name, fields) = variants.pop().unwrap();
-                    let fields = mapvec(fields.into_iter().enumerate(), |(i, field)| (Arc::new(i.to_string()), field));
-
-                    TypeBody::Product { type_name, fields }
-                } else {
-                    TypeBody::Sum(variants)
-                }
-            },
-            // Type aliases are expanded away wherever they are referenced in name resolution, so `type_body`
-            // should never be queried for one. `Error` falls through to the same harmless filler.
-            cst::TypeDefinitionBody::Alias(_) | cst::TypeDefinitionBody::Error => {
-                let type_name = item_context[type_definition.name].clone();
-                TypeBody::Product { type_name, fields: Vec::new() }
-            },
-        }
+            } else {
+                TypeBody::Sum(variants)
+            }
+        },
+        // Type aliases are expanded away wherever they are referenced in name resolution, so `type_body`
+        // should never be queried for one. `Error` falls through to the same harmless filler.
+        cst::TypeDefinitionBody::Alias(_) | cst::TypeDefinitionBody::Error => {
+            let type_name = item_context[type_definition.name].clone();
+            TypeBody::Product { type_name, fields: Vec::new() }
+        },
     }
 }
 
@@ -97,8 +108,8 @@ impl TopLevelId {
 ///
 // This assumes constructor args are in the same order as the type args.
 // This should be guaranteed by [TypeChecker::build_constructor_type].
-pub(crate) fn apply_type_constructor(typ: &Type, args: Option<&[Type]>, types: &TypeCheckResult) -> Type {
-    let expected_generic_count = match typ.follow(&types.bindings) {
+pub(crate) fn apply_type_constructor(typ: &Type, args: Option<&[Type]>, bindings: &TypeBindings) -> Type {
+    let expected_generic_count = match typ.follow(bindings) {
         Type::Forall(generics, _) => generics.len(),
         _ => 0,
     };
@@ -125,7 +136,7 @@ pub(crate) fn apply_type_constructor(typ: &Type, args: Option<&[Type]>, types: &
         None if expected_generic_count == 0 => typ.clone(),
         None => {
             // TODO: This should be an error in the future
-            let Type::Forall(generics, _) = typ.follow(&types.bindings) else { unreachable!() };
+            let Type::Forall(generics, _) = typ.follow(bindings) else { unreachable!() };
             let args = mapvec(generics.iter(), |_| Type::ERROR);
             typ.apply_type(&args, &no_type_var_bindings)
         },

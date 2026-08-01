@@ -425,7 +425,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
     /// inserted in order of `parameter_index` (matching the ordering of `actual.parameters`
     /// traversal in [`Self::implicit_parameter_coercion`]), later insertions see earlier ones
     /// already in place and `parameter_index` is directly the correct insertion position.
-    fn delay_find_implicit_value(
+    pub(super) fn delay_find_implicit_value(
         &mut self, target_type: &Type, parameter_index: usize, function: ExprId, call: Option<ExprId>,
     ) -> ExprId {
         let location = function.locate(self);

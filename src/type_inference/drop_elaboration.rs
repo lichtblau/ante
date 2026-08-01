@@ -19,15 +19,16 @@
 use std::sync::Arc;
 
 use crate::{
-    diagnostics::Location,
-    incremental::{ExportedDefinitions, GetItemRaw, VisibleImplicits},
+    diagnostics::{Location, SharedLeakReason},
+    incremental::{ExportedDefinitions, GetItemRaw, Resolve, VisibleImplicits},
+    iterator_extensions::mapvec,
     name_resolution::{Origin, namespace::SourceFileId},
     parser::{
         cst::{self, Expr, ReferenceKind},
         ids::{ExprId, NameId, PatternId, TopLevelId, TopLevelName},
     },
     type_inference::{
-        TypeChecker,
+        SharedDropGlue, SharedLeak, TypeChecker,
         affine::{MovePath, MoveTracker},
         errors::TypeErrorKind,
         generics::Generic,
@@ -386,7 +387,7 @@ impl TypeChecker<'_, '_> {
         if fields.is_empty() {
             // Not a product: derive a sum drop (an exhaustive match dropping each variant's
             // payloads) if it is an enum; anything else is skipped (leak).
-            return self.synthesize_sum_drop(place, typ, None, location);
+            return self.synthesize_sum_drop(place, typ, None, location, None);
         }
         let mut ordered: Vec<(String, Type, u32)> =
             fields.iter().map(|(name, (typ, index))| (name.to_string(), typ.clone(), *index)).collect();
@@ -908,14 +909,254 @@ impl TypeChecker<'_, '_> {
         name.local_name_id == NameId::RELEASE_FUNCTION
     }
 
-    /// The generalized type of a shared type's `release_T`: `forall <generics>. <SharedType> -> Unit`
-    /// (the handle is passed by value -- it is a Copy pointer). `release_T` is not a parsed item, so
-    /// inference computes its type here on demand ([Self::type_of_top_level_name] intercepts the
-    /// reserved name), which lets release calls type-check and instantiate like any generic call.
-    pub(super) fn release_function_generalized_type(&self, type_id: TopLevelId) -> Type {
+    /// The stable [TopLevelName] of a shared type's synthesized `Drop` impl.
+    pub(super) fn is_drop_impl_name(name: TopLevelName) -> bool {
+        name.local_name_id == NameId::DROP_IMPL
+    }
+
+    /// The generalized type of a shared type's `release_T`:
+    /// `forall <generics>. fn <SharedType> {Drop g}... -> Unit` (the handle is passed by value -- it
+    /// is a Copy pointer). `release_T` is not a parsed item, so inference computes its type here on
+    /// demand ([Self::type_of_top_level_name] intercepts the reserved name), which lets release
+    /// calls type-check and instantiate like any generic call.
+    ///
+    /// The `{Drop g}` parameters exist because tearing an owned generic payload down
+    /// needs a witness for it, and a release function is called from compiler-inserted points
+    /// where no dictionary could be threaded implicitly -- so it takes them the way every other
+    /// generic function does, as implicit parameters that implicit search fills in per call site.
+    /// Only the generics the pointee actually owns get one ([`Self::release_drop_constraints`]), so
+    /// a type that merely points at its generic pays nothing.
+    pub(super) fn release_function_generalized_type(&mut self, type_id: TopLevelId) -> Type {
+        let Some((data_type, generics)) = self.shared_type_and_generics(type_id) else { return Type::ERROR };
+        let mut parameters = vec![ParameterType::explicit(data_type)];
+        parameters.extend(self.release_drop_parameters(type_id));
+        let fn_type = Type::Function(Arc::new(FunctionType {
+            parameters,
+            environment: Type::NO_CLOSURE_ENV,
+            return_type: Type::UNIT,
+            // Pure: a release decrements, and at zero runs the pointee's `Drop` impl and tears its
+            // fields down. `Drop.drop` is declared `fn (mut t) -> Unit` with no `can` clause, so
+            // even a user-written impl cannot perform an effect from in here.
+            effects: Type::pure(),
+        }));
+        if generics.is_empty() { fn_type } else { Type::Forall(Arc::new(generics), Arc::new(fn_type)) }
+    }
+
+    /// The generalized type of a shared type's synthesized `Drop` impl: `forall <generics>.
+    /// Drop <SharedType>`, or `forall <generics>. fn {Drop g}... -> Drop <SharedType>` when the
+    /// pointee owns generics -- an impl with constraints is a function returning the ability type,
+    /// exactly as `drop_vec {Drop t}: Drop (Vec t)` is. Like `release_T` this is not a parsed item,
+    /// so its type is computed on demand when implicit search picks the witness up.
+    ///
+    /// The witness is what makes a container of handles release its elements: `Vec`'s own `Drop`
+    /// impl carries a `{Drop t}` constraint, and until now nothing satisfied `Drop Node` for a
+    /// shared `Node` -- so a `Vec Node` field of a shared pointee freed its buffer and stranded
+    /// every subtree hanging off it.
+    pub(super) fn drop_impl_generalized_type(&mut self, type_id: TopLevelId) -> Type {
+        let Some((data_type, generics)) = self.shared_type_and_generics(type_id) else { return Type::ERROR };
+        let drop_ability = Type::UserDefined(Origin::TopLevelDefinition(self.get_drop_type_name()));
+        let mut drop_of_t = Type::Application(Arc::new(drop_ability), Arc::new(vec![data_type]));
+
+        // The impl calls `release_T`, so it needs every witness `release_T` does.
+        let parameters = self.release_drop_parameters(type_id);
+        if !parameters.is_empty() {
+            drop_of_t = Type::Function(Arc::new(FunctionType {
+                parameters,
+                environment: Type::NO_CLOSURE_ENV,
+                return_type: drop_of_t,
+                // A constrained impl is a function that builds a dictionary; building one performs
+                // nothing. The witness goes through ordinary trait dispatch, so it takes the
+                // uniform convention: pure here, empty-tuple evidence appended by `convert_type`.
+                effects: Type::pure(),
+            }));
+        }
+        if generics.is_empty() { drop_of_t } else { Type::Forall(Arc::new(generics), Arc::new(drop_of_t)) }
+    }
+
+    /// `release_T`'s implicit parameters: one `{Drop g}` per generic the pointee owns.
+    fn release_drop_parameters(&mut self, type_id: TopLevelId) -> Vec<ParameterType> {
+        let constraints = self.release_drop_constraints(type_id);
+        if constraints.is_empty() {
+            return Vec::new();
+        }
+        let drop_ability = Type::UserDefined(Origin::TopLevelDefinition(self.get_drop_type_name()));
+        constraints
+            .into_iter()
+            .map(|generic| {
+                let constraint =
+                    Type::Application(Arc::new(drop_ability.clone()), Arc::new(vec![Type::Generic(generic)]));
+                ParameterType::implicit(constraint)
+            })
+            .collect()
+    }
+
+    /// The generics a shared type's pointee owns -- the ones whose values it holds and must
+    /// therefore tear down -- in declaration order. These are exactly the generics `release_T`
+    /// needs a `{Drop g}` witness for.
+    ///
+    /// Ownership here is the same question drop elaboration asks everywhere else: a value held
+    /// behind a reference or a raw `Ptr` is borrowed, not owned, so its element needs no witness
+    /// (and `Ptr` is the manual-management escape hatch besides). A closure's environment is
+    /// released wholesale rather than slot by slot, so a function-typed field owns no generic that
+    /// this walk can name.
+    pub(super) fn release_drop_constraints(&self, type_id: TopLevelId) -> Vec<Generic> {
+        let Some((_, generics)) = self.shared_type_and_generics(type_id) else { return Vec::new() };
+        if generics.is_empty() {
+            return Vec::new();
+        }
+
+        let mut owned = Vec::new();
+        for field in self.declared_field_types(type_id) {
+            self.collect_owned_generics(&field, &mut owned);
+        }
+        // Declaration order: the parameter order `release_T`'s call sites and its MIR must agree on.
+        generics.into_iter().filter(|generic| owned.contains(generic)).collect()
+    }
+
+    /// Every field / variant payload type of a type definition, converted from its CST against its
+    /// own name resolution and left in terms of its own declared generics.
+    ///
+    /// Deliberately not `type_body`, which reads these out of the type's finished `TypeCheck`:
+    /// this is asked of other items' types while implicit search picks up their synthesized `Drop`
+    /// witnesses, and running that search is part of a shared type's own `TypeCheck`. Two shared
+    /// types in scope of each other would then each demand the other's `TypeCheck` -- a cycle.
+    /// Name resolution answers the question just as well and depends on nothing downstream of it.
+    fn declared_field_types(&self, type_id: TopLevelId) -> Vec<Type> {
+        let (item, _) = GetItemRaw(type_id).get(self.compiler);
+        let cst::TopLevelItemKind::TypeDefinition(type_definition) = &item.kind else { return Vec::new() };
+        let resolve = Resolve(type_id).get(self.compiler);
+
+        let types: Vec<&cst::Type> = match &type_definition.body {
+            cst::TypeDefinitionBody::Struct(fields) => fields.iter().map(|(_, typ)| typ).collect(),
+            cst::TypeDefinitionBody::Enum(variants) => {
+                variants.iter().flat_map(|(_, payloads)| payloads.iter()).collect()
+            },
+            cst::TypeDefinitionBody::Alias(_) | cst::TypeDefinitionBody::Error => Vec::new(),
+        };
+
+        let mut local_kinds = TypeChecker::local_kinds_from_generics(&type_definition.generics);
+        let mut next_id = self.next_type_variable_id.get();
+        let converted = mapvec(&types, |typ| {
+            Type::from_cst_type(typ, &resolve, self.compiler, &mut next_id, &mut local_kinds, false, false)
+        });
+        self.next_type_variable_id.set(next_id);
+        converted
+    }
+
+    fn collect_owned_generics(&self, typ: &Type, out: &mut Vec<Generic>) {
+        match self.follow_type(typ) {
+            Type::Generic(generic) => {
+                if !out.contains(generic) {
+                    out.push(generic.clone());
+                }
+            },
+            Type::Application(constructor, arguments) if !self.type_is_reference_or_pointer(typ) => {
+                let (constructor, arguments) = (constructor.clone(), arguments.clone());
+                self.collect_owned_generics(&constructor, out);
+                for argument in arguments.iter() {
+                    self.collect_owned_generics(argument, out);
+                }
+            },
+            Type::Tuple(elements) => {
+                let elements = elements.clone();
+                for element in elements.iter() {
+                    self.collect_owned_generics(element, out);
+                }
+            },
+            _ => (),
+        }
+    }
+
+    /// True when `typ` is a shared type whose `release_T` declares `{Drop g}` witnesses.
+    pub(super) fn release_wants_witnesses(&self, typ: &Type) -> bool {
+        self.shared_type_top_level_id(typ).is_some_and(|type_id| !self.release_drop_constraints(type_id).is_empty())
+    }
+
+    /// The witnesses a release of a value of type `typ` needs, as `Drop <payload>` ability types --
+    /// `release_T`'s implicit parameters with the type's generics substituted by `typ`'s arguments.
+    fn release_witness_types(&mut self, typ: &Type) -> Vec<Type> {
+        let Some(type_id) = self.shared_type_top_level_id(typ) else { return Vec::new() };
+        let constraints = self.release_drop_constraints(type_id);
+        if constraints.is_empty() {
+            return Vec::new();
+        }
+        let Some((_, generics)) = self.shared_type_and_generics(type_id) else { return Vec::new() };
+        let Type::Application(_, arguments) = self.follow_type(typ) else { return Vec::new() };
+        let arguments = arguments.clone();
+
+        let drop_ability = Type::UserDefined(Origin::TopLevelDefinition(self.get_drop_type_name()));
+        constraints
+            .iter()
+            .filter_map(|generic| {
+                let index = generics.iter().position(|declared| declared == generic)?;
+                let argument = arguments.get(index)?.clone();
+                Some(Type::Application(Arc::new(drop_ability.clone()), Arc::new(vec![argument])))
+            })
+            .collect()
+    }
+
+    /// Resolve the `{Drop g}` witnesses a shared rvalue argument's post-call release will need,
+    /// and leave them in the `release_witnesses` side table for the MIR builder.
+    ///
+    /// A shared rvalue handed to a borrowing parameter stays the caller's to tear down: the callee
+    /// never releases it, so the caller releases it once the call returns. The builder emits that
+    /// release from the argument's type alone -- there is no synthesized call for implicit search to
+    /// run on -- so a `release_T` wanting witnesses has to have them resolved here, at the one point
+    /// where the implicit scope holding them is still open.
+    ///
+    /// Whether the callee's parameter actually borrows is not settled until the callee's inference
+    /// finishes (it may be in this very SCC), so the witnesses are resolved for every non-place
+    /// shared argument of a call to a plain function. Constructor arguments are excluded: they are
+    /// moved into the value being built and the caller never releases them. Over-resolving is free
+    /// at runtime -- an argument the builder never releases just never lowers these expressions --
+    /// but it does mean a function passing a freshly-built shared value to another function needs
+    /// that value's `{Drop g}` witnesses in scope, whether or not the release materializes.
+    pub(super) fn record_release_witnesses(&mut self, call: &cst::Call) {
+        if !self.drop_elaboration_active() || !self.callee_may_borrow(call.function) {
+            return;
+        }
+        for argument in &call.arguments {
+            if argument.is_implicit || self.is_place_expr(argument.expr) {
+                continue;
+            }
+            let typ = self.expr_types[&argument.expr].clone();
+            let witness_types = self.release_witness_types(&typ);
+            if witness_types.is_empty() {
+                continue;
+            }
+            let witnesses = mapvec(&witness_types, |witness_type| {
+                self.delay_find_implicit_value(witness_type, 0, argument.expr, None)
+            });
+            self.current_extended_context_mut().push_release_witnesses(argument.expr, witnesses);
+        }
+    }
+
+    /// True when a call's callee could have borrowing parameters -- a direct reference to a
+    /// top-level function. A constructor (whose item is the type definition) owns its arguments, and
+    /// an indirect callee has no mask the builder could read, so neither leaves the caller a release
+    /// to emit.
+    fn callee_may_borrow(&self, function: ExprId) -> bool {
+        let callee_path = match self.resolved_expr(function).as_ref() {
+            Expr::Variable(path) => *path,
+            _ => return false,
+        };
+        let Some(Origin::TopLevelDefinition(name)) = self.path_origin(callee_path) else { return false };
+        let (item, _) = GetItemRaw(name.top_level_item).get(self.compiler);
+        !matches!(item.kind, cst::TopLevelItemKind::TypeDefinition(_))
+    }
+
+    /// A place expression -- one the MIR builder retains rather than owns outright. Mirrors the
+    /// builder's own test at its borrowing-argument sites.
+    fn is_place_expr(&self, expr: ExprId) -> bool {
+        matches!(self.resolved_expr(expr).as_ref(), Expr::Variable(_) | Expr::MemberAccess(_))
+    }
+
+    /// A type definition applied to its own generics (`T`, or `T g`), plus those generics.
+    /// The shape both synthesized names above are stated in terms of.
+    fn shared_type_and_generics(&self, type_id: TopLevelId) -> Option<(Type, Vec<Generic>)> {
         let (item, _) = GetItemRaw(type_id).get(self.compiler);
         let cst::TopLevelItemKind::TypeDefinition(td) = &item.kind else {
-            return Type::ERROR;
+            return None;
         };
         let type_name = TopLevelName::new(type_id, td.name);
         let mut data_type = Type::UserDefined(Origin::TopLevelDefinition(type_name));
@@ -924,15 +1165,7 @@ impl TypeChecker<'_, '_> {
             let generic_types = generics.iter().map(|g| Type::Generic(g.clone())).collect::<Vec<_>>();
             data_type = Type::Application(Arc::new(data_type), Arc::new(generic_types));
         }
-        let fn_type = Type::Function(Arc::new(FunctionType {
-            parameters: vec![ParameterType::explicit(data_type)],
-            environment: Type::NO_CLOSURE_ENV,
-            return_type: Type::UNIT,
-            // A release runs no user code: it decrements, and at zero releases the pointee's own
-            // shared fields and frees the block. Nothing in that can perform an effect.
-            effects: Type::pure(),
-        }));
-        if generics.is_empty() { fn_type } else { Type::Forall(Arc::new(generics), Arc::new(fn_type)) }
+        Some((data_type, generics))
     }
 
     /// Synthesize a call `release_T <place>` releasing a shared handle by value.
@@ -1235,8 +1468,14 @@ impl TypeChecker<'_, '_> {
     /// variant-qualified path is moved are left alone -- sound because `place.Some#0` can only be
     /// moved on executions where the tag was `Some`. Returns `None` when no variant payload needs
     /// dropping (pruning).
+    ///
+    /// `coverage`, set only by the shared-glue walk, collects one flag per payload -- variants in
+    /// declaration order, payloads within a variant in order -- recording whether that payload's
+    /// teardown was synthesized. This is the same order the pointee's fields arrive in at
+    /// [`Self::check_shared_release_glue`], which pairs the flags back up with their locations.
     fn synthesize_sum_drop(
         &mut self, place: &MovePath, typ: &Type, tracker: Option<&MoveTracker>, location: &Location,
+        mut coverage: Option<&mut Vec<bool>>,
     ) -> Option<ExprId> {
         let typ = self.follow_type(typ).clone();
         let (type_name, args) = match &typ {
@@ -1255,7 +1494,7 @@ impl TypeChecker<'_, '_> {
         let cst::TypeDefinitionBody::Enum(raw_variants) = &type_definition.body else { return None };
         let raw_variant_names: Vec<NameId> = raw_variants.iter().map(|(name, _)| *name).collect();
 
-        let body = type_name.top_level_item.type_body(args.as_deref().map(|a| &a[..]), self.compiler);
+        let body = self.type_body_of(type_name.top_level_item, args.as_deref().map(|a| &a[..]));
         let super::type_body::TypeBody::Sum(variants) = body else { return None };
         if raw_variant_names.len() != variants.len() {
             return None;
@@ -1289,6 +1528,9 @@ impl TypeChecker<'_, '_> {
                     },
                     _ => self.try_synthesize_drop_for_place(&payload_place, payload_type, location),
                 };
+                if let Some(coverage) = coverage.as_deref_mut() {
+                    coverage.push(drop.is_some());
+                }
                 drops.extend(drop);
             }
 
@@ -1380,7 +1622,7 @@ impl TypeChecker<'_, '_> {
 
         let fields = self.get_field_types(&typ, None);
         let result = if fields.is_empty() {
-            self.synthesize_sum_drop(place, &typ, Some(tracker), location)
+            self.synthesize_sum_drop(place, &typ, Some(tracker), location, None)
         } else {
             let mut ordered: Vec<(String, Type, u32)> =
                 fields.iter().map(|(name, (typ, index))| (name.to_string(), typ.clone(), *index)).collect();
@@ -1541,33 +1783,6 @@ impl TypeChecker<'_, '_> {
         self.function_local_names.iter().any(|locals| locals.contains(&name))
     }
 
-    /// Reject a user `Drop` impl whose target is a `shared` type: shared handles are
-    /// Copy and never tracked, so there is no coherent point to run the impl. Only checked
-    /// under `--auto-drop` (the whole Drop-semantics package).
-    pub(super) fn reject_shared_drop_impl(&mut self, impl_type: &Type, pattern: PatternId) {
-        if !self.auto_drop {
-            return;
-        }
-        let mut typ = self.follow_type(impl_type).clone();
-        // Impls with implicit constraints are functions returning the ability type.
-        if let Type::Function(function) = &typ {
-            typ = self.follow_type(&function.return_type).clone();
-        }
-        let Type::Application(constructor, args) = &typ else { return };
-        let drop_type_name = self.get_drop_type_name();
-        let is_drop = matches!(
-            self.follow_type(constructor),
-            Type::UserDefined(Origin::TopLevelDefinition(name)) if *name == drop_type_name
-        );
-        if is_drop
-            && let Some(arg) = args.first()
-            && self.is_shared_user_defined(arg)
-        {
-            let location = self.current_context().pattern_location(pattern).clone();
-            self.compiler.accumulate(crate::diagnostics::Diagnostic::DropImplForSharedType { location });
-        }
-    }
-
     /// Returns the TopLevelName for the Prelude's `Drop.drop` method, caching it.
     pub(super) fn get_drop_method_name(&mut self) -> TopLevelName {
         if let Some(name) = self.drop_method_name {
@@ -1651,6 +1866,418 @@ impl TypeChecker<'_, '_> {
                 Type::Primitive(super::types::PrimitiveType::Reference(_) | super::types::PrimitiveType::Pointer)
             ),
             _ => false,
+        }
+    }
+
+    /// Give a `shared type` whose pointee the MIR release glue cannot fully tear down a
+    /// synthesized teardown instead, and warn about whatever teardown neither can perform.
+    ///
+    /// The hand-built glue in the MIR builder runs where no inference context exists, so it can
+    /// only chase shared handles; a `Drop` impl to call or a closure environment to release is
+    /// invisible to it. The decision procedure it is missing is the elaborator's own
+    /// ([`Self::try_synthesize_drop_for_place`]), so the teardown is built here, at the type's
+    /// definition -- the one resolution point that cannot depend on which file releases first.
+    /// `Drop` impls for the field types must therefore be visible here; a field whose teardown
+    /// resolves nowhere keeps leaking, and keeps its warning.
+    ///
+    /// Only types the glue actually falls short on take the synthesized path: the rest keep the
+    /// hand-built walk and its pointer-chasing release loop, which the fixed expression tree
+    /// synthesized here has no way to express (a self-recursive glue-bearing type therefore
+    /// releases its tail recursively -- one frame per node).
+    ///
+    /// `fields` are the pointee's field types -- the parameters of every constructor, in
+    /// declaration order -- each paired with the location of its type in the definition. They
+    /// are passed in because they carry the location of each field's type in the definition, which
+    /// is what the diagnostic points at and [`TopLevelId::type_body`] does not record.
+    pub(super) fn check_shared_release_glue(
+        &mut self, self_type: &Type, definition: &Location, fields: &[(Location, Type)],
+    ) {
+        if !self.auto_drop {
+            return;
+        }
+        let Some(type_id) = self.current_item else { return };
+
+        // `release_T`'s `{Drop g}` parameters, as local implicits. They must be in scope before the
+        // classifier runs, not just before the glue: whether a `Vec g` field can be torn down at
+        // all is the question of whether `drop_vec`'s own `{Drop t}` discharges here, and that is
+        // this capability's whole job.
+        let drop_caps = self.bind_release_drop_capabilities(type_id, definition);
+
+        let gaps: Vec<Option<SharedLeak>> =
+            fields.iter().map(|(_, typ)| self.field_release_glue_gap(typ, 0)).collect();
+
+        // The user's own `Drop` impl for this type, if it wrote one. It runs first, at count zero
+        // -- so the glue exists for its sake even when the pointee has nothing else to tear down.
+        let user_drop_impl = self.user_shared_drop_impl(type_id);
+
+        // Every field the hand-built glue covers by itself, so nothing to synthesize.
+        //
+        // A constrained type is synthesized regardless of whether it has a gap to close: only the
+        // synthesized body can bind `release_T`'s `{Drop g}` parameters, and its signature declares
+        // them from the declaration alone -- so leaving it to the hand-built walk would make the two
+        // disagree on how many parameters `release_T` takes. The glue is at least as complete as the
+        // walk, so nothing is lost by taking it. (A type reaches here with capabilities and no gap
+        // when a field owns a generic through an impl this file cannot see -- an unimported
+        // `drop_vec` -- in which case the capabilities go unspent and the buffer leaks as it did
+        // before, silently.)
+        if gaps.iter().all(Option::is_none) && drop_caps.is_empty() && user_drop_impl.is_none() {
+            return;
+        }
+
+        let (glue, covered) = self.synthesize_shared_drop_glue(self_type, drop_caps, user_drop_impl, definition);
+
+        for (index, (location, _)) in fields.iter().enumerate() {
+            // Now torn down by the synthesized glue -- the gap the classifier found is closed.
+            if covered.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some((culprit, reason)) = gaps[index].clone() else { continue };
+            // The culprit is the type that actually owns the un-reclaimed data, which for a
+            // field of aggregate type is nested inside it (`boxed: Boxed` leaks through the
+            // `String` in `Boxed`). The location still points at the field: that is where the
+            // shared type can be changed.
+            let typ = self.type_to_string(&culprit);
+            let diagnostic =
+                crate::diagnostics::Diagnostic::SharedFieldLeaked { typ, reason, location: location.clone() };
+            self.compiler.accumulate(diagnostic);
+        }
+
+        if let Some(glue) = glue
+            && let Some(item) = self.current_item
+        {
+            self.shared_glue_types.insert(item, glue);
+        }
+    }
+
+    /// Synthesize the pointee teardown of a `shared type`: the drop a local of the pointee's
+    /// shape would get, projected through the handle. Products walk their fields in declaration
+    /// order; sums lower to an exhaustive match. Every component routes through
+    /// [`Self::try_synthesize_drop_for_place`], so user `Drop` impls are called, shared fields
+    /// become `release_U` calls, nested aggregates expand, and no-op components prune away --
+    /// this synthesis invents no drop semantics of its own.
+    ///
+    /// The receiver is the handle, not the pointee: the pointee's unboxed layout is not a nameable
+    /// type, and member access through a shared handle already derefs. Returns the glue (`None`
+    /// when nothing in the pointee could be torn down after all) and, per pointee field in
+    /// declaration order, whether its teardown made it into the body.
+    ///
+    /// A field that resolves to nothing is left alone -- it leaks, as before, and warns -- never
+    /// half-dropped: `MissingDropConstraint` is suppressed here, because an owned generic already
+    /// has its capability (`drop_caps`) and any other unbounded variable reaching here is a place
+    /// the definition genuinely cannot decide.
+    fn synthesize_shared_drop_glue(
+        &mut self, self_type: &Type, drop_caps: Vec<NameId>, user_drop_impl: Option<TopLevelName>,
+        location: &Location,
+    ) -> (Option<SharedDropGlue>, Vec<bool>) {
+        let (_, handle) = self.fresh_variable("shared_self", self_type.clone(), location.clone());
+        self.name_types.insert(handle, self_type.clone());
+        let place = MovePath::Variable(handle);
+
+        let old_suppress = std::mem::replace(&mut self.suppress_missing_drop_diagnostic, true);
+        let (fields_drop, covered) = self.synthesize_pointee_drop(&place, self_type, location);
+        self.suppress_missing_drop_diagnostic = old_suppress;
+
+        // The user's `Drop` impl runs first: the fields are still intact, so it can read them
+        // through the handle, which is exactly the guarantee a non-shared `Drop` impl has.
+        let user_drop =
+            user_drop_impl.map(|impl_name| self.synthesize_user_drop_call(handle, impl_name, self_type, location));
+
+        // A constrained type's `release_T` takes the capabilities whether or not the walk found
+        // anything to spend them on -- its signature already says so, and the call sites have
+        // already been checked against it. Give it a body regardless, so the two cannot disagree.
+        let body = match (user_drop, fields_drop) {
+            (Some(user_drop), Some(fields_drop)) => {
+                let seq = |expr| cst::SequenceItem { comments: Vec::new(), expr };
+                let sequence = Expr::Sequence(vec![seq(user_drop), seq(fields_drop)]);
+                Some(self.push_expr(sequence, Type::UNIT, location.clone()))
+            },
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) if !drop_caps.is_empty() => {
+                Some(self.push_expr(Expr::Literal(cst::Literal::Unit), Type::UNIT, location.clone()))
+            },
+            (None, None) => None,
+        };
+        (body.map(|body| SharedDropGlue { handle, drop_caps, body }), covered)
+    }
+
+    /// Synthesize `drop (mut <handle>) {<impl>}` -- the user's own `Drop` impl for this shared type,
+    /// called on the handle at count zero.
+    ///
+    /// The capability is passed explicitly. Implicit search would find the synthesized witness
+    /// instead (which is `release_T`, and would recurse forever); the user's impl is deliberately
+    /// not registered where search can reach it, so naming it here is the only way in -- and the
+    /// only place it is correct to run, since a shared handle's death is a decrement, not a death.
+    fn synthesize_user_drop_call(
+        &mut self, handle: NameId, impl_name: TopLevelName, self_type: &Type, location: &Location,
+    ) -> ExprId {
+        let handle_expr = self.synthesize_place_expr(&MovePath::Variable(handle), self_type, location);
+        let ref_type = self.next_type_variable();
+        let reference = cst::Reference { kind: ReferenceKind::Mut, rhs: handle_expr };
+        let ref_expr = self.push_expr(Expr::Reference(reference), ref_type, location.clone());
+
+        // The impl is instantiated by hand rather than reached through a fresh type variable: it is
+        // named, not searched for, so nothing else would record the generic instantiation the MIR
+        // builder needs to monomorphize it.
+        let (impl_type, instantiation) = self.type_and_bindings_of_top_level_name(&impl_name);
+        let impl_path = self.push_path(
+            cst::Path { components: vec![("drop_impl".to_string(), location.clone())] },
+            impl_type.clone(),
+            location.clone(),
+        );
+        let context = self.current_extended_context_mut();
+        context.insert_path_origin(impl_path, Origin::TopLevelDefinition(impl_name));
+        if let Some(bindings) = instantiation {
+            context.insert_instantiation(impl_path, bindings);
+        }
+        let impl_expr = self.push_expr(Expr::Variable(impl_path), impl_type.clone(), location.clone());
+
+        // A constrained impl (`impl drop_box {Drop t}: Drop (Box t)`) is a function returning the
+        // ability, so it has to be applied to its own witnesses before it is one. They resolve the
+        // same way the glue's other drops do -- through the `{Drop g}` capabilities `release_T`
+        // carries, which are in scope here.
+        let impl_expr = match self.follow_type(&impl_type).clone() {
+            Type::Function(function) => {
+                let arguments = function
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, parameter)| {
+                        let witness = self.delay_find_implicit_value(&parameter.typ, index, impl_expr, None);
+                        cst::Argument::implicit(witness)
+                    })
+                    .collect();
+                let call = Expr::Call(cst::Call { function: impl_expr, arguments });
+                self.push_expr(call, function.return_type.clone(), location.clone())
+            },
+            _ => impl_expr,
+        };
+
+        let drop_method = self.get_drop_method_name();
+        let callee_type = self.next_type_variable();
+        let callee_path = self.push_path(
+            cst::Path { components: vec![("drop".to_string(), location.clone())] },
+            callee_type.clone(),
+            location.clone(),
+        );
+        self.current_extended_context_mut().insert_path_origin(callee_path, Origin::TopLevelDefinition(drop_method));
+        let callee = self.push_expr(Expr::Variable(callee_path), callee_type, location.clone());
+
+        let call = cst::Call {
+            function: callee,
+            arguments: vec![cst::Argument::explicit(ref_expr), cst::Argument::implicit(impl_expr)],
+        };
+        let call_expr = self.push_expr(Expr::Call(call), Type::UNIT, location.clone());
+
+        let old_synthesizing = std::mem::replace(&mut self.synthesizing_drops, true);
+        let old_check = std::mem::replace(&mut self.suppress_move_check, true);
+        let old_record = std::mem::replace(&mut self.suppress_move_record, true);
+        self.check_expr(call_expr, &Type::UNIT, TypeErrorKind::General);
+        self.suppress_move_record = old_record;
+        self.suppress_move_check = old_check;
+        self.synthesizing_drops = old_synthesizing;
+
+        call_expr
+    }
+
+    /// The user-written `Drop` impl for the shared type being defined, if any.
+    fn user_shared_drop_impl(&self, type_id: TopLevelId) -> Option<TopLevelName> {
+        VisibleImplicits(type_id.source_file).get(self.compiler).shared_drop_impl(type_id)
+    }
+
+    /// Bind one local implicit per generic the pointee owns, so the glue can drop those payloads
+    /// through the capability -- the same `{Drop t}` a hand-written generic function would carry.
+    /// The MIR builder binds each of these names to the matching parameter of `release_T`, whose
+    /// signature declares them ([`Self::release_function_generalized_type`]).
+    fn bind_release_drop_capabilities(&mut self, type_id: TopLevelId, location: &Location) -> Vec<NameId> {
+        let parameters = self.release_drop_parameters(type_id);
+        let mut names = Vec::new();
+        for parameter in parameters {
+            let (_, name) = self.fresh_variable("drop_cap", parameter.typ.clone(), location.clone());
+            self.name_types.insert(name, parameter.typ);
+            self.add_implicit_name(name);
+            names.push(name);
+        }
+        names
+    }
+
+    /// The pointee walk itself: a product's fields, or a sum's variants. Dispatches the same two
+    /// ways [`Self::synthesize_structural_drop`] does, but reports per-field coverage back to the
+    /// caller's diagnostic.
+    fn synthesize_pointee_drop(
+        &mut self, place: &MovePath, self_type: &Type, location: &Location,
+    ) -> (Option<ExprId>, Vec<bool>) {
+        let fields = self.get_field_types(self_type, None);
+        if fields.is_empty() {
+            let mut covered = Vec::new();
+            let body = self.synthesize_sum_drop(place, self_type, None, location, Some(&mut covered));
+            return (body, covered);
+        }
+
+        let mut ordered: Vec<(String, Type, u32)> =
+            fields.iter().map(|(name, (typ, index))| (name.to_string(), typ.clone(), *index)).collect();
+        ordered.sort_unstable_by_key(|(_, _, index)| *index);
+
+        let mut drops = Vec::new();
+        let mut covered = Vec::new();
+        for (field_name, field_type, _) in ordered {
+            let field_place = MovePath::field(place.clone(), field_name);
+            let drop = self.try_synthesize_drop_for_place(&field_place, &field_type, location);
+            covered.push(drop.is_some());
+            drops.extend(drop);
+        }
+        let body = self.sequence_drops(drops, location);
+        (body, covered)
+    }
+
+    /// The gap between what dropping a value of `typ` requires and what a shared type's MIR
+    /// release glue can do for a field of the pointee. The returned type is the one that
+    /// actually owns the un-reclaimed data -- `typ` itself, or a type nested inside it.
+    ///
+    /// `None` -- the glue covers it: primitives own nothing, a directly-held shared handle
+    /// becomes a recursive `release_U` call, and a non-shared aggregate is walked inline in
+    /// search of more handles (`release_inline_value` in the MIR builder). `Some` -- the field
+    /// owns heap data the glue leaves behind.
+    ///
+    /// Two deliberate blind spots, both silent: a bare `Ptr` (the manual-management escape
+    /// hatch, whose Prelude `Drop` impl is empty by design) and a bare generic, whose teardown
+    /// depends on the instantiation and so cannot be decided at the definition site at all.
+    ///
+    /// Memoized per concrete type, like [`Self::type_needs_no_drop`] -- whose no-op proof is the
+    /// first thing it consults.
+    fn field_release_glue_gap(&mut self, typ: &Type, depth: u32) -> Option<SharedLeak> {
+        // Recursion guard, mirroring the structural expansion's. Answering "no gap" at the cap
+        // keeps a pathological type silent rather than warning about a field we stopped
+        // understanding.
+        if depth >= 16 {
+            return None;
+        }
+        let typ = self.follow_type(typ).clone();
+        if let Some(hit) = self.shared_glue_cache.get(&typ) {
+            return hit.clone();
+        }
+        let result = self.field_release_glue_gap_inner(&typ, depth);
+        if self.type_is_concrete(&typ) {
+            self.shared_glue_cache.insert(typ, result.clone());
+        }
+        result
+    }
+
+    fn field_release_glue_gap_inner(&mut self, typ: &Type, depth: u32) -> Option<SharedLeak> {
+        // Nothing to tear down at all: primitives, and (deliberately) references and `Ptr`.
+        if self.type_needs_no_drop(typ) {
+            return None;
+        }
+        // A directly-held handle already becomes a recursive `release_U` call. Whether *U's* own
+        // pointee leaks is U's definition's diagnostic, not this one's -- stopping here is what
+        // keeps a self-recursive shared type from walking itself forever.
+        //
+        // Unless `release_U` needs `{Drop g}` witnesses: the hand-built MIR walk has no way to
+        // supply those, so the call has to be synthesized here instead, where implicit search can.
+        // Reporting a gap is how that happens -- and it never becomes a warning, since a shared
+        // field always synthesizes its release, so the coverage check always closes it.
+        if self.is_shared_user_defined(typ) {
+            return self.release_wants_witnesses(typ).then(|| (typ.clone(), SharedLeakReason::DropImpl));
+        }
+        // The glue skips function-typed fields entirely, so a closure's reference-counted
+        // environment block is never released. A `NoClosureEnv` function is a bare code pointer
+        // and owns nothing.
+        if let Type::Function(_) = typ {
+            return self.is_heap_env_closure(typ).then(|| (typ.clone(), SharedLeakReason::ClosureEnv));
+        }
+        // Copy types never consult `Drop` impls (mirroring `try_synthesize_drop_for_place`), but
+        // a Copy aggregate can still hold shared handles -- fall through to the field walk.
+        if !self.type_is_copy(typ) {
+            if self.type_has_drop_impl(typ) {
+                return Some((typ.clone(), SharedLeakReason::DropImpl));
+            }
+            // A container whose element type is still generic (`Vec t` in `shared type Crate t`)
+            // is declined above for a reason that does not apply here: the impl's own `{Drop t}`
+            // cannot be discharged at a type definition, which has no implicit scope. Its buffer
+            // leaks for every instantiation, though -- the element type only decides whether
+            // anything leaks inside it -- so ask the question that does not need the element:
+            // does the type own a `Ptr`, the one shape no field walk can follow?
+            if !typ.free_vars(&self.bindings).is_empty()
+                && self.type_has_drop_impl_ignoring_constraints(typ)
+                && self.type_owns_pointer(typ, 0)
+            {
+                return Some((typ.clone(), SharedLeakReason::DropImpl));
+            }
+        }
+        // A non-shared aggregate is walked inline by the glue: recurse to find out whether
+        // anything inside it needs more than that walk can do.
+        let fields = self.get_field_types(typ, None);
+        if !fields.is_empty() {
+            let field_types: Vec<Type> = fields.values().map(|(typ, _)| typ.clone()).collect();
+            return field_types.iter().find_map(|field| self.field_release_glue_gap(field, depth + 1));
+        }
+        let variants = self.sum_variant_payload_types(typ)?;
+        variants.iter().flatten().find_map(|payload| self.field_release_glue_gap(payload, depth + 1))
+    }
+
+    /// Does some visible `Drop` impl match `typ`, ignoring whether the impl's own `{Drop x}`
+    /// constraints can be discharged here? [`Self::type_has_drop_impl`] answers the stricter
+    /// question the elaborator needs (an impl it would actually resolve); at a type definition
+    /// there is no implicit scope, so that question is always "no" for a generic container, and
+    /// the looser one is the only one that can be asked.
+    fn type_has_drop_impl_ignoring_constraints(&mut self, typ: &Type) -> bool {
+        let drop_type_name = self.get_drop_type_name();
+        let constructor = Type::UserDefined(Origin::TopLevelDefinition(drop_type_name));
+        let drop_of_t = Type::Application(Arc::new(constructor), Arc::new(vec![typ.clone()]));
+
+        let Some(item) = self.current_item else { return false };
+        let visible_implicits = VisibleImplicits(item.source_file).get(self.compiler);
+        let mut found = false;
+        visible_implicits.iter_possibly_matching_impls(&drop_of_t, |_name, name_id| {
+            let (name_type, _) = self.type_and_bindings_of_top_level_name(name_id);
+            if self.try_unify(&name_type, &drop_of_t).is_ok() {
+                found = true;
+                return true;
+            }
+            // An impl with constraints is a function returning the ability type.
+            if let Type::Function(f) = &name_type
+                && self.try_unify(&f.return_type.clone(), &drop_of_t).is_ok()
+            {
+                found = true;
+                return true;
+            }
+            false
+        });
+        found
+    }
+
+    /// True when a value of `typ` owns heap data behind a raw `Ptr`: the shape every owning
+    /// container uses to hold its buffer (`Vec`'s `data`, `String`'s bytes), and the one thing a
+    /// field walk can never follow -- a pointer carries no length and no ownership claim. Shared
+    /// handles do not count: the glue releases those. Neither do references, which borrow.
+    fn type_owns_pointer(&mut self, typ: &Type, depth: u32) -> bool {
+        if depth >= 16 {
+            return false;
+        }
+        let typ = self.follow_type(typ).clone();
+        if self.type_is_pointer(&typ) {
+            return true;
+        }
+        if self.type_is_reference_or_pointer(&typ) || self.is_shared_user_defined(&typ) {
+            return false;
+        }
+        // Checked before the field walk below, which sees through both constructors.
+        let fields = self.get_field_types(&typ, None);
+        if !fields.is_empty() {
+            let field_types: Vec<Type> = fields.values().map(|(typ, _)| typ.clone()).collect();
+            return field_types.iter().any(|field| self.type_owns_pointer(field, depth + 1));
+        }
+        match self.sum_variant_payload_types(&typ) {
+            Some(variants) => variants.iter().flatten().any(|payload| self.type_owns_pointer(payload, depth + 1)),
+            None => false,
+        }
+    }
+
+    /// True when `typ` is the raw `Ptr` primitive, applied (`Ptr t`) or bare.
+    fn type_is_pointer(&self, typ: &Type) -> bool {
+        let is_pointer = |typ: &Type| matches!(typ, Type::Primitive(super::types::PrimitiveType::Pointer));
+        match self.follow_type(typ) {
+            Type::Application(constructor, _) => is_pointer(self.follow_type(constructor)),
+            other => is_pointer(other),
         }
     }
 
@@ -1742,7 +2369,7 @@ impl TypeChecker<'_, '_> {
             },
             _ => return None,
         };
-        let body = type_name.top_level_item.type_body(args.as_deref().map(|args| &args[..]), self.compiler);
+        let body = self.type_body_of(type_name.top_level_item, args.as_deref().map(|args| &args[..]));
         let super::type_body::TypeBody::Sum(variants) = body else { return None };
         Some(variants.into_iter().map(|(_, payloads)| payloads).collect())
     }

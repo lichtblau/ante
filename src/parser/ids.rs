@@ -227,6 +227,12 @@ impl NameId {
     /// and name string are supplied directly by the synthesizer, never looked up through this id,
     /// so it needs no `name_locations` entry.
     pub const RELEASE_FUNCTION: NameId = NameId(u32::MAX);
+
+    /// Reserved local name id (within a `shared` type's own top-level item) for that type's
+    /// synthesized `Drop` impl -- the witness that makes a shared handle satisfy a `{Drop t}`
+    /// constraint, so a container of handles releases its elements. Same contract as
+    /// [`Self::RELEASE_FUNCTION`]: a stable key only, never looked up in `name_locations`.
+    pub const DROP_IMPL: NameId = NameId(u32::MAX - 1);
 }
 
 impl From<NameId> for usize {
