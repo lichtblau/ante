@@ -990,9 +990,11 @@ impl Builder {
             },
             mir::Instruction::Store { pointer, value } => {
                 let typ = mir.type_of_value(value, definition);
+                // The extra `*` must be woven into the declarator, not appended: a pointer to a
+                // function value is `ret (**)(params)`, never `ret (*)(params)*`.
                 self.write("*(");
-                self.write_type(&typ, "");
-                self.write("*)");
+                self.write_type(&typ, "*");
+                self.write(")");
                 self.write_value(pointer, mir);
                 self.write(" = ");
                 self.write_value(value, mir);
@@ -1104,6 +1106,8 @@ impl Builder {
                 } else {
                     // `T (**)(args)`
                     self.write_result_binding(id, definition);
+                    // As in `Store`: `*(T*)p` for a function-typed `T` must print as
+                    // `*(ret (**)(params))p`, so the `*` goes inside the declarator.
                     self.write("*(");
                     self.write_declarator(result, &|this| this.write("*"));
                     self.write(")");

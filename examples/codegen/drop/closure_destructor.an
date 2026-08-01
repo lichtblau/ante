@@ -1,0 +1,54 @@
+// An owning `move` closure is affine, so its env's non-`Copy` slots have
+// exactly one owner and that owner travels with the closure value. When the
+// value dies, drop elaboration extracts each owned slot out of the closure and
+// drops it -- a value-based teardown, so it fires wherever the closure really
+// dies, including a caller that received it from an escape.
+//
+// Previously the escaping case retracted its env-drop obligation and leaked
+// (examples/codegen/drop/move_capture_escape.an).
+//
+// The three escape shapes, plus nesting:
+//   1. returned, bound by the caller  (`greet`)
+//   2. assigned into an outer `var`, overwritten  (`slot`)
+//   3. captured by value into another closure's env  (`nested`) -- the destructor recurses,
+//      because slot 0 of `nested`'s env is itself an affine closure.
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+// The closure outlives this scope: `r` is moved into the env, and nothing here drops it.
+// (No return-type annotation: annotating a closure type erases its environment -- see AGENTS.md.)
+make_greeter (r: R) =
+    move fn () -> println r.tag
+
+// Slot 0 of the returned closure's env is `inner`, an affine closure whose own env owns `r`.
+make_nested (r: R) =
+    inner = make_greeter r
+    move fn () -> inner ()
+
+main () =
+    greet = make_greeter (R 1)
+    greet ()
+
+    var slot = make_greeter (R 2)
+    slot ()
+    // Overwriting drops the old closure -- and with it, `R 2`.
+    slot := make_greeter (R 3)
+    slot ()
+
+    nested = make_nested (R 4)
+    nested ()
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 1
+// 2
+// drop 2
+// 3
+// 4
+// drop 4
+// drop 3
+// drop 1

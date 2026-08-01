@@ -1,5 +1,7 @@
+// `move` because `y` escapes `foo` while capturing the owned parameter `x`,
+// which `foo` frees on return. The generalization this pins is unaffected.
 foo x =
-    y = fn _ -> x
+    y = move fn _ -> x
     y
 
 // args: -e ast-t --no-color

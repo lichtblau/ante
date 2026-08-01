@@ -69,12 +69,27 @@ impl TypeChecker<'_, '_> {
     /// Escape check. Any reference in the returned value pointing into a local this function frees
     /// on return is a dangling escape: reject it with `ReferenceEscapesScope` pointing at the
     /// reference. Propagation through bindings, constructors, and closure captures.
+    ///
+    /// Now a closure that escapes while borrowing a non-Copy owned capture is rejected here
+    /// too. It was exempt while captures were by-value bit-copies (those leak rather than dangle).
     pub(super) fn reject_escaping_origins(&mut self, returned: ExprId) {
         let (tail, _) = self.compute_origins(returned);
         let mut reported: Vec<Location> = Vec::new();
-        for origin in tail.iter().filter(|o| !o.capture_borrow) {
+        for origin in tail.iter() {
             if !self.origin_escapes(&origin.kind) {
                 continue;
+            }
+            // A `Copy` capture is a bit-copy in the env, never a borrow of this frame, so it
+            // cannot dangle: ability dictionaries (`{p: Print t}`), function values, `shared`
+            // handles and primitives all reach here. Only a non-`Copy` owned capture is a real
+            // borrow the closure would carry past its owner's death.
+            if origin.capture_borrow
+                && let OriginKind::Local(path) = &origin.kind
+            {
+                let typ = self.name_types[&path.root_variable()].clone();
+                if self.type_is_copy(&typ) {
+                    continue;
+                }
             }
             let location = origin
                 .location
@@ -312,7 +327,12 @@ impl TypeChecker<'_, '_> {
             if !self.lambda_captures_name(lambda_expr, name) {
                 continue;
             }
-            if let Some(recorded) = bindings.get(&name) {
+            // A `let`-bound owned local (`foo = "a" ++ "b"`) records an empty origin set for its
+            // binding -- it points nowhere. That is not "already handled": it is an owned capture, so
+            // an empty entry must fall through to the borrow arm below exactly like a parameter's
+            // absent entry. Treating `Some(&[])` as handled silently skipped every bound-then-captured
+            // local (`closure_return.an`), the escape check's last laundering hole.
+            if let Some(recorded) = bindings.get(&name).filter(|recorded| !recorded.is_empty()) {
                 // A captured binding that already points somewhere (`r = ref local`) carries that
                 // origin into the closure -- a reference alias, escape-relevant.
                 for origin in recorded.clone() {
@@ -379,7 +399,7 @@ impl TypeChecker<'_, '_> {
         }
     }
 
-    fn name_is_reference_typed(&self, name: NameId) -> bool {
+    pub(super) fn name_is_reference_typed(&self, name: NameId) -> bool {
         self.name_types.get(&name).is_some_and(|typ| {
             typ.reference_element(&self.bindings).is_some() || typ.pointer_element(&self.bindings).is_some()
         })

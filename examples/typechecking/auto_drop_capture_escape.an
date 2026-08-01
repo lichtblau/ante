@@ -1,0 +1,21 @@
+get_closure () =
+    foo = "a" ++ "b"
+    stuff = fn () -> println foo
+    stuff
+
+main () =
+    f = get_closure ()
+    f ()
+
+// args: --check --no-color --auto-drop
+// expected exit status: 1
+// expected stderr:
+// examples/typechecking/auto_drop_capture_escape.an:3:13
+// 2 |     foo = "a" ++ "b"
+//   |     // error: This returns a reference to a value that is dropped when this function returns
+// 3 |     stuff = fn () -> println foo
+//   |             ^^^^^^^^^^^^^^^^^^^^
+// 4 |     stuff
+// 
+// Found 1 error and 0 warnings
+

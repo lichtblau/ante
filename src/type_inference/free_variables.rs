@@ -40,8 +40,14 @@ impl TypeChecker<'_, '_> {
         }
         context.find_free_variables(id, self);
 
+        // A bare-`Pointer` env (capability / ability-method dictionary) has no capture tuple to
+        // give `IMM` slots to -- `make_env_type_with_names` is never called for it -- so nothing is
+        // borrowed there and the MIR builder must not materialize. (Those envs carry only borrowed
+        // dictionaries anyway, which are `Copy`.)
+        let mut borrowed = FxHashSet::default();
         if !is_pointer(expected_environment_type, &self.bindings) {
-            let env_type = make_env_type_with_names(&context.free_vars, self, is_move);
+            borrowed = self.borrowed_capture_set(&context.free_vars, is_move);
+            let env_type = make_env_type_with_names(&context.free_vars, self, is_move, &borrowed);
             self.unify(&env_type, expected_environment_type, TypeErrorKind::ClosureEnv, id);
         }
 
@@ -49,8 +55,99 @@ impl TypeChecker<'_, '_> {
             if is_move {
                 self.current_extended_context_mut().mark_move_closure(id);
             }
+            // A borrowed capture is an `IMM` ref into the owner's storage: the env does not alias
+            // the value, so the owner is its sole owner and must drop it normally. Restore it to
+            // its scope by removing it from `captured_names`.
+            //
+            // Sound because a closure capturing `name` is necessarily defined after it, and scope
+            // exit drops in reverse-definition order -- so the borrowing closure always dies before
+            // its owner. A closure that escapes by return while borrowing is a compile error.
+            //
+            // Done here, not at the `record_captured_names` call site: this check may be deferred
+            // (`push_deferred_closure_check`) until the enclosing scope resolves its implicits, so
+            // this is the only point where `borrowed` is known. Both paths run after
+            // `record_captured_names`, so the removal sticks. Handler-scoped lambdas never entered
+            // `captured_names`, making the removal a no-op for them.
+            //
+            // The `var` half of the restore is not here: it must run eagerly, before deferral -- see
+            // [Self::restore_mut_ref_captures].
+            for name in &borrowed {
+                self.captured_names.remove(name);
+            }
+            self.current_extended_context_mut().insert_borrowed_captures(id, borrowed);
             self.current_extended_context_mut().insert_closure_environment(id, context.free_vars);
         }
+    }
+
+    /// Restore the `var` captures of a non-`move` closure to their owner.
+    /// `make_env_type_with_names` already gives each of these a `MUT` ref env slot and
+    /// `pack_closure_environment` already packs the owner's `StackAlloc` pointer.
+    /// The owner is the sole owner: it drops the value at scope exit, and overwrite-drops it on
+    /// `x := …`
+    ///
+    /// The closure is defined after the `var` and dies before it (scope exit drops in
+    /// reverse-definition order), and a non-`move` closure escaping while it borrows a non-`Copy`
+    /// local is a compile error -- `lambda_origin`'s borrow arm covers `var` captures too, since
+    /// they are not reference-typed.
+    ///
+    /// A `move` closure is excluded, and the reason is sharper than "both sides own the same heap":
+    /// it snapshots a `var` by value (`pack_closure_environment` derefs the slot). For an owned
+    /// capture that is actually fine now -- the snapshot is the env's, `record_move_captures` marks
+    /// the owner moved, `assignment_overwrite_drop` skips a moved place, and the destructor
+    /// frees the env slot. But for a `shared` `var` the snapshot is an unretained handle copy:
+    /// `pack_closure_environment` skips its `RcRetain` for `mutable_locals`, and
+    /// `record_shared_captures` skips `var`s too, so nothing funds a second reference. Restoring the
+    /// owner's release then frees the handle out from under an escaped closure -- a heap-use-after-free.
+    ///
+    /// Unlike before, set this runs eagerly, right after `record_captured_names`,
+    /// rather than inside `check_for_closure`. That check may be deferred until the enclosing scope
+    /// resolves its implicits (`push_deferred_closure_check`), which for a `for`-loop body lands
+    /// after the enclosing scope's drops are synthesized -- so a removal made there is too late and
+    /// the blanket wins (`Vec.remove_all`'s `idxs`, `map.an`'s `map`). Deciding "is this a `var`"
+    /// needs only `mutable_definitions`: no types, no implicits, nothing to wait for.
+    pub(super) fn restore_mut_ref_captures(&mut self, id: ExprId, is_move: bool) {
+        if is_move {
+            return;
+        }
+        let mut context = FreeVars::default();
+        context.find_free_variables(id, self);
+        for name in &context.free_vars {
+            if self.mutable_definitions.contains(name) {
+                self.captured_names.remove(name);
+            }
+        }
+    }
+
+    /// Which captures this closure holds by reference (`IMM` in the env) instead of by
+    /// value. Exactly the captures the escape check treats as `capture_borrow`
+    /// (`origins.rs::lambda_origin` + the `Copy` filter in `reject_escaping_origins`) -- keeping the
+    /// two in step is the invariant that makes borrow-in-env sound: every borrow that could escape
+    /// is a borrow the escape check rejects.
+    ///
+    /// - `move` captures are owned by the env, never borrowed.
+    /// - `var` captures are already `MUT` refs into the owner's slot.
+    /// - reference-typed captures point elsewhere; re-wrapping would double-indirect.
+    /// - `Copy` captures are bit-copies that cannot dangle and need no owner: primitives,
+    ///   function values, ability dictionaries, and `shared` handles.
+    ///
+    /// `type_is_copy` fails safe here: an in-flight unification variable answers "Copy", so an
+    /// unresolved capture stays by-value (the pre-existing leak) rather than becoming a wrong
+    /// borrow. Only confidently-non-`Copy` captures are borrowed.
+    fn borrowed_capture_set(&mut self, free_vars: &BTreeSet<NameId>, is_move: bool) -> FxHashSet<NameId> {
+        let mut borrowed = FxHashSet::default();
+        if is_move || !self.drop_elaboration_active() {
+            return borrowed;
+        }
+        for name in free_vars {
+            if self.mutable_definitions.contains(name) || self.name_is_reference_typed(*name) {
+                continue;
+            }
+            let typ = self.name_types[name].clone();
+            if !self.type_is_copy(&typ) {
+                borrowed.insert(*name);
+            }
+        }
+        borrowed
     }
 
     /// Auto-drop: record every free variable of the lambda at `id` as captured. Captured
@@ -78,13 +175,74 @@ impl TypeChecker<'_, '_> {
         context.find_free_variables(id, self);
 
         let location = id.locate(self);
+        let mut owned_captures = Vec::new();
         for name in &context.free_vars {
             let typ = self.name_types[name].clone();
             if !self.type_is_copy(&typ) {
                 // Capturing a binding moves the place it denotes, same as a direct use.
                 let move_path = self.binding_place(*name);
                 self.move_tracker.record_move(move_path, location.clone());
+                // The env is this capture's sole owner, so record it as an env-drop obligation of
+                // the closure's binding. `var` captures are excluded: a `move` closure snapshots
+                // them by value (`pack_closure_environment` Derefs the current value) while the
+                // outer slot stays live, so dropping both would double-free -- `var` env drops are
+                // out of scope here. Shared handles and function values are Copy, so
+                // they never reach this branch (shared captures and heap-env closure captures
+                // are handled separately).
+                if !self.mutable_definitions.contains(name) {
+                    owned_captures.push(*name);
+                }
             }
+        }
+        // A `move`-captured owned value is recorded moved above, so the owner's scope-exit drop is
+        // already suppressed by the move tracker (not by the blanket). Remove it from
+        // `captured_names` so the blanket's remaining population is meaningful -- exactly the
+        // escaping non-`move` owned captures.  Nothing changes at the
+        // owner (a moved value has no owner-side drop either way).
+        for capture in &owned_captures {
+            self.captured_names.remove(capture);
+        }
+    }
+
+    /// A `shared` handle captured by value into a closure env is a bit-copy the owner still
+    /// holds too (shared handles are `Copy`, so `record_move_captures` never sees them). Rather
+    /// than pick a unique owner, take a reference: the pack-time `RcRetain`
+    /// (`pack_closure_environment`) gives the env its own count, so:
+    ///   - the capture is restored to the owner's scope -- removed from `captured_names` so the
+    ///     owner's scope-exit `release_T` fires again (safe now: the retain kept the count above what
+    ///     the closure still needs), and
+    ///   - for a bound closure, the balancing env-side release is recorded as an obligation of the
+    ///     binding (`shared_closure_captures`), fired when the closure value dies un-escaped
+    ///     (`try_synthesize_drop_for_place`).
+    ///
+    /// `var` captures are excluded. Anonymous closures get only the owner restore: their retain has
+    /// no binding death to balance it and leaks by one count -- the leak-not-UAF fallback.  Runs
+    /// after `record_captured_names` so the removal sticks; auto-drop only.
+    pub(super) fn record_shared_captures(&mut self, id: ExprId, self_name: Option<NameId>) {
+        let mut context = FreeVars::default();
+        if let Some(name) = self_name {
+            context.defined_in_fn.insert(name);
+        }
+        context.find_free_variables(id, self);
+
+        let mut shared_captures = Vec::new();
+        for name in &context.free_vars {
+            let typ = self.name_types[name].clone();
+            if self.is_shared_user_defined(&typ) && !self.mutable_definitions.contains(name) {
+                shared_captures.push(*name);
+            }
+        }
+        if shared_captures.is_empty() {
+            return;
+        }
+        // Owner restore: the pack-time retain balances the owner's release, so let the owner drop
+        // its copy again (both owner and env now hold a real count).
+        for name in &shared_captures {
+            self.captured_names.remove(name);
+        }
+        // Only a bound closure has a scope-exit death to release the env's reference at.
+        if let Some(binding) = self_name {
+            self.shared_closure_captures.insert(binding, shared_captures);
         }
     }
 
@@ -270,17 +428,25 @@ impl FreeVars {
     }
 }
 
-fn make_env_type_with_names(free_vars: &BTreeSet<NameId>, checker: &TypeChecker, is_move: bool) -> Type {
+fn make_env_type_with_names(
+    free_vars: &BTreeSet<NameId>, checker: &TypeChecker, is_move: bool, borrowed: &FxHashSet<NameId>,
+) -> Type {
     let free_vars = free_vars.iter().map(|name| {
         let typ = checker.name_types[name].clone();
 
         // Closures:
-        // - Capture mutable variables by reference (so we wrap in a Mut ref here)
-        // - Capture immutable variables by value (FIXME)
+        // - Capture mutable variables by reference (a `Mut` ref)
+        // - Capture owned (non-`Copy`) immutable variables by reference too, so the owner keeps
+        //   ownership and drops them. `borrowed` is the frontend's authoritative set (see
+        //   `borrowed_capture_set`).
+        // - Capture everything else (`Copy` values, `shared` handles) by value
         // - Capture everything by move if it is a `move` closure
         if !is_move && checker.mutable_definitions.contains(name) {
             let lifetime = checker.next_type_variable();
             Type::Application(Arc::new(Type::MUT), Arc::new(vec![lifetime, typ]))
+        } else if borrowed.contains(name) {
+            let lifetime = checker.next_type_variable();
+            Type::Application(Arc::new(Type::IMM), Arc::new(vec![lifetime, typ]))
         } else {
             typ
         }

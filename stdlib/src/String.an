@@ -41,7 +41,7 @@ reverse (var s: String): String =
 ///
 /// For example `split "foo bar  baz "` will emit all of:
 /// ["foo", "bar", "", "baz", ""]
-split (s: String) (c: Char) = fn () can (Emit String) ->
+split (s: String) (c: Char) = move fn () can (Emit String) ->
     var subend = 0usz
     var substart = 0usz
     while U32 subend < s.length do
@@ -92,7 +92,7 @@ join (s: s) {Stream s String}: String =
     foldl s "" (++)
 
 /// Emits each byte in this string
-bytes (s: String) = fn () can (Emit U8) ->
+bytes (s: String) = move fn () can (Emit U8) ->
     var data = transmute s.data : Usz
     for i in 0 .. s.length do
         ptr = data + Usz i
