@@ -2,9 +2,9 @@ name: Release
 
 on:
   push:
-    branches: [ fork ]
+    branches: [ fork, drop+ci ]
   pull_request:
-    branches: [ fork ]
+    branches: [ fork, drop+ci ]
   workflow_dispatch:
 
 env:
