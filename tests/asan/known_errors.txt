@@ -1,0 +1,27 @@
+# Known pre-existing AddressSanitizer errors, surfaced by tests/asan/run.sh.
+# The lane reports listed files as KNOWN-ERR (non-gating) so it can still fail
+# on any NEW error a change introduces. Remove a line once the bug is fixed.
+#
+# Currently EMPTY -- the lane is error-free:
+# - The transmute round-trip over-read (union-payload widening) was fixed in
+#   Stage 1 increment 0 (min-size memcpy + zero-init).
+# - stream.an's stack-buffer-overflow was the abort optimization's longjmp
+#   crossing coroutine stacks: minicoro's running chain was left stale and
+#   ASan's ignored no_return left dead frames' shadow poisoned, so later valid
+#   writes reported as wild. Fixed by fiber-safe aborts (mco_abort_prepare /
+#   mco_abort_land in aminicoro/minicoro.c + the abort_handler_optimization
+#   protocol): the running chain is popped to the setjmp's context before the
+#   longjmp and the landing unpoisons the skipped frames.
+
+# Pre-existing upstream C-backend bug, NOT from the drop stack (added here when the
+# lane was restored at M3). `ptr_store` writes 16 bytes into an 8-byte allocation;
+# the LLVM lane passes the same files. Verified pre-existing:
+#   - identical with --no-auto-drop, which disables everything M2/M3 add
+#   - `ptr_store` lowering is untouched by every commit in the stack
+#   - the Sync module (44a13725, "Add atomic intrinsics and Sync module") is an
+#     origin/master commit predating the stack
+# Needs its own C-backend investigation; remove these once it is fixed.
+examples/codegen/sync/arc_share.an
+examples/codegen/sync/atomic_counter.an
+examples/codegen/sync/mutex_counter.an
+examples/codegen/sync/spawn_join.an

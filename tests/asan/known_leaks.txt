@@ -1,0 +1,86 @@
+# Files with KNOWN remaining leaks, allowlisted so `run.sh --gate-leaks` fails only on
+# NEW ones.
+#
+# CALIBRATED TO M3 (2/5, shared reference counting). This is deliberately not the
+# end-state list: each later milestone clears whole classes below, so entries must be
+# DELETED as their owning pick lands, not carried forward. A line that stops leaking and
+# stays here silently re-admits the leak later.
+#
+# Measured totals at M3: 22 files, 66614 bytes (58688 of it one coroutine stack, below).
+#
+# --- the abort contract (owned by the abort design, not a later pick) ---
+#
+#   A handler that completes without resuming discards the suspended continuation.
+#   Nothing on it is torn down: no drops run, and nothing double-frees.
+#
+#   effects/drop_matrix/abort_pinned_leak.an -- 68 bytes, the two continuation Strings,
+#     in 4 allocations. The coroutine buffer itself is freed (mco_coro_free runs).
+#
+#   effects/abort_within_coroutine.an -- 58656 bytes: a WHOLE coroutine stack from
+#     mco_create, plus 32 bytes of Maybe payload. The cross-stack case: the abort
+#     longjmps from the inner generator's coroutine to a setjmp on the OUTER generator's
+#     coroutine, so the inner one is never mco_destroy'd. Isolated at M3 -- the same
+#     nesting without the abort leaks only the 32-byte payload, and the same nesting
+#     through Std.Stream.foldr is completely clean, so this is the discarded
+#     continuation, not the stream shape. Freeing it needs the abort path to destroy
+#     the coroutines it unwinds past.
+#
+# --- pre-M5 closure-capture residue (delete when (4/5) Closure ownership lands) ---
+#
+#   An owned value captured by a closure has no destructor on the closure yet.
+#
+#   effects/drop_matrix/closure_capture_across_performs.an -- 42 bytes = 21 in `compute`
+#     (effectful) + 21 in `control` (no effects at all). Symmetric on purpose: that is
+#     the file's thesis, effects cost nothing beyond the plain closure leak.
+#   effects/drop_matrix/handler_owned_state.an -- 24 bytes, the handler-captured `var acc`
+#     at handle completion.
+#   effects/handle_multiple_effects.an -- 32 bytes.
+#   constrained_impl.an -- 192 bytes.
+#   method_calls.an -- 80 bytes.
+#   stdlib-tests/{char,early_return,fail,throw}.an -- 64 bytes each.
+#   stdlib-tests/{math,stream,string}.an -- 1600 / 704 / 2464 bytes.
+#
+# --- Drop impl not in scope at the use site ---
+#
+#   A container's `Drop` impl lives in its own module: `import Std.Vec` does NOT bring it
+#   in, only `import Std.Vec.drop_vec` does. Drop synthesis never sees it, derives a
+#   structural drop over all-Copy fields, prunes to None, and the buffer leaks. The open
+#   question is whether the fix is the import or module-level impl visibility, so the
+#   test files are left alone pending that decision.
+#
+#   stdlib-tests/env.an (24), stdlib-tests/io.an (108), stdlib-tests/vec.an (1040),
+#   implicit_import.an (40).
+#
+# --- Drop impl IS imported and it still leaks ---
+#
+#   stdlib-tests/map.an (632, drop_hashmap), stdlib-tests/rc.an (32, drop_rc),
+#   stdlib-tests/seq.an (548, drop_seq). Plain `main` locals; rc.an also does manual
+#   inc_ref_count/dec_ref_count bookkeeping. Unowned, needs a fresh look.
+#
+# --- not a compiler leak, pinned deliberately ---
+#
+#   index_assign.an -- 40 bytes. The program itself does `p: Ptr I32 = malloc 8` and
+#   never frees it. `Ptr t` is Copy with a no-op Drop impl, so this is correct behavior.
+#
+examples/codegen/constrained_impl.an
+examples/codegen/effects/abort_within_coroutine.an
+examples/codegen/effects/drop_matrix/abort_pinned_leak.an
+examples/codegen/effects/drop_matrix/closure_capture_across_performs.an
+examples/codegen/effects/drop_matrix/handler_owned_state.an
+examples/codegen/effects/handle_multiple_effects.an
+examples/codegen/implicit_import.an
+examples/codegen/index_assign.an
+examples/codegen/method_calls.an
+examples/codegen/stdlib-tests/char.an
+examples/codegen/stdlib-tests/early_return.an
+examples/codegen/stdlib-tests/env.an
+examples/codegen/stdlib-tests/fail.an
+examples/codegen/stdlib-tests/io.an
+examples/codegen/stdlib-tests/map.an
+examples/codegen/stdlib-tests/math.an
+examples/codegen/stdlib-tests/rc.an
+examples/codegen/stdlib-tests/seq.an
+examples/codegen/stdlib-tests/stream.an
+examples/codegen/stdlib-tests/string.an
+examples/codegen/stdlib-tests/throw.an
+examples/codegen/stdlib-tests/vec.an
