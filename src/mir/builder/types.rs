@@ -73,6 +73,30 @@ where
         self.convert_context().shared_inner_layout_of(typ, None).map(|(layout, _)| layout)
     }
 
+    /// True when `expr`'s inferred type is a `shared` handle.
+    pub(super) fn expr_tc_is_shared(&self, expr: ExprId) -> bool {
+        self.types.result.maps.expr_types.get(&expr).is_some_and(|typ| self.shared_inner_layout_of(typ).is_some())
+    }
+
+    /// True when `typ` is a closure whose environment is a bare `Pointer` -- the exact shape that
+    /// heap-allocates via `AllocShared`. Mirrors the frontend `is_heap_env_closure`; excludes `Ptr
+    /// Unit` dictionary environments (`Application`, not the bare `Pointer` primitive). These
+    /// closures' env pointers are reference-counted like shared handles.
+    pub(super) fn tc_is_heap_env_closure(&self, typ: &TCType) -> bool {
+        match typ.follow(&self.types.bindings) {
+            TCType::Function(function) => matches!(
+                function.environment.follow(&self.types.bindings),
+                TCType::Primitive(crate::type_inference::types::PrimitiveType::Pointer)
+            ),
+            _ => false,
+        }
+    }
+
+    /// True when `expr`'s inferred type is a heap-env closure.
+    pub(super) fn expr_tc_is_heap_env_closure(&self, expr: ExprId) -> bool {
+        self.types.result.maps.expr_types.get(&expr).is_some_and(|typ| self.tc_is_heap_env_closure(typ))
+    }
+
     /// Like [Self::shared_inner_layout_of] but only for `shared mut`. Used to decide whether `:=` mutates in place.
     pub(super) fn shared_mut_inner_layout_of(&self, typ: &TCType) -> Option<Type> {
         self.convert_context().shared_inner_layout_of(typ, None).and_then(|(layout, mutable)| mutable.then_some(layout))

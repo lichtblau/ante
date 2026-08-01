@@ -20,17 +20,18 @@ use std::sync::Arc;
 
 use crate::{
     diagnostics::Location,
-    incremental::{ExportedDefinitions, VisibleImplicits},
+    incremental::{ExportedDefinitions, GetItemRaw, VisibleImplicits},
     name_resolution::{Origin, namespace::SourceFileId},
     parser::{
         cst::{self, Expr, ReferenceKind},
-        ids::{ExprId, NameId, PatternId, TopLevelName},
+        ids::{ExprId, NameId, PatternId, TopLevelId, TopLevelName},
     },
     type_inference::{
         TypeChecker,
         affine::{MovePath, MoveTracker},
         errors::TypeErrorKind,
-        types::Type,
+        generics::Generic,
+        types::{FunctionType, ParameterType, Type},
     },
 };
 
@@ -236,7 +237,23 @@ impl TypeChecker<'_, '_> {
         // Honest for bare variables under the flag: literal vars and `{Copy t}`-bounded
         // generics are Copy; everything else falls through to the generic rules below.
         if self.type_is_copy(&typ) {
-            return None;
+            // Shared handles are Copy but reference-counted: a binding's death releases its
+            // reference via the type's synthesized `release_T`.
+            if self.is_shared_user_defined(&typ) {
+                return Some(self.synthesize_release_call(place, &typ, location));
+            }
+            // Heap-env closures are Copy but their environment is reference-counted:
+            // A binding's death releases the env's refcount, freeing the block at zero.
+            // Effect continuations (`resume`) share the shape but have coroutine-supplied, non-RC
+            // environments -- do not release them yet.
+            if self.is_heap_env_closure(&typ) && !self.effect_continuation_names.contains(&place.root_variable()) {
+                return Some(self.synthesize_closure_env_release(place, &typ, location));
+            }
+            // A Copy aggregate can still transitively own shared fields (a struct of all-Copy
+            // fields is itself Copy). Structural drop reaches those fields (each shared one hits
+            // the branch above) and self-prunes to `None` when nothing inside needs releasing --
+            // so pure-Copy values (primitives, `{Copy t}` generics) still produce no drop.
+            return self.synthesize_structural_drop(place, &typ, location);
         }
         // A rigid generic: a named signature generic (`Type::Generic`, from annotated
         // signatures) or a bare type variable connected to the signature (unannotated
@@ -718,6 +735,99 @@ impl TypeChecker<'_, '_> {
         }
     }
 
+    /// The stable [TopLevelName] of a shared type's synthesized `release_T` function.  Both a
+    /// release call site and the type's own MIR emission derive it from the type's item id, so
+    /// `name_to_id`/`get_definition_id` resolve them to one definition.
+    pub(super) fn get_release_function_name(&self, type_id: TopLevelId) -> TopLevelName {
+        TopLevelName::new(type_id, NameId::RELEASE_FUNCTION)
+    }
+
+    pub(super) fn is_release_function_name(name: TopLevelName) -> bool {
+        name.local_name_id == NameId::RELEASE_FUNCTION
+    }
+
+    /// The generalized type of a shared type's `release_T`: `forall <generics>. <SharedType> -> Unit`
+    /// (the handle is passed by value -- it is a Copy pointer). `release_T` is not a parsed item, so
+    /// inference computes its type here on demand ([Self::type_of_top_level_name] intercepts the
+    /// reserved name), which lets release calls type-check and instantiate like any generic call.
+    pub(super) fn release_function_generalized_type(&self, type_id: TopLevelId) -> Type {
+        let (item, _) = GetItemRaw(type_id).get(self.compiler);
+        let cst::TopLevelItemKind::TypeDefinition(td) = &item.kind else {
+            return Type::ERROR;
+        };
+        let type_name = TopLevelName::new(type_id, td.name);
+        let mut data_type = Type::UserDefined(Origin::TopLevelDefinition(type_name));
+        let generics: Vec<Generic> = td.generics.iter().map(|p| Generic::Named(Origin::Local(p.name))).collect();
+        if !generics.is_empty() {
+            let generic_types = generics.iter().map(|g| Type::Generic(g.clone())).collect::<Vec<_>>();
+            data_type = Type::Application(Arc::new(data_type), Arc::new(generic_types));
+        }
+        let fn_type = Type::Function(Arc::new(FunctionType {
+            parameters: vec![ParameterType::explicit(data_type)],
+            environment: Type::NO_CLOSURE_ENV,
+            return_type: Type::UNIT,
+            // A release runs no user code: it decrements, and at zero releases the pointee's own
+            // shared fields and frees the block. Nothing in that can perform an effect.
+            effects: Type::pure(),
+        }));
+        if generics.is_empty() { fn_type } else { Type::Forall(Arc::new(generics), Arc::new(fn_type)) }
+    }
+
+    /// Synthesize a call `release_T <place>` releasing a shared handle by value.
+    /// Unlike [Self::synthesize_drop_call] it passes the handle directly (a Copy pointer, no `mut`
+    /// reference). The callee resolves through the reserved release name; `check_expr` types and
+    /// instantiates it exactly like a real generic call.
+    fn synthesize_release_call(&mut self, place: &MovePath, typ: &Type, location: &Location) -> ExprId {
+        let place_expr = self.synthesize_place_expr(place, typ, location);
+
+        let type_id = self
+            .shared_type_top_level_id(typ)
+            .expect("synthesize_release_call: place is not a shared user-defined type");
+        let release_name = self.get_release_function_name(type_id);
+        let callee_type = self.next_type_variable();
+        let callee_path = self.push_path(
+            cst::Path { components: vec![("release".to_string(), location.clone())] },
+            callee_type.clone(),
+            location.clone(),
+        );
+        self.current_extended_context_mut().insert_path_origin(callee_path, Origin::TopLevelDefinition(release_name));
+        let callee = self.push_expr(Expr::Variable(callee_path), callee_type, location.clone());
+
+        let call = cst::Call { function: callee, arguments: vec![cst::Argument::explicit(place_expr)] };
+        let call_expr = self.push_expr(Expr::Call(call), Type::UNIT, location.clone());
+
+        let old_synthesizing = std::mem::replace(&mut self.synthesizing_drops, true);
+        let old_check = std::mem::replace(&mut self.suppress_move_check, true);
+        let old_record = std::mem::replace(&mut self.suppress_move_record, true);
+        self.check_expr(call_expr, &Type::UNIT, TypeErrorKind::General);
+        self.suppress_move_record = old_record;
+        self.suppress_move_check = old_check;
+        self.synthesizing_drops = old_synthesizing;
+
+        call_expr
+    }
+
+    /// Synthesize a heap-env closure's environment release. Unlike a shared handle (a nominal
+    /// `release_T` call) closures have no nominal release function -- the operation is uniform
+    /// (decrement the env pointer's refcount, free at zero), so the place expression is recorded
+    /// directly in the `closure_env_releases` side table and the MIR builder emits a null-safe
+    /// `ReleaseClosureEnv` on the place's env pointer. The place expression is checked with moves
+    /// suppressed (the closure value is dead on this edge; it must neither re-check nor record).
+    fn synthesize_closure_env_release(&mut self, place: &MovePath, typ: &Type, location: &Location) -> ExprId {
+        let place_expr = self.synthesize_place_expr(place, typ, location);
+
+        let old_synthesizing = std::mem::replace(&mut self.synthesizing_drops, true);
+        let old_check = std::mem::replace(&mut self.suppress_move_check, true);
+        let old_record = std::mem::replace(&mut self.suppress_move_record, true);
+        self.check_expr(place_expr, typ, TypeErrorKind::General);
+        self.suppress_move_record = old_record;
+        self.suppress_move_check = old_check;
+        self.synthesizing_drops = old_synthesizing;
+
+        self.current_extended_context_mut().mark_closure_env_release(place_expr);
+        place_expr
+    }
+
     /// Derive the drop for a (possibly partially-moved) sum-typed place: an exhaustive
     /// synthesized `match` binding each variant's payloads to fresh names and dropping the
     /// ones still owned. When `tracker` is given (residual drops), payloads whose
@@ -826,6 +936,19 @@ impl TypeChecker<'_, '_> {
     pub(super) fn synthesize_partial_drop(
         &mut self, place: &MovePath, typ: &Type, tracker: &MoveTracker, location: &Location,
     ) -> Option<ExprId> {
+        // A shared handle is reference-counted and unconditionally Copy: its payloads cannot be
+        // moved out (projecting them copies the pointer + retains), so its own refcount must be
+        // released on every binding death regardless of how the move tracker views projections out
+        // of it. Matching a node and rebuilding it (`Tree _ l x r -> Tree B l x r`) reads as child
+        // moves, which would otherwise route to the partial-move path below and skip the release
+        // (Copy → `None`) -- leaking the handle. Bypass the move gates and always emit `release_T`.
+        // Any escaping tail use is balanced by the escape retain, so this never double-frees.
+        {
+            let followed = self.follow_type(typ).clone();
+            if self.is_shared_user_defined(&followed) {
+                return self.try_synthesize_drop_for_place(place, &followed, location);
+            }
+        }
         if tracker.is_moved(place).is_some() {
             return None;
         }
@@ -885,6 +1008,58 @@ impl TypeChecker<'_, '_> {
     /// reference/pointer type) stay legal. Gaps: References laundered through intermediate
     /// ref-typed bindings, stored into escaping structs via bindings, or captured by escaping
     /// closures.
+    ///
+    /// Walk a function's return/tail expression and mark every tail-position shared-handle place
+    /// (variable / field access) for an escape retain.  Recurses through the value-producing tails
+    /// of `if`/`match`/sequences so that `else tree` and `other -> other` are reached, but stops at
+    /// fresh results (calls, constructors), which are already +1 and moved out.
+    pub(super) fn mark_tail_escape_retains(&mut self, expr: ExprId) {
+        if !self.drop_elaboration_active() {
+            return;
+        }
+        let cst_expr = match self.current_extended_context().extended_expr(expr) {
+            Some(expr) => expr.clone(),
+            None => self.current_context()[expr].clone(),
+        };
+        match cst_expr {
+            cst::Expr::Variable(_) | cst::Expr::MemberAccess(_) => {
+                let Some(typ) = self.expr_types.get(&expr).cloned() else { return };
+                // A handle or closure env escaping as an alias of a local the scope-exit release is
+                // about to decrement. So is a Copy aggregate holding either one: its structural
+                // drop releases them field by field, and the caller receives them already dead.
+                // (A non-Copy aggregate is moved out instead -- its drop went with it.)
+                let escapes_refcount = self.is_shared_user_defined(&typ)
+                    || self.is_heap_env_closure(&typ)
+                    || (self.type_is_copy(&typ) && !self.type_needs_no_drop(&typ));
+                if escapes_refcount {
+                    self.current_extended_context_mut().mark_escape_retain(expr);
+                }
+            },
+            cst::Expr::Sequence(items) => {
+                if let Some(last) = items.last() {
+                    self.mark_tail_escape_retains(last.expr);
+                }
+            },
+            cst::Expr::If(if_) => {
+                self.mark_tail_escape_retains(if_.then);
+                if let Some(else_) = if_.else_ {
+                    self.mark_tail_escape_retains(else_);
+                }
+            },
+            cst::Expr::Match(match_) => {
+                for (_, body) in &match_.cases {
+                    self.mark_tail_escape_retains(*body);
+                }
+            },
+            cst::Expr::TypeAnnotation(annotation) => self.mark_tail_escape_retains(annotation.lhs),
+            _ => {},
+        }
+    }
+
+    /// Auto-drop escape check: The value leaving this function must carry no reference into a local
+    /// it frees on return. Delegates to the origin analysis ([`Self::reject_escaping_origins`]) -- which
+    /// propagates through bindings, constructors, and closure
+    /// captures.
     pub(super) fn check_reference_escape(&mut self, returned: ExprId) {
         if !self.drop_elaboration_active() {
             return;

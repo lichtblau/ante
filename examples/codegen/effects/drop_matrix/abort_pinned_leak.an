@@ -1,0 +1,84 @@
+// A handler that completes without resuming discards the suspended continuation;
+// owned values live in it are LEAKED (never dropped, never double-freed, never UB).
+// This file is allowlisted in tests/asan/known_leaks.txt with the exact shape:
+// the two continuation Strings below (68 B in 4 allocations), nothing else.
+//
+// Two abort shapes, because they lower differently:
+//  - shape A: single abort arm -> abort_handler_optimization rewrites the handle
+//    into ordinary control flow (no coroutine). The continuation's drops are
+//    still skipped: the leak here is missing drop elaboration on an ordinary
+//    edge, NOT forced by mco_coro_free.
+//  - shape B: a prior non-tail `step` resume forces a real coroutine; `quit`
+//    then aborts it. mco_coro_free frees the coroutine stack (the buffer itself
+//    does not leak) but runs nothing on it: only the continuation-owned heap
+//    payload leaks. The abort value propagates back through the suspended
+//    `step` arm (its post-resume code runs, receiving the abort value).
+
+effect Bail =
+    bail: fn Unit -> Never
+
+effect Proto =
+    step: fn Unit -> I32
+    quit: fn Unit -> Never
+
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+// Shape A: owned values live when the (optimized) abort fires.
+doomed_plain (): I32 can Bail =
+    r = R 7
+    s = "heap in plain continuation" ++ "!"
+    bail ()
+    println s
+    r.tag
+
+run_plain (f: fn Unit => I32 can Bail): I32 =
+    handler h for bail () -> 0 - 1
+    f ()
+
+// Shape B: same, but a prior non-tail resume makes the continuation a real
+// suspended coroutine before the abort discards it.
+doomed_coro (): I32 can Proto =
+    r = R 8
+    s = "heap in coroutine continuation" ++ "!"
+    x = step ()
+    print "stepped "
+    println x
+    quit ()
+    println s
+    r.tag + x
+
+run_coro (f: fn Unit => I32 can Proto): I32 =
+    handler h for
+    | step () ->
+        println "step pre"
+        res = resume 1
+        println "step post"
+        res
+    | quit () -> 0 - 2
+    in f ()
+
+main () =
+    outer = R 100
+    a = run_plain doomed_plain
+    print "plain code = "
+    println a
+    b = run_coro doomed_coro
+    print "coro code = "
+    println b
+    print "outer still "
+    println outer.tag
+
+// args: --delete-binary --no-color
+// expected stdout:
+// plain code = -1
+// step pre
+// stepped 1
+// step post
+// coro code = -2
+// outer still 100
+// drop 100

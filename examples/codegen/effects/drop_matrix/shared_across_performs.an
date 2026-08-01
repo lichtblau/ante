@@ -1,0 +1,75 @@
+// - shared handle passed INTO a handler arm (the arm consumes/reads it)
+// - shared handle created in an arm, returned OUT through `resume`
+// - shared handle round-tripped: perform argument -> arm -> resume result
+// - shared handle merely LIVE across a suspension (never crosses the boundary)
+// - shared handle as an explicit argument to a trait method
+//   (same builder path as effect ops, no effects involved)
+
+shared type L =
+    | Nil
+    | Cons I32 L
+
+count (l: L): I32 =
+    match l
+    | Nil -> 0
+    | Cons _ rest -> 1 + count rest
+
+effect Juggle =
+    give: fn L -> Unit
+    take: fn Unit -> L
+    bounce: fn L -> L
+    ask: fn Unit -> I32
+
+trait Weigh t =
+    weigh: fn t -> I32
+
+impl weigh_l: Weigh L with
+    weigh (l: L): I32 =
+        match l
+        | Nil -> 0
+        | Cons x rest -> x + weigh rest
+
+compute (): I32 can Juggle =
+    list: L = Cons 10 (Cons 20 Nil)
+    alias = list
+    give list
+    made = take ()
+    print "made count "
+    println (count made)
+    back = bounce made
+    x = ask ()
+    print "alias count "
+    println (count alias)
+    count back + x
+
+run (f: fn Unit => I32 can Juggle): I32 =
+    handler h for
+    | give l ->
+        print "arm got count "
+        println (count l)
+        resume ()
+    | take () ->
+        fresh: L = Cons 5 (Cons 6 (Cons 7 Nil))
+        resume fresh
+    | bounce l -> resume l
+    | ask () -> resume 100
+    in f ()
+
+main () =
+    total = run compute
+    print "total = "
+    println total
+    tree: L = Cons 1 (Cons 2 Nil)
+    print "weigh "
+    println (weigh tree)
+    print "weigh again "
+    println (weigh tree)
+
+// args: --delete-binary --no-color
+// expected stdout:
+// arm got count 2
+// made count 3
+// alias count 2
+// total = 103
+// weigh 3
+// weigh again 3

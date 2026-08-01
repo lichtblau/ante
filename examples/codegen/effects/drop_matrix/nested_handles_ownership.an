@@ -1,0 +1,68 @@
+// Nested handlers; owned (printing Drop + String) and shared values live
+// across both suspensions of two nested non-tail handlers; both coroutines complete.
+// Each R drops exactly once, the shared list's count is balanced.
+
+shared type L =
+    | Nil
+    | Cons I32 L
+
+count (l: L): I32 =
+    match l
+    | Nil -> 0
+    | Cons _ rest -> 1 + count rest
+
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+effect Ping =
+    do_ping: fn I32 -> I32
+
+effect Pong =
+    do_pong: fn I32 -> I32
+
+foo (): I32 can Ping, Pong =
+    r = R 3
+    s = "owned across nested" ++ "!"
+    list: L = Cons 1 (Cons 2 Nil)
+    a = do_ping 1
+    b = do_pong 2
+    print "still "
+    println s
+    a + b + r.tag + count list
+
+ping (f: fn Unit => a can Ping) =
+    handler h for do_ping x ->
+        println "ping pre"
+        r = resume (x * 2)
+        println "ping post"
+        r
+    in f ()
+
+pong (f: fn Unit => a can Ping, Pong) =
+    handler h for do_pong x ->
+        println "pong pre"
+        r = resume (x * 3)
+        println "pong post"
+        r
+    in f ()
+
+main () =
+    total = ping fn () ->
+        pong fn () ->
+            foo ()
+    print "total = "
+    println total
+
+// args: --delete-binary --no-color
+// expected stdout:
+// ping pre
+// pong pre
+// still owned across nested!
+// drop 3
+// pong post
+// ping post
+// total = 13

@@ -1,0 +1,91 @@
+// Resume runs exactly once. Each R must print exactly once
+// (a second print = double-drop; a missing print = leak).
+// String payloads make the same cells LSan-observable.
+//
+// Cells:
+//   - owned values live ACROSS a perform, in the continuation (tail + non-tail)
+//   - owned value passed INTO the handler arm (arm owns + drops it)
+//   - owned value created in the arm, returned OUT through `resume`
+//
+// The `run_tail` handler has a single bare `resume (x + 1)` arm (the
+// tail-resume-optimization shape); `run_nontail` does work after `resume`,
+// forcing the real coroutine path.
+
+effect Trip =
+    hop: fn I32 -> I32
+    send_r: fn R -> Unit
+    send_s: fn String -> Unit
+    fetch: fn Unit -> String
+
+type R = tag: I32
+
+impl drop_r: Drop R with
+    drop (r: mut R) =
+        print "drop "
+        println r.tag
+
+compute (): I32 can Trip =
+    r_live = R 1
+    s_live = "owned across performs" ++ "!"
+    a = hop 1
+    send_r (R 2)
+    send_s ("sent payload" ++ "!")
+    got = fetch ()
+    print "got "
+    println got
+    print "still have "
+    println s_live
+    a + r_live.tag
+
+run_nontail (f: fn Unit => I32 can Trip): I32 =
+    handler h for
+    | hop x ->
+        println "hop pre"
+        res = resume (x + 1)
+        println "hop post"
+        res
+    | send_r r ->
+        print "arm got r "
+        println r.tag
+        resume ()
+    | send_s s ->
+        print "arm got s "
+        println s
+        resume ()
+    | fetch () -> resume ("from arm" ++ "!")
+    in f ()
+
+simple (): I32 can Trip =
+    r = R 3
+    b = hop 10
+    b + r.tag
+
+run_tail (f: fn Unit => I32 can Trip): I32 =
+    handler h for
+    | hop x -> resume (x + 1)
+    | send_r _r -> resume ()
+    | send_s _s -> resume ()
+    | fetch () -> resume ("unused" ++ "")
+    in f ()
+
+main () =
+    total = run_nontail compute
+    print "total = "
+    println total
+    small = run_tail simple
+    print "small = "
+    println small
+
+// args: --delete-binary --no-color
+// expected stdout:
+// hop pre
+// arm got r 2
+// arm got s sent payload!
+// got from arm!
+// still have owned across performs!
+// drop 1
+// drop 2
+// hop post
+// total = 3
+// drop 3
+// small = 14
