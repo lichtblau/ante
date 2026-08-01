@@ -306,6 +306,43 @@ impl Definition {
         order
     }
 
+    /// Returns every block a branch can actually enter, starting from the entry block.
+    ///
+    /// The `end` of an [TerminatorInstruction::If] or [TerminatorInstruction::Switch] is not an
+    /// edge: nothing branches to it, it only tells [Function::topological_sort] where the branches
+    /// are expected to merge. So [Function::topological_sort] yields blocks this does not, and it
+    /// is the two together that describe the control flow: when every branch of a match diverges
+    /// (`| Lft d | Rgt d -> return d`), no arm jumps to the block the match merges into, and that
+    /// block — along with the rest of the function after the match — is dead.
+    pub fn reachable_blocks(&self) -> FxHashSet<BlockId> {
+        let mut reachable = FxHashSet::<BlockId>::default();
+        let mut stack = vec![BlockId::ENTRY_BLOCK];
+
+        while let Some(block) = stack.pop() {
+            if !reachable.insert(block) {
+                continue;
+            }
+
+            match &self.blocks[block].terminator {
+                Some(TerminatorInstruction::Jmp((target, _))) => stack.push(*target),
+                Some(TerminatorInstruction::If { condition: _, then, else_, end: _ }) => {
+                    stack.push(then.0);
+                    stack.push(else_.0);
+                },
+                Some(TerminatorInstruction::Switch { int_value: _, cases, else_, end: _ }) => {
+                    stack.extend(cases.iter().map(|(_, case)| case.0));
+                    stack.push(else_.0);
+                },
+                Some(TerminatorInstruction::Unreachable) => (),
+                Some(TerminatorInstruction::Return(_)) => (),
+                Some(TerminatorInstruction::Result(_)) => (),
+                None => unreachable!("Function::reachable_blocks: block {block} has no terminator"),
+            }
+        }
+
+        reachable
+    }
+
     /// True if this function is not generic over any type variables
     fn is_monomorphic(&self) -> bool {
         self.generic_count == 0
