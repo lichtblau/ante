@@ -945,6 +945,53 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         Some(cst::Expr::Lambda(cst::Lambda { parameters, body, return_type: None, is_move: false, effects: None }))
     }
 
+    /// Eta-expand a function reference into `fn p0 .. pn -> f p0 .. pn`, one wrapper parameter per
+    /// slot of `parameters`. Used to give a borrowing-parameter function the plain owned calling
+    /// convention every indirect call site assumes of a function value
+    /// (see [`TypeChecker::function_reference_has_borrowing_param`]): the wrapper's own parameters
+    /// own what they are handed and drop it at scope exit (the wrapper is checked with drop
+    /// elaboration on, like any [`CoercionKind::Wrapper`]), while its body calls `f` directly, where
+    /// the borrow-eliding convention still applies.
+    ///
+    /// Unlike [`Self::create_closure_wrapper_for_implicit`] this inserts no implicit arguments: it
+    /// fires only when the arity already matches, so `parameters` are exactly the explicit ones to
+    /// forward. Returns `None` (leaving the reference as-is) if any slot is implicit, which would
+    /// mean the implicit path should have handled this instead.
+    pub(super) fn create_eta_wrapper(&mut self, function: ExprId, parameters: &[ParameterType]) -> Option<cst::Expr> {
+        if parameters.iter().any(|p| p.is_implicit) {
+            return None;
+        }
+        let location = function.locate(self);
+
+        let mut lambda_parameters = Vec::new();
+        let mut arguments = Vec::new();
+        for parameter in parameters {
+            let (var_path, var_name) = self.fresh_variable("p", parameter.typ.clone(), location.clone());
+            let pattern = self.push_pattern(cst::Pattern::Variable(var_name), location.clone());
+            let expr = self.push_expr(cst::Expr::Variable(var_path), parameter.typ.clone(), location.clone());
+            arguments.push(cst::Argument { is_implicit: false, expr });
+            lambda_parameters.push(cst::Parameter::with_implicit(pattern, false));
+        }
+
+        // `function` is the ExprId being replaced, so its content is copied to a fresh id to forward
+        // to -- mirroring `create_closure_wrapper_for_implicit`.
+        let inner = self.current_extended_context()[function].clone();
+        let inner = self.push_expr(inner, Type::ERROR, location.clone());
+
+        let body = cst::Expr::Call(cst::Call { function: inner, arguments });
+        let body = self.push_expr(body, Type::ERROR, location);
+
+        Some(cst::Expr::Lambda(cst::Lambda {
+            parameters: lambda_parameters,
+            body,
+            return_type: None,
+            is_move: false,
+            // No effects clause: the wrapper performs whatever the function it forwards to
+            // performs, inferred from the body.
+            effects: None,
+        }))
+    }
+
     /// Creates a new expression referring to the given implicit value.
     /// - 0 arguments: The expression is a variable
     /// - 1+ arguments: The expression is a function call to the given name, using the given arguments.

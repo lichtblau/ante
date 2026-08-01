@@ -1,0 +1,48 @@
+// `sum_list`'s parameter is by-value, concretely shared, never tail-returned
+// and never captured -- so it is inferred borrowing: the callee never
+// releases it, and statically-known call sites with pure (unconstrained
+// static impl) implicits elide the argument retain outright. `use_weigh`
+// passes its own borrowing parameter to a trait method (the callee-owns
+// trait path retains/releases that hop independently).
+
+shared type L =
+    | Nil
+    | Cons I32 L
+
+sum_list (l: L): I32 =
+    match l
+    | Nil -> 0
+    | Cons x rest -> x + sum_list rest
+
+trait Weigh t =
+    weigh: fn t -> I32
+
+impl weigh_l: Weigh L with
+    weigh (l: L): I32 = sum_list l
+
+use_weigh (l: L) {w: Weigh L}: I32 = weigh l {w}
+
+// Tail-returning a borrowing parameter is allowed: the escape retain gives the
+// returned copy its own count, so BOTH handles below are independently owned
+// and released -- the callee still never releases its parameter.
+prepend_or_keep (l: L) (x: I32): L =
+    if x %% 2 then Cons x l
+    else l
+
+main () =
+    list: L = Cons 1 (Cons 2 (Cons 3 Nil))
+    println (sum_list list)
+    println (use_weigh list)
+    grown = prepend_or_keep list 4
+    kept = prepend_or_keep list 5
+    println (sum_list grown)
+    println (sum_list kept)
+    println (sum_list list)
+
+// args: --delete-binary --no-color
+// expected stdout:
+// 6
+// 6
+// 10
+// 6
+// 6

@@ -108,16 +108,6 @@ pub struct IndividualTypeCheckResult {
     /// when newly created items from the type checking pass are used.
     pub context: ExtendedTopLevelContext,
 
-    /// For each reference-returning top-level function name, which of its explicit parameters'
-    /// origins can flow into the return value's reference elements -- the return-origin summary.
-    /// Positional mask aligned with explicit call arguments. Consumed by the escape check
-    /// post-inference (where all `TypeCheck` results are complete, see
-    /// `compute_return_origin_summary` and `call_origin`), as an additive refinement over the
-    /// fallback union: substitute the origins of exactly the arguments whose parameters flow.
-    /// Present only for reference-returning functions; an all-`false` entry means "returns a
-    /// reference, but not one derived from a parameter".
-    pub return_origins: FxHashMap<NameId, Vec<bool>>,
-
     /// One or more names may be externally visible outside this top-level item.
     /// Each of these names will be generalized and placed in this map.
     /// Ex: in `foo = (bar = 1; bar + 2)` only `foo: I32` will be generalized,
@@ -125,6 +115,26 @@ pub struct IndividualTypeCheckResult {
     /// Ex2: in `type Foo = | A | B`, `A` and `B` will both be generalized, and
     /// there is no need to generalize `Foo` itself.
     pub generalized: FxHashMap<NameId, Type>,
+
+    /// For each top-level function name, which of its explicit parameters are borrowing --
+    /// by-value, concretely `shared`-typed, never referenced in tail/return position, and never
+    /// captured by a nested lambda (and the function has no function- or ability-typed explicit
+    /// parameters, its only suspension avenues besides implicits).  The callee never releases
+    /// these; call sites with statically-known callees consult this mask to elide the argument
+    /// retain (or to balance it with a post-call release).
+    pub borrowed_params: FxHashMap<NameId, Vec<bool>>,
+
+    /// For each reference-returning top-level function name, which of its explicit parameters'
+    /// origins can flow into the return value's reference elements -- the return-origin
+    /// summary. Positional mask aligned with explicit call arguments.  Consumed by the escape
+    /// check post-inference (where all `TypeCheck` results are complete -- the
+    /// `borrowed_param_mask_of_callee` seam; consuming it during inference is unsound, see
+    /// `compute_return_origin_summary` and `call_origin`), as an additive refinement over the
+    /// fallback union: substitute the origins of exactly the arguments whose parameters
+    /// flow. Present only for reference-returning functions; an all-`false` entry means "returns a
+    /// reference, but not one derived from a parameter" (a local/immortal, or lost through a
+    /// nominal wrapper the may-alias test can't see -- 10 keeps the fallback floor for the latter).
+    pub return_origins: FxHashMap<NameId, Vec<bool>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -212,16 +222,14 @@ struct TypeChecker<'local, 'inner> {
     /// plain `x := v` LHS (reassignment reads nothing from `x`).
     suppress_move_record: bool,
 
-    /// The top-level definition name whose lambda body is about to be inferred, so
-    /// [`Self::compute_return_origin_summary`] can key its summary -- set only for a top-level
-    /// function/method definition immediately before its `infer_lambda`, and `take`n at the start of
-    /// each `infer_lambda_impl` (so nested lambdas in the body see `None`). Unlike `self_name` this
-    /// covers `MethodName` patterns (`Vec.get`, `HashMap.get`) without perturbing recursion-capture.
-    summary_binding_name: Option<NameId>,
-
-    /// Return-origin summaries computed by [`Self::compute_return_origin_summary`], keyed by item
-    /// then function name, moved into each [`IndividualTypeCheckResult`] at `finish`.
-    return_origin_summaries: FxHashMap<TopLevelId, FxHashMap<NameId, Vec<bool>>>,
+    /// Set only while inferring a call's direct variable callee (`m ()`). Calling a closure
+    /// borrows it, it does not consume it -- the same rule the escape scan already uses ("a direct
+    /// variable callee does not escape `m`"). Without this, an owning closure (now non-`Copy`)
+    /// would be moved by its own call, so its scope-exit env-teardown drop would never fire and the
+    /// capture would leak. Unlike `suppress_move_record` this must not disable drop elaboration,
+    /// and it leaves the use-after-move check in place, so calling an already-moved closure is
+    /// still an error.
+    borrow_callee: bool,
 
     /// The place each local binding denotes. Absent ⇒ the binding denotes its own variable.
     /// Present only for bindings that name a sub-place of another value — currently those
@@ -282,6 +290,32 @@ struct TypeChecker<'local, 'inner> {
     /// Captured names are never auto-dropped: the closure may outlive the owning scope, so
     /// dropping the referent would dangle it. Skipping only leaks for now.
     captured_names: FxHashSet<NameId>,
+
+    /// The top-level definition name whose lambda body is about to be inferred, so
+    /// [`Self::compute_return_origin_summary`] can key its summary -- set only for a top-level
+    /// function/method definition immediately before its `infer_lambda`, and `take`n at the start of
+    /// each `infer_lambda_impl` (so nested lambdas in the body see `None`). Unlike `self_name` this
+    /// covers `MethodName` patterns (`Vec.get`, `HashMap.get`) without perturbing recursion-capture.
+    summary_binding_name: Option<NameId>,
+
+    /// Masks computed by [`Self::compute_borrowed_param_mask`], keyed by
+    /// item then function name, moved into each [`IndividualTypeCheckResult`] at `finish`.
+    borrowed_param_masks: FxHashMap<TopLevelId, FxHashMap<NameId, Vec<bool>>>,
+
+    /// Return-origin summaries computed by [`Self::compute_return_origin_summary`], keyed by item
+    /// then function name, moved into each [`IndividualTypeCheckResult`] at `finish` (same
+    /// lifecycle as `borrowed_param_masks`).
+    return_origin_summaries: FxHashMap<TopLevelId, FxHashMap<NameId, Vec<bool>>>,
+
+    /// The current item's borrowing parameter names -- their scope-exit
+    /// release is skipped (the caller owns the handle for the call's duration).
+    borrowed_local_params: FxHashSet<NameId>,
+
+    /// Bindings that are whole-place aliases of an immutable local (`a = t`), keyed by the bound
+    /// name, valued by the definition's rhs expr. Their retain+release pair is elided: the rhs is
+    /// not marked in `retain_bindings` and the scope-exit release is skipped. An explicit `drop
+    /// (mut a)` on such a binding restores the retain (the pair must rebalance).
+    borrowed_bindings: FxHashMap<NameId, ExprId>,
 
     /// Nonzero while inferring a call's argument list (`--auto-drop` only). Auto-ref of an
     /// rvalue argument (`println ("a" ++ "b")`) creates a caller-owned temporary that no
@@ -379,8 +413,7 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             move_tracker: Default::default(),
             suppress_move_check: false,
             suppress_move_record: false,
-            summary_binding_name: None,
-            return_origin_summaries: Default::default(),
+            borrow_callee: false,
             binding_places: Default::default(),
             copy_type_name: None,
             field_types_cache: Default::default(),
@@ -395,6 +428,11 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             drop_method_name: None,
             drop_type_name: None,
             captured_names: Default::default(),
+            summary_binding_name: None,
+            borrowed_param_masks: Default::default(),
+            return_origin_summaries: Default::default(),
+            borrowed_local_params: Default::default(),
+            borrowed_bindings: Default::default(),
             call_argument_depth: 0,
             pending_autoref_temp_drops: Vec::new(),
             effect_continuation_names: Default::default(),
@@ -493,6 +531,41 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         origin.or_else(|| self.current_extended_context().path_origin(path))
     }
 
+    /// True if `expr` is a reference to a top-level function that has at least one borrowing
+    /// parameter (see [`Self::compute_borrowed_param_mask`]).
+    ///
+    /// A borrowing parameter is one the callee never releases; direct call sites elide the matching
+    /// argument retain to compensate (`borrowed_param_mask_of_callee` in the MIR builder resolves
+    /// the callee to a top-level name to find the mask). Handed around by value through a
+    /// `fn`-typed slot the mask is invisible: the indirect call site cannot see it, uses the plain
+    /// owned convention, and retains for a callee that never releases -- orphaning one reference per
+    /// call. So such a reference, in value position, is eta-expanded into a wrapper that owns and
+    /// releases its arguments ([`Self::eta_expand_borrowing_value`] / [`Self::create_eta_wrapper`]);
+    /// the wrapper's body calls the function directly, where the elision still applies. Direct calls
+    /// are untouched -- the eta hook fires only when `borrow_callee` is false.
+    fn function_reference_has_borrowing_param(&self, expr: ExprId) -> bool {
+        let cst::Expr::Variable(path) = &self.current_extended_context()[expr] else { return false };
+        let Some(Origin::TopLevelDefinition(name)) = self.path_origin(*path) else { return false };
+        let has_borrow = |mask: &Vec<bool>| mask.iter().any(|b| *b);
+        // Same SCC: the mask lives in `self.borrowed_param_masks` once that function's own check has
+        // run. Order within an SCC is not guaranteed, so a not-yet-checked callee reads as "no
+        // mask" -- that only forgoes a wrapper and leaks, never a double free. Crucially, do not
+        // fall through to the cross-SCC query for a current-SCC item: that would re-enter the SCC
+        // computation already in progress.
+        if self.item_contexts.contains_key(&name.top_level_item) {
+            return self
+                .borrowed_param_masks
+                .get(&name.top_level_item)
+                .and_then(|masks| masks.get(&name.local_name_id))
+                .is_some_and(has_borrow);
+        }
+        // A different SCC. A borrowing function is fully annotated (its parameter types had to be
+        // concretely `shared`), so it depends on nothing here and its SCC was resolved first; this
+        // query is memoized and cannot cycle back into the running one.
+        let check = crate::incremental::TypeCheck(name.top_level_item).get(self.compiler);
+        check.result.borrowed_params.get(&name.local_name_id).is_some_and(has_borrow)
+    }
+
     /// Returns the `String` type defined in the Prelude, caching it for subsequent calls.
     fn get_string_type(&mut self) -> Type {
         if let Some(typ) = &self.string_type {
@@ -523,11 +596,12 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
             .into_iter()
             .map(|(id, maps)| {
                 let generalized = generalized.remove(&id).unwrap_or_default();
+                let borrowed_params = self.borrowed_param_masks.remove(&id).unwrap_or_default();
                 let return_origins = self.return_origin_summaries.remove(&id).unwrap_or_default();
                 let mut context = self.id_contexts.remove(&id).unwrap();
                 let item_context = self.item_contexts.get(&id).unwrap();
                 context.extend_from_resolution_result(item_context.2.as_ref());
-                (id, IndividualTypeCheckResult { maps, generalized, context, return_origins })
+                (id, IndividualTypeCheckResult { maps, generalized, context, borrowed_params, return_origins })
             })
             .collect();
 
@@ -554,8 +628,10 @@ impl<'local, 'inner> TypeChecker<'local, 'inner> {
         self.binding_places = Default::default();
         self.drop_scopes.clear();
         self.synthesizing_drops = false;
-        self.summary_binding_name = None;
         self.captured_names.clear();
+        self.summary_binding_name = None;
+        self.borrowed_local_params.clear();
+        self.borrowed_bindings.clear();
         self.call_argument_depth = 0;
         self.pending_autoref_temp_drops.clear();
         self.effect_continuation_names.clear();
